@@ -627,7 +627,7 @@ def compact_reinsert(x, y, w, h, preplaced_mask=None, boundary_code=None,
 
 
 def compact_merge_clusters(x, y, w, h, preplaced_mask=None, boundary_code=None,
-                           touch_tol_ratio=0.02, rounds=5, verbose=False):
+                           touch_tol_ratio=0.02, rounds=20, verbose=False):
     """
     找出目前 layout 裡「彼此貼合」的連通元件（touching graph 的連通分量），
     把主要群（面積最大的那群）以外的每個衛星群整體平移、往主要群靠近，
@@ -642,9 +642,13 @@ def compact_merge_clusters(x, y, w, h, preplaced_mask=None, boundary_code=None,
     中間空一大塊」的成因。這裡直接把衛星群當剛體一起平移過去，從根本解決。
 
     preplaced_mask: 若某群包含 preplaced block，整群不動（有固定錨點）。
-    boundary_code:  若某群包含 LEFT/RIGHT 鎖定的 block，整群不做 x 平移；
-                    TOP/BOTTOM 鎖定則不做 y 平移，避免破壞 boundary 位置。
-                    兩軸都鎖死就整群不動（搬不了）。
+    boundary_code:  用「移動後重算官方 boundary 判定式、違規數不能超過移動前」
+                    當安全閘門（見 _try_axis），而非單純看有沒有沾到鎖定 bit。
+                    v4.5：若「兩個以上」衛星群共享同一條邊界鎖（例如都是
+                    RIGHT-locked），會先把它們當一個剛體家族一起平移，因為
+                    單獨移動任一個都會讓它自己脫離那條邊、被閘門擋下——整族
+                    一起移動才能在不違反任何成員鎖定的前提下縮小跟 main 的
+                    距離（見下方「家族協同移動」區塊）。
 
     只動 x, y（不碰 w, h）；每次平移都用二分法找最大安全距離（不會跟任何
     「非本群」的 block 重疊），保證不會把不重疊的狀態變成重疊。
@@ -697,8 +701,111 @@ def compact_merge_clusters(x, y, w, h, preplaced_mask=None, boundary_code=None,
 
         comp_area = np.array([areas_arr[comp_id == c].sum() for c in range(n_comp)])
         main_c = int(np.argmax(comp_area))
+        main_mask0 = comp_id == main_c
 
         moved_any = False
+
+        # ---- 家族協同移動：多個衛星群共享同一條邊界鎖時，整族剛體一起平移 ----
+        # 下面的「單一衛星 vs main」邏輯沒辦法處理「兩個以上各自獨立的衛星群，
+        # 剛好都被鎖在同一條邊」的情況：任何一個衛星群單獨試著往內移動，都會
+        # 被「移動後這個衛星自己不再貼著那條邊」的驗證擋下來——因為邊界本身
+        # 是由「目前這條邊上最極端的 block」自我定義，若同一條邊還有其他衛星
+        # 群守著，這個衛星群移開後自己就不再是最極端的，等於違反自己的鎖定。
+        # 解法：把「共享同一條邊界鎖」的所有衛星群當成一個剛體家族，用同一個
+        # 位移量一起移動——家族內部相對位置不變，所以移動後家族仍然共同定義
+        # 同一條（跟著縮小的）邊界，不會違反任何一個成員的鎖定。
+        family_handled_axis = {}
+        for bit, axis in ((1, 'x'), (2, 'x'), (4, 'y'), (8, 'y')):
+            fam = [c for c in range(n_comp) if c != main_c
+                   and not preplaced_mask[comp_id == c].any()
+                   and bool((boundary_code[comp_id == c] & bit).any())]
+            if len(fam) < 2:
+                continue
+            if bool((boundary_code[main_mask0] & bit).any()):
+                continue   # main 也鎖在這條邊，這軸沒有可壓縮的空間
+            fam_mask = np.isin(comp_id, fam)
+            main_mask = main_mask0
+            others_mask = ~fam_mask & ~main_mask
+            main_immovable = bool(preplaced_mask[main_mask].any())
+
+            main_area_sum = areas_arr[main_mask].sum()
+            main_cx = float(((x[main_mask] + w[main_mask] / 2) * areas_arr[main_mask]).sum() / main_area_sum)
+            main_cy = float(((y[main_mask] + h[main_mask] / 2) * areas_arr[main_mask]).sum() / main_area_sum)
+            fam_area_sum = areas_arr[fam_mask].sum()
+            fam_cx = float(((x[fam_mask] + w[fam_mask] / 2) * areas_arr[fam_mask]).sum() / fam_area_sum)
+            fam_cy = float(((y[fam_mask] + h[fam_mask] / 2) * areas_arr[fam_mask]).sum() / fam_area_sum)
+            needed = (main_cx - fam_cx) if axis == 'x' else (main_cy - fam_cy)
+            for c in fam:
+                family_handled_axis.setdefault(c, set()).add(axis)
+            if abs(needed) < 1e-9:
+                continue
+
+            def _apply_fam(dx_s, dy_s, dx_m, dy_m, t):
+                xt = x.copy(); yt = y.copy()
+                xt[fam_mask] = x[fam_mask] + dx_s * t
+                yt[fam_mask] = y[fam_mask] + dy_s * t
+                xt[main_mask] = x[main_mask] + dx_m * t
+                yt[main_mask] = y[main_mask] + dy_m * t
+                return xt, yt
+
+            def _overlap_bad_fam(xt, yt):
+                for grp_mask, other_mask in ((fam_mask, main_mask), (fam_mask, others_mask),
+                                              (main_mask, others_mask)):
+                    if not other_mask.any() or not grp_mask.any():
+                        continue
+                    gx_, gy_, gw_, gh_ = xt[grp_mask], yt[grp_mask], w[grp_mask], h[grp_mask]
+                    ox_, oy_, ow_, oh_ = xt[other_mask], yt[other_mask], w[other_mask], h[other_mask]
+                    ovx = np.minimum(gx_[:, None] + gw_[:, None], ox_[None, :] + ow_[None, :]) - \
+                          np.maximum(gx_[:, None], ox_[None, :])
+                    ovy = np.minimum(gy_[:, None] + gh_[:, None], oy_[None, :] + oh_[None, :]) - \
+                          np.maximum(gy_[:, None], oy_[None, :])
+                    if bool(((ovx > 1e-9) & (ovy > 1e-9)).any()):
+                        return True
+                return False
+
+            baseline_v_fam = compute_boundary_violations(x, y, w, h, boundary_code)
+
+            def _feasible_fam(dx_s, dy_s, dx_m, dy_m, t):
+                xt, yt = _apply_fam(dx_s, dy_s, dx_m, dy_m, t)
+                if _overlap_bad_fam(xt, yt):
+                    return False
+                return compute_boundary_violations(xt, yt, w, h, boundary_code) <= baseline_v_fam
+
+            def _max_t_fam(dx_s, dy_s, dx_m, dy_m):
+                if abs(dx_s) + abs(dy_s) + abs(dx_m) + abs(dy_m) < 1e-9:
+                    return 0.0
+                if _feasible_fam(dx_s, dy_s, dx_m, dy_m, 1.0):
+                    return 1.0
+                if not _feasible_fam(dx_s, dy_s, dx_m, dy_m, 0.0):
+                    return 0.0
+                lo, hi = 0.0, 1.0
+                for _ in range(30):
+                    mid = (lo + hi) / 2.0
+                    if _feasible_fam(dx_s, dy_s, dx_m, dy_m, mid):
+                        lo = mid
+                    else:
+                        hi = mid
+                return lo
+
+            dx_s, dy_s = (needed, 0.0) if axis == 'x' else (0.0, needed)
+            t_fam = _max_t_fam(dx_s, dy_s, 0.0, 0.0)
+            if t_fam > 1e-6:
+                xt, yt = _apply_fam(dx_s, dy_s, 0.0, 0.0, t_fam)
+                x[:] = xt; y[:] = yt
+                moved_any = True
+                if verbose:
+                    print("compact_merge_clusters: round={} family bit={} ({} sats) "
+                          "moved t={:.3f}".format(_round, bit, len(fam), t_fam))
+            if t_fam < 0.999 and not main_immovable:
+                remaining = needed * (1.0 - t_fam)
+                if abs(remaining) > 1e-9:
+                    dx_m, dy_m = (-remaining, 0.0) if axis == 'x' else (0.0, -remaining)
+                    t_main = _max_t_fam(0.0, 0.0, dx_m, dy_m)
+                    if t_main > 1e-6:
+                        xt, yt = _apply_fam(0.0, 0.0, dx_m, dy_m, t_main)
+                        x[:] = xt; y[:] = yt
+                        moved_any = True
+
         for c in range(n_comp):
             if c == main_c:
                 continue
@@ -795,8 +902,9 @@ def compact_merge_clusters(x, y, w, h, preplaced_mask=None, boundary_code=None,
                             moved = True
                 return moved
 
-            moved_x = _try_axis('x', needed_dx)
-            moved_y = _try_axis('y', needed_dy)
+            handled = family_handled_axis.get(c, set())
+            moved_x = False if 'x' in handled else _try_axis('x', needed_dx)
+            moved_y = False if 'y' in handled else _try_axis('y', needed_dy)
             if moved_x or moved_y:
                 moved_any = True
             elif verbose:
@@ -1132,6 +1240,11 @@ def legalize_lff(
     reinsert_sweeps=3,
     reinsert_grid_density=12,
     tie_break_mode="area_desc",   # 'area_desc' | 'area_asc' | 'flexibility'（實驗用）
+    # v4.4 實驗：100 樣本 A/B 顯示 compact_gravity 對 area_gap/hpwl_gap/
+    # V_relative 都是輕微負面（且不會修到「多個獨立衛星群共享同一條被鎖死
+    # 邊界」這種情況——見 legalize_lff 呼叫處的說明），維持預設關閉。
+    use_gravity=False,
+    gravity_iters=40,
     verbose=False,
 ):
     """
@@ -1502,6 +1615,19 @@ def legalize_lff(
     # 保證只會讓 bbox 縮小或持平，直接解決這種巨集尺度的留白。
     x, y = compact_merge_clusters(x, y, w, h, preplaced_mask=preplaced_mask,
                                   boundary_code=boundary_code, verbose=verbose)
+
+    # ---- 每個 block 各自往（面積加權）全域重心靠攏 ----
+    # compact_merge_clusters 只處理「已經彼此貼合」的連通分量之間的巨集移動；
+    # 一個「沒有跟任何人貼合、四周有明顯空地」的孤立 block（例如角落單獨一塊，
+    # 沒有被任何 boundary/cluster 約束釘住）不屬於任何衛星群，merge_clusters
+    # 抓不到它。compact_gravity 用「每個 block 各自往全域重心走一小步、
+    # 撞到人就二分法退讓」的方式，讓這種孤立 block 有機會往有人群的方向移動——
+    # 跟 compact_reinsert 的網格搜尋是互補的：這裡是「往一個有意義的方向走」，
+    # 便宜（不用枚举網格）但不保證找到「最佳」位置；compact_reinsert 之後
+    # 會再對每個 block 做更精細的局部搜尋。
+    if use_gravity:
+        x, y = compact_gravity(x, y, w, h, preplaced_mask=preplaced_mask,
+                               boundary_code=boundary_code, iters=gravity_iters)
 
     # ---- Remove-and-reinsert 局部搜尋：填內部縫隙、進一步壓縮 bbox ----
     # compact_merge_clusters 處理的是巨集尺度（整群衛星群搬移）；LFF 排布

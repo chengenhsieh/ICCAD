@@ -437,6 +437,9 @@ def legalize_result(
     reinsert_sweeps=3,
     reinsert_grid_density=12,
     tie_break_modes=None,
+    use_gravity=False,
+    gravity_iters=40,
+    verbose=True,
 ):
     """
     對 generate_floorplan() 選出的 raw best 做 legalize 後處理，保證零 overlap、
@@ -477,7 +480,9 @@ def legalize_result(
             reinsert_sweeps=reinsert_sweeps,
             reinsert_grid_density=reinsert_grid_density,
             tie_break_mode=mode,
-            verbose=(mode == modes[0]),
+            use_gravity=use_gravity,
+            gravity_iters=gravity_iters,
+            verbose=(mode == modes[0]) and verbose,
         )
         # legalize_lff 內部已經呼叫過 hard_zero_overlap 做防禦性驗證，這裡再走
         # 一次完整的 _guarantee_zero_overlap（含重試 + 絕對保底 eject）當雙重
@@ -802,7 +807,7 @@ def run_one_sample(sample_idx, official, model, config, device,
                    n_samples=6, ddim_steps=100,
                    sampler="ddim", edm_steps=50, use_amp=False, post_repel_steps=30,
                    scale_t_windows=False, reinsert_sweeps=3, reinsert_grid_density=12,
-                   tie_break_modes=None):
+                   tie_break_modes=None, use_gravity=False, gravity_iters=40):
     """
     跑單一 validation sample：
       1. 解析 inputs / GT / constraints
@@ -993,6 +998,8 @@ def run_one_sample(sample_idx, official, model, config, device,
         reinsert_sweeps=reinsert_sweeps,
         reinsert_grid_density=reinsert_grid_density,
         tie_break_modes=tie_break_modes,
+        use_gravity=use_gravity,
+        gravity_iters=gravity_iters,
     )
     t_legalize = time.perf_counter() - t_legal_start
 

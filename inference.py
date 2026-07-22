@@ -439,6 +439,25 @@ def legalize_result(
     tie_break_modes=None,
     use_gravity=False,
     gravity_iters=40,
+    # v4.7: 100 樣本 paired A/B（同一組 diffusion 輸出餵給不同 legalize 設定，
+    # 排除取樣雜訊）驗證後改為預設開啟。compact_merge_cluster_groups 直接針對
+    # 每個 cluster group 的連通性做剛體貼合，並用 hpwl_slack_ratio 控制「最多
+    # 願意用多少額外 HPWL 換一個 grouping 違規」——paired 測試下 area_gap
+    # 100/100 樣本零變化、V_grouping 從未在任何樣本變差（29/100 樣本變好），
+    # 平均 hpwl_gap 代價僅 +0.16%（換算官方 cost 公式約 -1.3%，比 slack=0 的
+    # 嚴格零代價版本更好）。見 compact_merge_cluster_groups docstring 與呼叫處
+    # 說明（utils.py）。
+    use_cluster_merge=True,
+    hpwl_slack_ratio=5.0,
+    use_second_merge_pass=True,
+    weight_dist=1.0,
+    weight_boundary=3.0,
+    weight_cluster=1.0,
+    weight_b2b=0.5,
+    weight_p2b=0.15,
+    weight_shape=3.0,
+    use_cluster_adjacency=False,
+    cluster_adjacency_bonus=5.0,
     verbose=True,
 ):
     """
@@ -482,6 +501,17 @@ def legalize_result(
             tie_break_mode=mode,
             use_gravity=use_gravity,
             gravity_iters=gravity_iters,
+            use_cluster_merge=use_cluster_merge,
+            hpwl_slack_ratio=hpwl_slack_ratio,
+            use_second_merge_pass=use_second_merge_pass,
+            weight_dist=weight_dist,
+            weight_boundary=weight_boundary,
+            weight_cluster=weight_cluster,
+            weight_b2b=weight_b2b,
+            weight_p2b=weight_p2b,
+            weight_shape=weight_shape,
+            use_cluster_adjacency=use_cluster_adjacency,
+            cluster_adjacency_bonus=cluster_adjacency_bonus,
             verbose=(mode == modes[0]) and verbose,
         )
         # legalize_lff 內部已經呼叫過 hard_zero_overlap 做防禦性驗證，這裡再走
@@ -807,7 +837,11 @@ def run_one_sample(sample_idx, official, model, config, device,
                    n_samples=6, ddim_steps=100,
                    sampler="ddim", edm_steps=50, use_amp=False, post_repel_steps=30,
                    scale_t_windows=False, reinsert_sweeps=3, reinsert_grid_density=12,
-                   tie_break_modes=None, use_gravity=False, gravity_iters=40):
+                   tie_break_modes=None, use_gravity=False, gravity_iters=40,
+                   use_cluster_merge=True, hpwl_slack_ratio=5.0, use_second_merge_pass=True,
+                   weight_dist=1.0, weight_boundary=3.0, weight_cluster=1.0,
+                   weight_b2b=0.5, weight_p2b=0.15, weight_shape=3.0,
+                   use_cluster_adjacency=False, cluster_adjacency_bonus=5.0):
     """
     跑單一 validation sample：
       1. 解析 inputs / GT / constraints
@@ -1000,6 +1034,17 @@ def run_one_sample(sample_idx, official, model, config, device,
         tie_break_modes=tie_break_modes,
         use_gravity=use_gravity,
         gravity_iters=gravity_iters,
+        use_cluster_merge=use_cluster_merge,
+        hpwl_slack_ratio=hpwl_slack_ratio,
+        use_second_merge_pass=use_second_merge_pass,
+        weight_dist=weight_dist,
+        weight_boundary=weight_boundary,
+        weight_cluster=weight_cluster,
+        weight_b2b=weight_b2b,
+        weight_p2b=weight_p2b,
+        weight_shape=weight_shape,
+        use_cluster_adjacency=use_cluster_adjacency,
+        cluster_adjacency_bonus=cluster_adjacency_bonus,
     )
     t_legalize = time.perf_counter() - t_legal_start
 

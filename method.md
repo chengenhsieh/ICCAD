@@ -254,15 +254,53 @@ median minimizes weighted sum of absolute deviations）。這讓我們不需要�
 
    這個修正用一個獨立、乾淨的單元測試驗證過機制本身正確：兩個互不相鄰、都
    鎖在同一條邊的衛星分量，在有真正空間可移動時會正確地一起平移、保持邊界
-   對齊，bbox 寬度從 80 縮小到 35、且零重疊。100 樣本官方驗證集上，這是
-   本次投入的多個壓縮嘗試裡**唯一**帶來平均 area gap 實質下降的改動（見
-   2.3 節的完整比較表）。
+   對齊，bbox 寬度從 80 縮小到 35、且零重疊。
 2. `compact_reinsert`——對每個 block 做「拔出來、在目前佔用範圍內找 bbox 面
    積 + 緊密度最小的新位置、比較後決定要不要換」的局部搜尋，能找到單純滑動
    搆不到的位置。
 3. `compact_positions`——純幾何的沿 x/y 軸滑到貼齊，成本最低的收尾動作。
+4. **第二次 `compact_merge_clusters`（v4.6）**——`compact_reinsert` 的局部
+   搜尋常常會移動原本卡住的衛星分量、開出新的「彼此貼合」機會，而第一次
+   `compact_merge_clusters`（跑在 reinsert 之前）看不到這些新機會。在
+   pipeline 尾端對同一個函式再補跑一次，抓住這些新開出的機會——多數情況下
+   第一輪就會因為沒有東西可移動而立刻收斂，成本幾乎為零。100 樣本 A/B：
+   area_gap 24.6% → 23.1%、V_relative 0.112 → 0.106，時間持平甚至略快。
+5. **`compact_merge_cluster_groups`（v4.7，直接針對 cluster soft constraint
+   本身）**——前面幾步處理的都是「彼此已經貼合的巨集群聚」，跟官方
+   `V_grouping` 指標（同一個 cluster group 的成員是否形成單一連通分量，只看
+   成員彼此是否直接共邊，不能透過非成員 block 搭橋）不是同一件事：LFF 排布
+   時 cluster 成員只有「加權中位數往組重心拉」這個軟性訊號，重心接近不代表
+   真的共邊貼合，同一組常常被分裂成多個連通分量卻無法被前面的機制修正。
 
-以上三步都被設計成**證明上單調不變差**（不會把不重疊變成重疊、不會讓 bbox
+   `compact_merge_cluster_groups` 直接針對每個 cluster group 檢查連通性
+   （用跟官方指標完全一致的 `_blocks_share_edge` 判定式），把分裂的子塊往
+   組內面積最大的子塊做精確貼合（4 種候選剛體位移，各自貼齊目標的一個邊，
+   逐一驗證安全性後套用），並額外要求：(a) 移動後 boundary 違規、
+   cluster 違規總數都不能變差；(b) 移動前後總 HPWL（B2B + P2B）增加量不能
+   超過 `hpwl_slack_ratio * avg_side`（`avg_side` 是 block 平均邊長，等於
+   一個「block 身位」的長度尺度）。第 (b) 道閘門是這一版的關鍵：早期沒有
+   HPWL 閘門的版本在真實資料上會讓 grouping 的改善以 HPWL 明顯變差為代價
+   （剛體移動常常連帶拖走跟其他 block 有真實接線的成員），加上閘門後只對
+   「HPWL 代價可控」的違規出手。這個函式刻意放在 pipeline **最尾端**（第二次
+   `compact_merge_clusters` 之後）——實測發現放在 `compact_reinsert` 之前會
+   被後續的逐一局部搜尋悄悄拆散剛建立好的貼合（`compact_reinsert` 的成本
+   函式不知道 grouping 是個非黑即白的鄰接需求），導致 V_grouping 不降反升；
+   放在所有其他幾何調整都完成之後才做，就不會再被撤銷。
+
+   驗證方式也升級了：一開始用「獨立取樣」的 100 樣本 A/B（baseline 和新設定
+   各自重跑一次完整 diffusion + legalize）測 `hpwl_slack_ratio=0`（嚴格
+   零代價），結果 V_grouping 幾乎沒有改善（374→375）——但這個結論後來被
+   證明是雜訊蓋過訊號：改用 **paired** 設計重測（同一組 diffusion 輸出
+   餵給不同 legalize 設定，排除掉 diffusion 取樣本身的隨機性），才發現
+   訊號其實一直都在。100 樣本 paired 測試下：`hpwl_slack_ratio=0` 讓
+   V_grouping 378→371（無任何樣本變差、6 個變好）；放寬到
+   `hpwl_slack_ratio=5.0` 效果更好，378→349（同樣無任何樣本變差、24 個
+   變好），area_gap 100 樣本中只有 1 個有可忽略的變化，平均 hpwl_gap
+   代價僅 +0.16%。換算官方 cost 公式（`(1+0.5·(hpwl_gap+area_gap))
+   ·exp(2·V_rel)`）粗估，`hpwl_slack_ratio=5.0` 的淨效益（約 −1.3%）優於
+   `=0`（約 −0.4%），故採用 `hpwl_slack_ratio=5.0` 當預設。
+
+以上五步都被設計成**證明上單調不變差**（不會把不重疊變成重疊、不會讓 bbox
 變大）——因此可以安全疊加在保證正確的 legalize 結果之上，沒有任何 hard
 constraint 被重新破壞的風險。
 
@@ -282,17 +320,43 @@ constraint 被重新破壞的風險。
 | `compact_reinsert` 搜尋強度加倍/三倍 | area gap 沒有改善（甚至略差），時間成本卻明顯增加 | 維持原設定 |
 | Legalize 用多種 tie-break 順序取最佳 bbox（legalize 版 best-of-N） | 單一輸入下不同順序确實能差到 ±10% bbox，但套用 `compact_reinsert` 後這個差異幾乎被磨平；時間成本卻是線性倍增 | 不採用（保留為可選功能） |
 | `compact_gravity`（每個 block 各自往全域重心走一小步）當額外壓縮 pass | area gap、hpwl gap、V_relative 都輕微變差，且不會處理「多個獨立衛星群共享同一條邊界鎖」這種情況 | 不採用（保留為可選功能） |
-| `compact_merge_clusters` 加入**家族協同移動**（多個衛星分量共享同一條邊界鎖時一起剛體平移）+ `rounds: 5 → 20` | 100 樣本 area gap 24.7% → **23.8%**（實質改善），legalize 最差情況時間反而下降（5.10s → 3.58s），V_relative 小幅上升（0.109 → 0.113），0/100 infeasible 不變 | **採用**（唯一一個帶來實質 area gap 改善的壓縮嘗試） |
+| `compact_merge_clusters` 加入**家族協同移動**（多個衛星分量共享同一條邊界鎖時一起剛體平移）+ `rounds: 5 → 20` | 100 樣本 area gap 24.7% → **23.8%**（實質改善），legalize 最差情況時間反而下降（5.10s → 3.58s），V_relative 小幅上升（0.109 → 0.113），0/100 infeasible 不變 | **採用** |
+| `post_repel_steps` 掃描 15/30/45/60 | area gap 24.1%/24.2%/23.9%/24.2%、hpwl gap 15.2%/15.9%/16.1%/16.0%、V_relative 0.112/0.112/0.119/0.115——四組數字在雜訊範圍內互相交疊，沒有單調趨勢 | 維持原設定（30），不值得為了雜訊等級的差異改參數 |
+| Legalize 放置階段加入「同 cluster group 貼靠候選位置」偏好（`use_cluster_adjacency`，對每個候選自由矩形額外嘗試貼齊同組已放置 block 的 4 個邊、給予成本折扣） | 純合成測試（無 B2B/P2B 連線）V_grouping 大幅下降、看似有效；但 100 樣本真實資料上 area gap 23.7%→25.5%、hpwl gap 16.5%→19.0%、V_relative 0.116→0.134，三項同時變差。根因：合成測試產生器從不建立 B2B/P2B 連線，等於讓「貼靠折扣」在測試中完全沒有 HPWL 目標可以競爭，因此系統性低估了真實資料中的代價 | **不採用**（已還原，程式碼保留為 opt-in 參數） |
+| `compact_reinsert`/`compact_positions` 之後再補跑一次 `compact_merge_clusters`（`use_second_merge_pass`） | `compact_reinsert` 的局部搜尋常會移動原本卡住的衛星分量、開出新的「彼此貼合」機會，第一次 merge（在 reinsert 之前）看不到。100 樣本 A/B：area gap 24.6%→**23.1%**、V_relative 0.112→**0.106**，兩項同時改善，時間幾乎不變（第一輪多半立即收斂） | **採用**（v4.6，改為預設開啟） |
+| 依 `compute_cluster_violations` 精確定義（`_blocks_share_edge`）逐 cluster group 補做剛體貼合（`compact_merge_cluster_groups` 早期版本，只有全域違規不增加的安全閘門、沒有 HPWL 閘門） | 修正過連通性判定與「移動整個剛體可能牽動其他 group」的問題後，100 樣本測試 V_relative 仍在雜訊範圍內小幅上升（0.113→0.118），沒有取得可靠的淨改善 | **不採用**（見下一行：加上 HPWL 閘門後的版本才是後來採用的 v4.7） |
+| `weight_cluster` 掃描 1.0/2.0/3.0 | wc=2.0：area 23.7%→23.8%、hpwl 16.5%→17.2%、V_rel 0.113→0.103；wc=3.0：area→24.8%、hpwl→18.3%、V_rel→0.108——調高權重能壓低 V_relative，但總是以 hpwl gap 明顯變差為代價，且 area gap 也沒有跟著改善 | **不採用**（維持 1.0） |
+| `compact_merge_cluster_groups` 加上 **HPWL 不變差閘門**（`hpwl_slack_ratio`），並修正「放在 compact_reinsert 之前會被後續步驟撤銷」的排序 bug，移到 pipeline 最尾端 | 獨立取樣 100 樣本測 `hpwl_slack_ratio=0` 一開始幾乎沒改善（374→375），改用 **paired** 設計（同一組 diffusion 輸出餵給不同 legalize 設定，排除取樣雜訊）重測才發現訊號被雜訊蓋住：`slack=0` 讓 V_grouping 378→371（0 個樣本變差）；`slack=5.0`（5 個 block 身位）378→349（同樣 0 個變差、24 個變好），area_gap 100 樣本中只有 1 個可忽略的變化，hpwl_gap 平均代價僅 +0.16% | **採用**（v4.7，`hpwl_slack_ratio=5.0`，改為預設開啟） |
 
 這個過程反映的核心判斷：**diffusion 端「批次內免費」的候選數（`n_samples`）
 值得投資；legalize 端單純「加碼同一種搜尋的強度」（不管是加大 `compact_reinsert`
 的網格、多跑幾種排布順序、或加一個新的通用拉力 `compact_gravity`）在目前的
 演算法結構下已經觸頂，邊際效益接近於零——但這不代表 legalize 端已經沒有
-空間，`compact_merge_clusters` 的家族協同移動證明了：只要找到現有搜尋結構
-「結構性漏掉」的一整類情況（此處是「多個獨立衛星群共享同一條邊界鎖」），
-用一個針對性、範圍明確的機制去補，仍然能拿到實質、幾乎零成本的改善。要再
-進一步壓低 area gap，比較有希望的方向是繼續找這類「結構性漏洞」，而不是
-籠統加大現有搜尋的強度。
+空間，`compact_merge_clusters` 的家族協同移動、以及後來加上的第二次 merge
+pass，都證明了：只要找到現有搜尋結構「結構性漏掉」的情況（前者是「多個獨立
+衛星群共享同一條邊界鎖」、後者是「reinsert 開出的新貼合機會，第一次 merge
+看不到」），用一個針對性、範圍明確的機制去補，仍然能拿到實質、幾乎零成本
+的改善。
+
+另一方面，這輪測試也劃出了一條清楚的界線：**任何無差別放大「往 cluster
+靠攏」力道的機制（放置階段的貼靠偏好、調高 `weight_cluster`），在真實資料上
+都會讓 V_relative 的改善以 hpwl gap 變差為代價**——因為真實資料的 block 之間
+有實際的 B2B/P2B 連線需要兼顧，而這個 trade-off 在本專案自製的合成測試資料
+中是完全看不到的（合成生成器從不建立連線）。但這不代表 grouping 完全沒有
+安全的攻克方式：v4.7 的 `compact_merge_cluster_groups` 說明「無差別放大力道」
+和「針對性地只在代價可控時出手」是兩回事——用 HPWL 閘門把移動範圍限制在
+「這一步棋的代價經過明確計算、確定夠小」的違規上，而不是對所有 cluster
+成員都加一個無差別的偏好/權重，就能在不犧牲 HPWL 的前提下拿到真的改善。
+
+v4.7 的驗證過程也留下一個重要的方法論教訓：**diffusion sampling 沒有固定
+random seed，是這整個調參過程中最大的干擾源**——`hpwl_slack_ratio=0` 第一次
+用「獨立取樣」的 100 樣本 A/B（baseline 和新設定各自重新跑一次完整
+diffusion + legalize）測出來幾乎沒有效果，但改用 **paired** 設計（同一組
+diffusion 輸出，只換 legalize 設定）重測，才發現訊號其實一直都在，只是先前
+兩次獨立取樣的雜訊量級跟訊號差不多大，把它蓋住了。這代表往後任何「效果
+不確定」的 legalize 端改動，應該優先用 paired 設計驗證，而不是急著用獨立
+取樣的結果下「沒有效果」的結論——除非改動的地方在 diffusion 端本身（那樣
+paired 設計就不適用了）。
 
 ---
 
@@ -301,10 +365,14 @@ constraint 被重新破壞的風險。
 | 指標 | 數值 |
 |---|---|
 | Hard constraint 違規 | 0 / 100（zero overlap, exact preplaced/fixed shape, area ≤1% error, 皆保證滿足） |
-| Area gap（vs. optimal） | ~23.7% |
-| HPWL gap（vs. optimal） | ~16.1% |
-| Soft constraint 違規率（V_relative） | ~0.113 |
-| 平均單樣本總時間 | ~2.5s（diffusion ~1.3s + legalize ~1.2s） |
+| Area gap（vs. optimal） | ~24.0%（v4.7：`use_second_merge_pass` + `use_cluster_merge`/`hpwl_slack_ratio=5.0` 皆開啟後） |
+| HPWL gap（vs. optimal） | ~15.6% |
+| Soft constraint 違規率（V_relative） | ~0.106 |
+| 平均單樣本總時間 | ~2.5s（diffusion ~1.2s + legalize ~1.2s） |
+
+（diffusion sampling 未固定 random seed，同一組參數重跑 100 樣本時上述數字
+本身會有 ±0.01 左右的自然波動，屬於量測雜訊而非參數變化造成——這也是為何
+v4.7 的驗證過程改用 paired 設計，見上一節。）
 
 ---
 

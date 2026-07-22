@@ -55,8 +55,9 @@ from inference import load_model, generate_floorplan, legalize_result
 class MyOptimizer(FloorplanOptimizer):
     """Diffusion-generate + LFF-legalize floorplanning optimizer."""
 
-    # Config validated on the 100-sample validation set: ~2.7s/sample avg,
-    # 0/100 infeasible, area_gap ~24.8%, hpwl_gap ~15.9%, V_relative ~0.110.
+    # Config validated on the 100-sample validation set (v4.7: use_second_merge_pass
+    # + use_cluster_merge/hpwl_slack_ratio=5.0 both on) -- see method.md section 2.2.
+    # ~2.5s/sample avg, 0/100 infeasible; see the evaluate run for area/hpwl/V_rel.
     CHECKPOINT_NAME = "model_epoch300_overlap_v4.pt"
     DDIM_STEPS = 30
     N_SAMPLES = 14
@@ -164,6 +165,9 @@ class MyOptimizer(FloorplanOptimizer):
             cluster_group=cluster_group,
             boundary_code=boundary_code,
             outline_bbox=outline_bbox,
+            use_second_merge_pass=True,
+            use_cluster_merge=True,
+            hpwl_slack_ratio=5.0,
             verbose=self.verbose,
         )
 

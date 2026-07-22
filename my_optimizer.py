@@ -55,13 +55,30 @@ from inference import load_model, generate_floorplan, legalize_result
 class MyOptimizer(FloorplanOptimizer):
     """Diffusion-generate + LFF-legalize floorplanning optimizer."""
 
-    # Config validated on the 100-sample validation set (v4.7: use_second_merge_pass
-    # + use_cluster_merge/hpwl_slack_ratio=5.0 both on) -- see method.md section 2.2.
-    # ~2.5s/sample avg, 0/100 infeasible; see the evaluate run for area/hpwl/V_rel.
+    # Config validated on the 100-sample validation set -- see method.md
+    # sections 2.2 (v4.7 legalize-side cluster merge) and 2.1 (v5.0
+    # diffusion-side force-strength tuning). ~2.5s/sample avg, 0/100
+    # infeasible; see the evaluate run for area/hpwl/V_rel.
     CHECKPOINT_NAME = "model_epoch300_overlap_v4.pt"
     DDIM_STEPS = 30
     N_SAMPLES = 14
     POST_REPEL_STEPS = 30
+    # v5.0: 100-sample quasi-paired sweep found the hardcoded force-guidance
+    # strengths in diffusion.py were too strong, overriding the model's own
+    # learned signal. grouping_force_strength 0.015->0.030 (sweet spot; both
+    # weaker and 0.050 are worse), repulsion_strength 0.05->0.025, and
+    # boundary_nudge_strength 0.05->0.025 (0.10 made V_boundary worse).
+    # Combined (not just additive): area/hpwl unchanged, V_relative
+    # 0.1092->0.1032 (V_grouping 359->339), ~-1.26% on the contest cost
+    # formula vs. the old hardcoded defaults. A follow-up fine sweep around
+    # this point found grouping_force_strength=0.030 and
+    # boundary_nudge_strength=0.025 were already the local optimum, but
+    # repulsion_strength=0.0375 beat 0.025 on both sides of two independent
+    # 100-sample re-runs (different random seeds each time; ~-0.2%~-0.3% on
+    # the cost formula, small but directionally consistent) -- adopted.
+    GROUPING_FORCE_STRENGTH = 0.030
+    BOUNDARY_NUDGE_STRENGTH = 0.025
+    REPULSION_STRENGTH = 0.0375
 
     def __init__(self, verbose: bool = False):
         super().__init__(verbose)
@@ -155,6 +172,9 @@ class MyOptimizer(FloorplanOptimizer):
             p2b_edges=p2b_edges, pins_pos=pins_np,
             gt_w=gt_w, gt_h=gt_h, gt_x=gt_x, gt_y=gt_y,
             sampler="ddim", post_repel_steps=self.POST_REPEL_STEPS,
+            grouping_force_strength=self.GROUPING_FORCE_STRENGTH,
+            boundary_nudge_strength=self.BOUNDARY_NUDGE_STRENGTH,
+            repulsion_strength=self.REPULSION_STRENGTH,
         )
 
         legalized = legalize_result(

@@ -63,6 +63,28 @@ def generate_floorplan(
     use_amp=False,           # v4.3: model forward 用 fp16 autocast（實驗用，預設關閉）
     post_repel_steps=30,     # v4.3: diffusion 結束後純物理 repel 步數（實驗用，legalize 已有壓縮）
     scale_t_windows=False,   # v4.3: force-guidance 的 t 窗口是否照 ddim_steps 等比例縮放（A/B 驗證無效，預設關閉）
+    pin_force_strength=0.02,
+    # v5.0: 100 樣本 quasi-paired 掃描（同一個 sample idx 固定 torch seed，
+    # 讓不同力設定至少共用同一組初始噪聲，逼近 legalize 端實驗用的 paired
+    # 設計）後改為預設開啟。三個力個別掃描都指向「原本寫死的強度偏強、蓋過
+    # 模型自己學到的訊號」：grouping_force 從 0.015 加到 0.030 讓 V_grouping
+    # 單調改善（359→355，再加到 0.050 又惡化，甜蜜點在 0.030）；
+    # repulsion_strength 從 0.05 減半到 0.025 則是 area/hpwl/V_relative 同時
+    # 變好（0.1092→0.1046）；boundary_nudge_strength 加倍到 0.10 讓
+    # V_boundary 反而變差（116→122），減半到 0.025 才是對的方向。三個各自
+    # 最佳值合在一起測（不是簡單相加，見下方數字），area_gap/hpwl_gap 完全
+    # 持平，V_relative 從 0.1092 降到 0.1032（主要來自 V_grouping
+    # 359→339），換算官方 cost 公式淨效益約 -1.26%，比任何單一個力的效果都
+    # 好。之後在這組最佳值附近（固定另外兩個力）再細掃一輪：grouping_force
+    # 在 0.030 兩側都變差，維持原值；boundary_nudge 在 0.025~0.0375 之間打平
+    # 、維持原值；repulsion_strength 卻在 0.025 兩側（0.0125、0.0375）都更好
+    # ——換兩組不同的 random seed 各自跑 100 樣本獨立確認，0.0375 都比 0.025
+    # 好（cost 公式估計 -0.2%~-0.3%），改善來源在兩次測試中不太一樣
+    # （一次主要是 V_grouping、一次主要是 V_boundary），效應本身不大、但
+    # 方向穩定，改為新預設。
+    grouping_force_strength=0.030,
+    boundary_nudge_strength=0.025,
+    repulsion_strength=0.0375,
 ):
     """
     Args:
@@ -302,6 +324,10 @@ def generate_floorplan(
             grouping_until_t=int(30 * _t_scale),
             repulsion_from_t=int(50 * _t_scale),
             boundary_from_t=int(20 * _t_scale),
+            pin_force_strength=pin_force_strength,
+            grouping_force_strength=grouping_force_strength,
+            boundary_nudge_strength=boundary_nudge_strength,
+            repulsion_strength=repulsion_strength,
         )
 
     preplaced_indices = [i for i in range(k) if preplaced_mask_np[i]]
@@ -449,6 +475,12 @@ def legalize_result(
     # 說明（utils.py）。
     use_cluster_merge=True,
     hpwl_slack_ratio=5.0,
+    use_snap_boundary=False,   # 實驗用：見 compact_snap_boundary 呼叫處說明（utils.py）
+    boundary_hpwl_slack_ratio=0.0,   # 實驗用：見 compact_snap_boundary docstring
+    use_pair_reinsert=False,  # 實驗用：見 compact_pair_reinsert 呼叫處說明（utils.py）
+    pair_reinsert_sweeps=2,
+    pair_reinsert_grid_density=8,
+    pair_reinsert_hpwl_slack_ratio=0.0,
     use_second_merge_pass=True,
     weight_dist=1.0,
     weight_boundary=3.0,
@@ -503,6 +535,12 @@ def legalize_result(
             gravity_iters=gravity_iters,
             use_cluster_merge=use_cluster_merge,
             hpwl_slack_ratio=hpwl_slack_ratio,
+            use_snap_boundary=use_snap_boundary,
+            boundary_hpwl_slack_ratio=boundary_hpwl_slack_ratio,
+            use_pair_reinsert=use_pair_reinsert,
+            pair_reinsert_sweeps=pair_reinsert_sweeps,
+            pair_reinsert_grid_density=pair_reinsert_grid_density,
+            pair_reinsert_hpwl_slack_ratio=pair_reinsert_hpwl_slack_ratio,
             use_second_merge_pass=use_second_merge_pass,
             weight_dist=weight_dist,
             weight_boundary=weight_boundary,
@@ -837,8 +875,14 @@ def run_one_sample(sample_idx, official, model, config, device,
                    n_samples=6, ddim_steps=100,
                    sampler="ddim", edm_steps=50, use_amp=False, post_repel_steps=30,
                    scale_t_windows=False, reinsert_sweeps=3, reinsert_grid_density=12,
+                   pin_force_strength=0.02, grouping_force_strength=0.030,
+                   boundary_nudge_strength=0.025, repulsion_strength=0.0375,
                    tie_break_modes=None, use_gravity=False, gravity_iters=40,
-                   use_cluster_merge=True, hpwl_slack_ratio=5.0, use_second_merge_pass=True,
+                   use_cluster_merge=True, hpwl_slack_ratio=5.0, use_snap_boundary=False,
+                   boundary_hpwl_slack_ratio=0.0,
+                   use_pair_reinsert=False, pair_reinsert_sweeps=2, pair_reinsert_grid_density=8,
+                   pair_reinsert_hpwl_slack_ratio=0.0,
+                   use_second_merge_pass=True,
                    weight_dist=1.0, weight_boundary=3.0, weight_cluster=1.0,
                    weight_b2b=0.5, weight_p2b=0.15, weight_shape=3.0,
                    use_cluster_adjacency=False, cluster_adjacency_bonus=5.0):
@@ -967,6 +1011,10 @@ def run_one_sample(sample_idx, official, model, config, device,
         gt_w=gt_w, gt_h=gt_h, gt_x=gt_x, gt_y=gt_y,
         sampler=sampler, edm_steps=edm_steps, use_amp=use_amp,
         post_repel_steps=post_repel_steps, scale_t_windows=scale_t_windows,
+        pin_force_strength=pin_force_strength,
+        grouping_force_strength=grouping_force_strength,
+        boundary_nudge_strength=boundary_nudge_strength,
+        repulsion_strength=repulsion_strength,
     )
     t_diffusion = time.perf_counter() - t_diff_start
 
@@ -1036,6 +1084,12 @@ def run_one_sample(sample_idx, official, model, config, device,
         gravity_iters=gravity_iters,
         use_cluster_merge=use_cluster_merge,
         hpwl_slack_ratio=hpwl_slack_ratio,
+        use_snap_boundary=use_snap_boundary,
+        boundary_hpwl_slack_ratio=boundary_hpwl_slack_ratio,
+        use_pair_reinsert=use_pair_reinsert,
+        pair_reinsert_sweeps=pair_reinsert_sweeps,
+        pair_reinsert_grid_density=pair_reinsert_grid_density,
+        pair_reinsert_hpwl_slack_ratio=pair_reinsert_hpwl_slack_ratio,
         use_second_merge_pass=use_second_merge_pass,
         weight_dist=weight_dist,
         weight_boundary=weight_boundary,

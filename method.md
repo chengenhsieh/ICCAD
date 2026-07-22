@@ -161,6 +161,35 @@ Models,"* ICLR 2021）的非馬可夫、可跳步反向過程，而非原始 DDP
    在採樣時 steer 生成軌跡」的手法與 diffusion guidance 文獻（見 1.3 引用的
    Dhariwal & Nichol 2021）同源，但這裡用的是任務特定的解析幾何力，而非
    學出來的 classifier gradient。
+
+   **力的強度（v5.0）**：這幾個力的強度（`grouping_force_strength`、
+   `boundary_nudge_strength`、`repulsion_strength`）原本從第一版就寫死沒調過。
+   100 樣本掃描（因為改動的是 diffusion 生成本身、無法像 legalize 端那樣共用
+   同一個 raw 輸出做 paired 比較，改用「同一個 sample idx 固定 `torch.manual_
+   seed`，讓不同力設定至少從同一組初始噪聲出發」逼近 paired 設計）發現三個力
+   原本都偏強、蓋過了模型自己學到的訊號：
+   - `grouping_force_strength`：0.015→0.030 讓 V_grouping 單調改善
+     （364→359→355），但加到 0.050 又惡化（357）——甜蜜點在 2 倍、不是越強
+     越好。
+   - `repulsion_strength`：0.05→0.025（減半）讓 area_gap、hpwl_gap、
+     V_relative **同時**變好；加倍到 0.10 反而 area_gap 變差。
+   - `boundary_nudge_strength`：0.05→0.025（減半）小幅改善；加倍到 0.10 讓
+     V_boundary 反而變差（116→122）。
+
+   三個各自的最佳值合在一起測（不是簡單相加）：area_gap／hpwl_gap 完全持平，
+   V_relative 從 0.1092 降到 0.1032（主要來自 V_grouping 359→339），換算
+   官方 cost 公式淨效益約 **−1.26%**，是這批推論參數實驗裡最大的一次改善。
+
+   **細掃確認（固定另外兩個力在最佳值，各自往上下再測）**：`grouping_
+   force_strength` 在 0.030 兩側（0.0225、0.040）都變差，確認就是甜蜜點；
+   `boundary_nudge_strength` 在 0.025～0.0375 之間幾乎打平，也維持 0.025；
+   但 `repulsion_strength` 在 0.025 兩側（0.0125、0.0375）反而都比 0.025
+   本身好——換兩組不同的 random seed 各自完整跑 100 樣本獨立確認，
+   `repulsion_strength=0.0375` 兩次都比 0.025 好（cost 公式估計約
+   −0.2%～−0.3%），只是改善的來源不太一致（一次主要是 V_grouping、一次
+   主要是 V_boundary），效應本身不大但方向穩定。最終預設值：
+   `grouping_force_strength=0.030`、`boundary_nudge_strength=0.025`、
+   `repulsion_strength=0.0375`。
 4. **Best-of-N + re-noise**：一次生成 `n_samples` 個候選（同一個 batch 一起
    跑，在 GPU 上幾乎是平行成本，不是序列疊加——100 樣本 A/B 顯示
    `n_samples: 6→14` 對 diffusion 時間幾乎沒有影響）。在 `t = renoise_idx`
@@ -327,6 +356,10 @@ constraint 被重新破壞的風險。
 | 依 `compute_cluster_violations` 精確定義（`_blocks_share_edge`）逐 cluster group 補做剛體貼合（`compact_merge_cluster_groups` 早期版本，只有全域違規不增加的安全閘門、沒有 HPWL 閘門） | 修正過連通性判定與「移動整個剛體可能牽動其他 group」的問題後，100 樣本測試 V_relative 仍在雜訊範圍內小幅上升（0.113→0.118），沒有取得可靠的淨改善 | **不採用**（見下一行：加上 HPWL 閘門後的版本才是後來採用的 v4.7） |
 | `weight_cluster` 掃描 1.0/2.0/3.0 | wc=2.0：area 23.7%→23.8%、hpwl 16.5%→17.2%、V_rel 0.113→0.103；wc=3.0：area→24.8%、hpwl→18.3%、V_rel→0.108——調高權重能壓低 V_relative，但總是以 hpwl gap 明顯變差為代價，且 area gap 也沒有跟著改善 | **不採用**（維持 1.0） |
 | `compact_merge_cluster_groups` 加上 **HPWL 不變差閘門**（`hpwl_slack_ratio`），並修正「放在 compact_reinsert 之前會被後續步驟撤銷」的排序 bug，移到 pipeline 最尾端 | 獨立取樣 100 樣本測 `hpwl_slack_ratio=0` 一開始幾乎沒改善（374→375），改用 **paired** 設計（同一組 diffusion 輸出餵給不同 legalize 設定，排除取樣雜訊）重測才發現訊號被雜訊蓋住：`slack=0` 讓 V_grouping 378→371（0 個樣本變差）；`slack=5.0`（5 個 block 身位）378→349（同樣 0 個變差、24 個變好），area_gap 100 樣本中只有 1 個可忽略的變化，hpwl_gap 平均代價僅 +0.16% | **採用**（v4.7，`hpwl_slack_ratio=5.0`，改為預設開啟） |
+| 比照 grouping 的做法，做 `compact_snap_boundary`：找出還沒真正貼到邊的 boundary block、把它所在的剛體貼合分量（貼合分量卡住時退而只搬它自己）推向 layout 目前的真實邊界，同樣用獨立的 `boundary_hpwl_slack_ratio` 當代價閘門 | 開發過程中先抓到一個真的 bug——分量只要含任何一個 preplaced block 就整個跳過，但真實資料壓縮完常常整個 layout 收斂成一塊涵蓋幾乎所有 block 的連通分量，導致這個機制幾乎永遠是 no-op；修正連通性（preplaced block 視為圖上的洞，不當跳板）並加上「整團搬不動就只搬自己」的 fallback 後，直接對 30 樣本中 17 個真的有 boundary 違規的 legalize 結果逐一測試，**0/17 個違規被修好**，即使把 HPWL 閘門放到很寬鬆也一樣。追一個具體案例發現這不是程式錯誤，而是結構性問題：pipeline 尾端這個階段的 layout 已經被 `compact_reinsert`/`compact_positions` 壓得很緊（平均 packing density ~77.5%），沒貼到邊的違規多半是「直線滑過去的路徑上剛好卡著另一個同樣合法佔位的 block」，不是「有空間但沒人推」，單純的單軸滑動修不了 | **不採用**（程式碼保留為 opt-in 函式；見下方說明） |
+| `compact_pair_reinsert`：仿 detailed placement 文獻的 2-block 聯合 remove-and-reinsert（`compact_reinsert` 一次只拔一個 block，看不到「兩個都要挪才能一起讓 bbox 縮小」的組合式改善），只對 touching graph 上彼此鄰接的 pair 出手，只有全域 bbox 嚴格變小才採用 | 合成測試（無 boundary/cluster 約束）100% 不變差、多組 seed 最多 −12.76% bbox，看起來很有效；但真實資料 100 樣本 paired 測試 **0/100 樣本有任何變化**，legalize 時間卻多了 46%。追蹤發現：選 pair 的依據（touching graph 鄰接）在真實資料上恰好選錯了目標——真實 layout 在這個 pass 之前已經被兩次 `compact_merge_clusters` 和 `compact_merge_cluster_groups` 充分拉緊過，彼此貼合的兩塊通常是有正當理由才貼在一起，拆開各自重插幾乎必定更差（追蹤到的案例新 bbox 比原本大 15-20%），安全閘門正確擋下了每一次嘗試。合成測試看似有效，是因為合成資料沒有 boundary/cluster 約束、跳過了那兩層額外拉緊機制，留下的是真正可以拆開重排的貼合對，這個差異不會在真實資料上出現 | **不採用**（機制本身正確、安全，只是在真實資料上是零效益 + 高成本的 no-op） |
+| Diffusion 採樣的 force-guidance **強度**（`grouping_force_strength`/`boundary_nudge_strength`/`repulsion_strength`，寫死後從未調過）：因為改動的是生成本身、無法像 legalize 端共用同一個 raw 輸出，改用「同一個 sample idx 固定 `torch.manual_seed`」逼近 paired 設計 | `grouping_force_strength` 0.015→0.030 讓 V_grouping 單調改善（364→359→355），加到 0.050 又惡化，甜蜜點在 2 倍；`repulsion_strength` 減半（0.05→0.025）讓 area/hpwl/V_relative 同時變好，加倍反而 area_gap 變差；`boundary_nudge_strength` 減半也小幅改善，加倍讓 V_boundary 變差（116→122）——三個力原本都偏強、蓋過模型自己學到的訊號。三個最佳值合在一起測（不是簡單相加）：area/hpwl 完全持平，V_relative 0.1092→0.1032（V_grouping 359→339），換算 cost 公式淨效益約 **−1.26%** | **採用**（v5.0，三者皆改為新預設） |
+| 在 v5.0 最佳值附近細掃（固定另外兩個力，各自往上下再測兩個值） | `grouping_force_strength` 在 0.030 兩側都變差，確認就是甜蜜點；`boundary_nudge_strength` 在 0.025~0.0375 之間打平；`repulsion_strength` 卻在 0.025 兩側（0.0125、0.0375）都比 0.025 本身好，換兩組不同 random seed 各自跑 100 樣本獨立確認，`0.0375` 都比 `0.025` 好（cost 公式估計約 -0.2%~-0.3%），只是改善來源兩次不太一致（一次主要是 V_grouping、一次主要是 V_boundary），效應本身不大但方向穩定 | **採用**（`repulsion_strength` 改為 0.0375；`grouping_force_strength`/`boundary_nudge_strength` 維持不變） |
 
 這個過程反映的核心判斷：**diffusion 端「批次內免費」的候選數（`n_samples`）
 值得投資；legalize 端單純「加碼同一種搜尋的強度」（不管是加大 `compact_reinsert`
@@ -358,6 +391,17 @@ diffusion 輸出，只換 legalize 設定）重測，才發現訊號其實一直
 取樣的結果下「沒有效果」的結論——除非改動的地方在 diffusion 端本身（那樣
 paired 設計就不適用了）。
 
+grouping 修好之後，回頭用同一套方法論（找出還沒滿足的違規、把它所在的剛體
+分量推向目標、用 HPWL 閘門保護代價）處理 boundary 違規（`compact_snap_
+boundary`），卻在 30 樣本的直接測試中 0/17 個違規被修好，這跟 grouping 的
+經驗形成有意思的對比，值得記錄兩者的關鍵差異：grouping 違規通常只需要把
+一個分裂出去的小分量往回拉，路徑上常常還有空間；boundary 違規出現在
+pipeline 已經跑完 `compact_reinsert`/`compact_positions`、整個 layout 被
+壓得很緊之後，此時沒貼到邊多半代表「直線路徑被另一個同樣合法佔位的 block
+擋死」，屬於需要真正 2D 重新排位（例如連帶把擋路的 block 也拔出來重插一次）
+才能解的問題，不是單軸滑動能修的範疇。這說明「照搬同一套修復手法」不能
+保證跨違規類型都有效，仍然需要針對每種違規的實際成因分別驗證。
+
 ---
 
 ## 最終結果（100 樣本官方 validation set）
@@ -365,10 +409,10 @@ paired 設計就不適用了）。
 | 指標 | 數值 |
 |---|---|
 | Hard constraint 違規 | 0 / 100（zero overlap, exact preplaced/fixed shape, area ≤1% error, 皆保證滿足） |
-| Area gap（vs. optimal） | ~24.0%（v4.7：`use_second_merge_pass` + `use_cluster_merge`/`hpwl_slack_ratio=5.0` 皆開啟後） |
-| HPWL gap（vs. optimal） | ~15.6% |
-| Soft constraint 違規率（V_relative） | ~0.106 |
-| 平均單樣本總時間 | ~2.5s（diffusion ~1.2s + legalize ~1.2s） |
+| Area gap（vs. optimal） | ~23.5%（v5.0：v4.7 legalize 設定 + force-guidance 強度細掃後的最終值） |
+| HPWL gap（vs. optimal） | ~15.7-16.1% |
+| Soft constraint 違規率（V_relative） | ~0.103-0.104 |
+| 平均單樣本總時間 | ~2.3-2.5s（diffusion ~1.2s + legalize ~1.0-1.2s） |
 
 （diffusion sampling 未固定 random seed，同一組參數重跑 100 樣本時上述數字
 本身會有 ±0.01 左右的自然波動，屬於量測雜訊而非參數變化造成——這也是為何

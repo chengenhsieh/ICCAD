@@ -626,6 +626,176 @@ def compact_reinsert(x, y, w, h, preplaced_mask=None, boundary_code=None,
     return x, y
 
 
+def _reinsert_best_position(idx, x, y, w, h, others_mask, boundary_code, avg_side,
+                            grid_density, gap_weight):
+    """
+    compact_reinsert 內層搜尋的獨立版本：假設 block idx 已經從 layout「拔出來」
+    （others_mask 標出還留在場上的 block），在 others_mask 目前佔用範圍內找
+    一個新位置，讓「重新插入後的 bbox 面積 + gap_weight * avg_side * 離最近
+    鄰居距離」最小。回傳 (best_x, best_y, best_cost)；others_mask 全空時回傳
+    block 原本的位置（沒有東西可以參考，維持原地）。
+    """
+    if not others_mask.any():
+        return float(x[idx]), float(y[idx]), 0.0
+    xo, yo, wo, ho = x[others_mask], y[others_mask], w[others_mask], h[others_mask]
+    ox_min = float(xo.min()); ox_max = float((xo + wo).max())
+    oy_min = float(yo.min()); oy_max = float((yo + ho).max())
+    wi, hi = float(w[idx]), float(h[idx])
+
+    def _nearest_gap(xc, yc):
+        gx = np.maximum(0.0, np.maximum(xo - (xc + wi), xc - (xo + wo)))
+        gy = np.maximum(0.0, np.maximum(yo - (yc + hi), yc - (yo + ho)))
+        return float(np.sqrt(gx * gx + gy * gy).min())
+
+    n_grid = max(int(grid_density), 3)
+    code = int(boundary_code[idx])
+    lock_x = bool(code & 3)
+    lock_y = bool(code & 12)
+    x_candidates = [float(x[idx])] if lock_x else np.linspace(ox_min - wi, ox_max, n_grid)
+    y_candidates = [float(y[idx])] if lock_y else np.linspace(oy_min - hi, oy_max, n_grid)
+
+    best_cost, best_pos = None, (float(x[idx]), float(y[idx]))
+    for xc in x_candidates:
+        xc = float(xc)
+        ox_arr = np.minimum(xc + wi, xo + wo) - np.maximum(xc, xo)
+        x_touches = ox_arr > 1e-9
+        for yc in y_candidates:
+            yc = float(yc)
+            oy_arr = np.minimum(yc + hi, yo + ho) - np.maximum(yc, yo)
+            if np.any(x_touches & (oy_arr > 1e-9)):
+                continue
+            bbox_cost = ((max(ox_max, xc + wi) - min(ox_min, xc)) *
+                         (max(oy_max, yc + hi) - min(oy_min, yc)))
+            cost = bbox_cost + gap_weight * avg_side * _nearest_gap(xc, yc)
+            if best_cost is None or cost < best_cost - 1e-9:
+                best_cost, best_pos = cost, (xc, yc)
+    if best_cost is None:
+        return None, None, None
+    return best_pos[0], best_pos[1], best_cost
+
+
+def compact_pair_reinsert(x, y, w, h, preplaced_mask=None, boundary_code=None,
+                          cluster_group=None, touch_tol_ratio=0.02, sweeps=3,
+                          grid_density=12, gap_weight=0.6,
+                          W_int=None, p2b_edges=None, pins_pos=None,
+                          hpwl_slack_ratio=0.0, verbose=False):
+    """
+    v4.9（實驗用）：`compact_reinsert` 一次只拔一個 block 出來重插——如果
+    「兩個互相靠近的 block 都要挪位置、才能一起讓 bbox 縮小」，單一 block
+    搜尋永遠看不到這個組合（各自單獨嘗試時，任何一個先移動都可能暫時讓
+    bbox 打平甚至變差，被 compact_reinsert「嚴格變好才採用」的規則擋下）。
+    這是 detailed placement 文獻裡標準的 local search 手法——一次移動一小群
+    互相鄰近的 block（這裡取最小的 pair），比單一 block 的搜尋更有機會跳出
+    「兩邊互卡」的局部最佳解。
+
+    只對 touching graph 上彼此鄰接的 pair 出手（把搜尋範圍限制在真正有機會
+    互相影響的鄰居，避免 O(k^2) 全枚舉）：把兩個 block 都拔出來，用跟
+    compact_reinsert 相同的網格搜尋依序找新位置（兩種順序都試，取較好的一
+    組），只有在滿足以下全部條件時才採用：
+      1. 最終全域 bbox 面積嚴格小於套用前（這是這個 pass 的核心目標，跟其他
+         compact_* pass「不變差就好」不同，這裡要求真的變好）。
+      2. boundary / cluster 違規數不變差（若提供 cluster_group）。
+      3. 總 HPWL 增加量不超過 hpwl_slack_ratio * avg_side（若提供 W_int/
+         p2b_edges/pins_pos；閘門邏輯跟 compact_merge_cluster_groups 一致）。
+    """
+    x = np.array(x, dtype=np.float64).copy()
+    y = np.array(y, dtype=np.float64).copy()
+    w = np.asarray(w, dtype=np.float64)
+    h = np.asarray(h, dtype=np.float64)
+    k = len(x)
+    if k < 2:
+        return x, y
+    if preplaced_mask is None:
+        preplaced_mask = np.zeros(k, dtype=bool)
+    else:
+        preplaced_mask = np.asarray(preplaced_mask, dtype=bool)
+    if boundary_code is None:
+        boundary_code = np.zeros(k, dtype=np.int64)
+    else:
+        boundary_code = np.asarray(boundary_code, dtype=np.int64)
+    has_cluster = cluster_group is not None
+    if has_cluster:
+        cluster_group = np.asarray(cluster_group, dtype=np.int64)
+
+    avg_side = float(np.mean(np.sqrt(w * h))) if k else 1.0
+    touch_tol = max(touch_tol_ratio * avg_side, 1e-6)
+    check_hpwl = W_int is not None or (p2b_edges and pins_pos is not None)
+    hpwl_slack = max(0.0, hpwl_slack_ratio) * avg_side
+
+    def _total_hpwl(xx, yy):
+        total = 0.0
+        if W_int is not None:
+            total += compute_hpwl_vectorized(xx, yy, w, h, W_int)
+        if p2b_edges and pins_pos is not None:
+            total += compute_p2b_hpwl(xx, yy, w, h, p2b_edges, pins_pos)
+        return total
+
+    def _bbox_area(xx, yy):
+        return (float((xx + w).max()) - float(xx.min())) * (float((yy + h).max()) - float(yy.min()))
+
+    for _sweep in range(sweeps):
+        xr = x + w; yt = y + h
+        gx = np.maximum(0.0, np.maximum(x[:, None] - xr[None, :], x[None, :] - xr[:, None]))
+        gy = np.maximum(0.0, np.maximum(y[:, None] - yt[None, :], y[None, :] - yt[:, None]))
+        adj = np.sqrt(gx * gx + gy * gy) <= touch_tol
+        np.fill_diagonal(adj, False)
+
+        pairs = [(i, j) for i in range(k) for j in np.nonzero(adj[i])[0] if j > i]
+        moved_any = False
+
+        for i, j in pairs:
+            if preplaced_mask[i] or preplaced_mask[j]:
+                continue
+            baseline_bbox = _bbox_area(x, y)
+            baseline_v = compute_boundary_violations(x, y, w, h, boundary_code)
+            baseline_cluster_v = compute_cluster_violations(x, y, w, h, cluster_group) if has_cluster else 0
+            baseline_hpwl = _total_hpwl(x, y) if check_hpwl else 0.0
+
+            best_result = None
+            for first, second in ((i, j), (j, i)):
+                others_first = np.ones(k, dtype=bool)
+                others_first[i] = False; others_first[j] = False
+                fx, fy, _ = _reinsert_best_position(first, x, y, w, h, others_first,
+                                                    boundary_code, avg_side, grid_density, gap_weight)
+                if fx is None:
+                    continue
+                xt = x.copy(); yt2 = y.copy()
+                xt[first] = fx; yt2[first] = fy
+
+                others_second = np.ones(k, dtype=bool)
+                others_second[second] = False
+                sx, sy, _ = _reinsert_best_position(second, xt, yt2, w, h, others_second,
+                                                    boundary_code, avg_side, grid_density, gap_weight)
+                if sx is None:
+                    continue
+                xt[second] = sx; yt2[second] = sy
+
+                new_bbox = _bbox_area(xt, yt2)
+                if new_bbox >= baseline_bbox - 1e-6:
+                    continue
+                if compute_boundary_violations(xt, yt2, w, h, boundary_code) > baseline_v:
+                    continue
+                if has_cluster and compute_cluster_violations(xt, yt2, w, h, cluster_group) > baseline_cluster_v:
+                    continue
+                if check_hpwl and _total_hpwl(xt, yt2) > baseline_hpwl + hpwl_slack + 1e-6:
+                    continue
+                if best_result is None or new_bbox < best_result[0] - 1e-9:
+                    best_result = (new_bbox, xt, yt2)
+
+            if best_result is not None:
+                _, xt, yt2 = best_result
+                x[:] = xt; y[:] = yt2
+                moved_any = True
+                if verbose:
+                    print("compact_pair_reinsert: sweep={} pair=({},{}) bbox {:.1f} -> {:.1f}".format(
+                        _sweep, i, j, baseline_bbox, best_result[0]))
+
+        if not moved_any:
+            break
+
+    return x, y
+
+
 def compact_merge_clusters(x, y, w, h, preplaced_mask=None, boundary_code=None,
                            touch_tol_ratio=0.02, rounds=20, verbose=False):
     """
@@ -936,6 +1106,326 @@ def compact_merge_clusters(x, y, w, h, preplaced_mask=None, boundary_code=None,
             n2 += 1
         print("compact_merge_clusters done: {} connected component(s) remaining "
               "(1 = fully merged)".format(n2))
+
+    return x, y
+
+
+def compact_snap_boundary(x, y, w, h, preplaced_mask=None, boundary_code=None,
+                          cluster_group=None, touch_tol_ratio=0.02, rounds=10,
+                          W_int=None, p2b_edges=None, pins_pos=None,
+                          boundary_hpwl_slack_ratio=0.0, verbose=False):
+    """
+    針對目前還沒真正貼到邊的 boundary block，把它所在的剛體貼合分量整體
+    平移，推向 layout 目前的真實邊界（xmin/xmax/ymin/ymax——boundary 的定義
+    見 compute_boundary_violations，是「目前所有 block 的 bbox」，不是
+    outline/canvas），直到貼上邊界或被別的 block 擋住為止。
+
+    動機：`compact_positions` 只往 -x/-y 方向壓縮，這剛好跟 LEFT(1)/
+    BOTTOM(8) 鎖定的方向一致，所以這兩種 lock 通常會被自然帶到邊界；但
+    RIGHT(2)/TOP(4) 鎖定需要的是「往 +x/+y 推」，而 pipeline 裡沒有任何
+    通用機制做這件事——這些 block 只有在 legalize_lff 最初的 LFF 放置階段
+    被「往 outline 邊界拉」的加權中位數軟性訊號影響過一次（會跟 weight_dist
+    /weight_cluster/weight_b2b 等競爭，不保證真的落在邊界上），放置完之後
+    的每個壓縮 pass 都只會「保護」它們的位置不被 -x/-y 壓縮誤傷，沒有人會
+    再把它們往外推。這是 V_boundary 違規裡結構性、方向不對稱的主因之一。
+
+    每次移動都：
+    1. 用二分法找最大安全平移距離——目標本身就是「現有的邊界值」，所以移動
+       不會讓 bbox 變大；若中途被其他 block 擋住，則移到安全上限為止（不保
+       證這輪就真的貼上，但下一輪 touching graph 更新後可能又有新空間）。
+    2. 移動的是這個 block 所在的剛體貼合分量（沿用跟 compact_merge_clusters
+       一樣的鬆散 touching graph），保留跟其他 block 既有的貼合關係，不拆散
+       既有的 cluster/HPWL 接觸。
+    3. 安全閘門：移動後總 boundary 違規數不能超過移動前（跟 compact_merge_
+       clusters 用同一個判定式；因為目標本身就是現有邊界值，這個移動不可能
+       讓任何「其他」被鎖定的 block 失去其極值地位）；若提供 cluster_group，
+       移動後總 cluster 違規數也不能變差；若提供 W_int/p2b_edges/pins_pos，
+       移動前後總 HPWL 增加量不能超過 boundary_hpwl_slack_ratio * avg_side
+       （用獨立參數，不跟 compact_merge_cluster_groups 的 hpwl_slack_ratio
+       共用，方便個別調參；閘門邏輯跟該函式一致，見其 docstring）。
+    """
+    x = np.array(x, dtype=np.float64).copy()
+    y = np.array(y, dtype=np.float64).copy()
+    w = np.asarray(w, dtype=np.float64)
+    h = np.asarray(h, dtype=np.float64)
+    k = len(x)
+    if k < 2:
+        return x, y
+    if preplaced_mask is None:
+        preplaced_mask = np.zeros(k, dtype=bool)
+    else:
+        preplaced_mask = np.asarray(preplaced_mask, dtype=bool)
+    if boundary_code is None:
+        boundary_code = np.zeros(k, dtype=np.int64)
+    else:
+        boundary_code = np.asarray(boundary_code, dtype=np.int64)
+    if not (boundary_code > 0).any():
+        return x, y
+    has_cluster = cluster_group is not None
+    if has_cluster:
+        cluster_group = np.asarray(cluster_group, dtype=np.int64)
+
+    avg_side = float(np.mean(np.sqrt(w * h))) if k else 1.0
+    touch_tol = max(touch_tol_ratio * avg_side, 1e-6)
+
+    check_hpwl = W_int is not None or (p2b_edges and pins_pos is not None)
+    hpwl_slack = max(0.0, boundary_hpwl_slack_ratio) * avg_side
+
+    def _total_hpwl(xx, yy):
+        total = 0.0
+        if W_int is not None:
+            total += compute_hpwl_vectorized(xx, yy, w, h, W_int)
+        if p2b_edges and pins_pos is not None:
+            total += compute_p2b_hpwl(xx, yy, w, h, p2b_edges, pins_pos)
+        return total
+
+    # bit -> (axis, sign, edge_fn(x,y,w,h,i) -> current edge coord of block i)
+    _BITS = (
+        (1, 'x', -1),   # LEFT: 往 -x 貼齊 xmin
+        (2, 'x', +1),   # RIGHT: 往 +x 貼齊 xmax
+        (4, 'y', +1),   # TOP: 往 +y 貼齊 ymax
+        (8, 'y', -1),   # BOTTOM: 往 -y 貼齊 ymin
+    )
+
+    for _round in range(rounds):
+        xr = x + w; yt = y + h
+        gx = np.maximum(0.0, np.maximum(x[:, None] - xr[None, :], x[None, :] - xr[:, None]))
+        gy = np.maximum(0.0, np.maximum(y[:, None] - yt[None, :], y[None, :] - yt[:, None]))
+        adj = np.sqrt(gx * gx + gy * gy) <= touch_tol
+        np.fill_diagonal(adj, False)
+
+        # 連通分量刻意排除 preplaced block（當圖上的洞，不可通過、不可移動）
+        # 才計算——若照「鬆散 touching graph 的連通分量裡只要有一個 preplaced
+        # block 就整個跳過」的舊邏輯，實測發現經過前面幾輪壓縮後，整個 layout
+        # 常常已經收斂成一個涵蓋幾乎所有 block 的巨大連通分量，導致這個函式
+        # 在真實資料上幾乎永遠是 no-op（因為 preplaced block 幾乎必然跟其他
+        # 所有東西連在一起）。只把「經由非 preplaced block 互相貼合」能連到
+        # i 的那些 block 一起搬，preplaced block 本身與只能透過它才連得到的
+        # 部分則保持原地不動（在 others_mask 裡當固定的重疊檢查對象）。
+        movable = ~preplaced_mask
+        adj_mv = adj & movable[:, None] & movable[None, :]
+        comp_id_mv = -np.ones(k, dtype=int)
+        n_comp_mv = 0
+        for s in range(k):
+            if not movable[s] or comp_id_mv[s] != -1:
+                continue
+            stack = [s]; comp_id_mv[s] = n_comp_mv
+            while stack:
+                u = stack.pop()
+                for v in np.nonzero(adj_mv[u])[0]:
+                    if comp_id_mv[v] == -1:
+                        comp_id_mv[v] = n_comp_mv; stack.append(v)
+            n_comp_mv += 1
+
+        xmin, xmax = float(x.min()), float(xr.max())
+        ymin, ymax = float(y.min()), float(yt.max())
+        rel_tol = 1e-2 * max(xmax - xmin, ymax - ymin, 1e-6)
+
+        moved_any = False
+        handled_comp_axis = set()   # (comp_id_mv, axis) 這輪已經處理過，避免重工
+
+        def _try_evict_boundary_obstacles(i, dx, dy, baseline_v, baseline_cluster_v, baseline_hpwl):
+            """
+            v4.8：i 自己單獨滑到目標位置時，找出擋在路上的 obstacle block（≤2
+            個、都不是 preplaced 才處理，太多個代表問題更複雜、不硬解）。依序
+            把每個 obstacle「請出去」，用跟 compact_reinsert 完全一樣的網格
+            搜尋邏輯（bbox 面積最小、避開所有其他 block）幫它們在別處找新家，
+            i 則直接佔用騰出來的位置。全部 obstacle 都成功找到新家、且整體
+            通過 boundary/cluster/HPWL 三道閘門才會採用；任何一步失敗就整個
+            放棄（不留下部分套用的中間狀態）。
+
+            回傳 (used_mask, apply_fn)；失敗回傳 (None, None)。
+            """
+            if preplaced_mask[i]:
+                return None, None
+            target_x, target_y = float(x[i] + dx), float(y[i] + dy)
+
+            others = np.ones(k, dtype=bool); others[i] = False
+            ox_ = np.minimum(target_x + w[i], x[others] + w[others]) - np.maximum(target_x, x[others])
+            oy_ = np.minimum(target_y + h[i], y[others] + h[others]) - np.maximum(target_y, y[others])
+            blocked = (ox_ > 1e-9) & (oy_ > 1e-9)
+            obstacle_idx = np.nonzero(others)[0][blocked]
+            if len(obstacle_idx) == 0 or len(obstacle_idx) > 2:
+                return None, None
+            if preplaced_mask[obstacle_idx].any():
+                return None, None
+
+            xt = x.copy(); yt2 = y.copy()
+            xt[i] = target_x; yt2[i] = target_y
+            moved_obstacles = []
+            for oj in obstacle_idx.tolist():
+                oj = int(oj)
+                others2 = np.ones(k, dtype=bool); others2[oj] = False
+                xo2, yo2, wo2, ho2 = xt[others2], yt2[others2], w[others2], h[others2]
+                ox_min = float(xo2.min()); ox_max = float((xo2 + wo2).max())
+                oy_min = float(yo2.min()); oy_max = float((yo2 + ho2).max())
+                lock_x_oj = bool(int(boundary_code[oj]) & 3)
+                lock_y_oj = bool(int(boundary_code[oj]) & 12)
+                cur_xj, cur_yj = float(xt[oj]), float(yt2[oj])
+                x_cands = [cur_xj] if lock_x_oj else np.linspace(ox_min - w[oj], ox_max, 12)
+                y_cands = [cur_yj] if lock_y_oj else np.linspace(oy_min - h[oj], oy_max, 12)
+
+                best_pos, best_cost = None, None
+                for xc in x_cands:
+                    xc = float(xc)
+                    ox_arr = np.minimum(xc + w[oj], xo2 + wo2) - np.maximum(xc, xo2)
+                    x_touches = ox_arr > 1e-9
+                    for yc in y_cands:
+                        yc = float(yc)
+                        oy_arr = np.minimum(yc + h[oj], yo2 + ho2) - np.maximum(yc, yo2)
+                        if np.any(x_touches & (oy_arr > 1e-9)):
+                            continue
+                        bbox_cost = ((max(ox_max, xc + w[oj]) - min(ox_min, xc)) *
+                                     (max(oy_max, yc + h[oj]) - min(oy_min, yc)))
+                        if best_cost is None or bbox_cost < best_cost - 1e-9:
+                            best_cost, best_pos = bbox_cost, (xc, yc)
+                if best_pos is None:
+                    return None, None
+                xt[oj], yt2[oj] = best_pos
+                moved_obstacles.append(oj)
+
+            xr2 = xt + w; ytop2 = yt2 + h
+            ov_x = np.minimum(xr2[:, None], xr2[None, :]) - np.maximum(xt[:, None], xt[None, :])
+            ov_y = np.minimum(ytop2[:, None], ytop2[None, :]) - np.maximum(yt2[:, None], yt2[None, :])
+            ov = (ov_x > 1e-9) & (ov_y > 1e-9)
+            np.fill_diagonal(ov, False)
+            if ov.any():
+                return None, None
+            # 跟其他兩層（整團剛體、solo）不同：eviction 這條路徑的目標位置是
+            # 靠網格搜尋找出來的，不是「移到現有邊界值」這種數學上保證不會讓
+            # bbox 變大的操作，需要額外顯式檢查，維持跟其他 compact_* pass
+            # 一致的「證明上單調不變差」設計原則。
+            baseline_bbox = (float((x + w).max()) - float(x.min())) * (float((y + h).max()) - float(y.min()))
+            new_bbox = (float(xr2.max()) - float(xt.min())) * (float(ytop2.max()) - float(yt2.min()))
+            if new_bbox > baseline_bbox + 1e-6:
+                return None, None
+            if compute_boundary_violations(xt, yt2, w, h, boundary_code) > baseline_v:
+                return None, None
+            if has_cluster and compute_cluster_violations(xt, yt2, w, h, cluster_group) > baseline_cluster_v:
+                return None, None
+            if check_hpwl and _total_hpwl(xt, yt2) > baseline_hpwl + hpwl_slack + 1e-6:
+                return None, None
+
+            used = np.zeros(k, dtype=bool)
+            used[i] = True
+            for oj in moved_obstacles:
+                used[oj] = True
+            return used, (lambda t, xt=xt, yt2=yt2: (xt, yt2))
+
+        for i in range(k):
+            code = int(boundary_code[i])
+            if code == 0 or preplaced_mask[i]:
+                continue
+            c = int(comp_id_mv[i])
+
+            for bit, axis, sign in _BITS:
+                if not (code & bit):
+                    continue
+                if (c, axis) in handled_comp_axis:
+                    continue
+                if axis == 'x':
+                    cur = (x[i] + w[i]) if sign > 0 else x[i]
+                    target = xmax if sign > 0 else xmin
+                else:
+                    cur = (y[i] + h[i]) if sign > 0 else y[i]
+                    target = ymax if sign > 0 else ymin
+                if abs(cur - target) <= rel_tol:
+                    continue   # 已經貼齊，不用動
+                needed = target - cur
+                if sign * needed <= 1e-9:
+                    continue   # 方向不對（理論上不會發生，防禦性檢查）
+                handled_comp_axis.add((c, axis))
+
+                dx, dy = (needed, 0.0) if axis == 'x' else (0.0, needed)
+                baseline_v = compute_boundary_violations(x, y, w, h, boundary_code)
+                baseline_cluster_v = compute_cluster_violations(x, y, w, h, cluster_group) if has_cluster else 0
+                baseline_hpwl = _total_hpwl(x, y) if check_hpwl else 0.0
+
+                def _solve(comp_mask, dx=dx, dy=dy, baseline_v=baseline_v,
+                           baseline_cluster_v=baseline_cluster_v, baseline_hpwl=baseline_hpwl):
+                    others_mask = ~comp_mask
+
+                    def _apply(t):
+                        xt = x.copy(); yt2 = y.copy()
+                        xt[comp_mask] = x[comp_mask] + dx * t
+                        yt2[comp_mask] = y[comp_mask] + dy * t
+                        return xt, yt2
+
+                    def _overlap_bad(xt, yt2):
+                        if not others_mask.any():
+                            return False
+                        gx_, gy_, gw_, gh_ = xt[comp_mask], yt2[comp_mask], w[comp_mask], h[comp_mask]
+                        ox_, oy_, ow_, oh_ = xt[others_mask], yt2[others_mask], w[others_mask], h[others_mask]
+                        ovx = np.minimum(gx_[:, None] + gw_[:, None], ox_[None, :] + ow_[None, :]) - \
+                              np.maximum(gx_[:, None], ox_[None, :])
+                        ovy = np.minimum(gy_[:, None] + gh_[:, None], oy_[None, :] + oh_[None, :]) - \
+                              np.maximum(gy_[:, None], oy_[None, :])
+                        return bool(((ovx > 1e-9) & (ovy > 1e-9)).any())
+
+                    def _feasible(t):
+                        xt, yt2 = _apply(t)
+                        if _overlap_bad(xt, yt2):
+                            return False
+                        if compute_boundary_violations(xt, yt2, w, h, boundary_code) > baseline_v:
+                            return False
+                        if has_cluster and compute_cluster_violations(xt, yt2, w, h, cluster_group) > baseline_cluster_v:
+                            return False
+                        if check_hpwl and _total_hpwl(xt, yt2) > baseline_hpwl + hpwl_slack + 1e-6:
+                            return False
+                        return True
+
+                    if _feasible(1.0):
+                        return 1.0, _apply
+                    if not _feasible(0.0):
+                        return 0.0, _apply
+                    lo, hi = 0.0, 1.0
+                    for _ in range(30):
+                        mid = (lo + hi) / 2.0
+                        if _feasible(mid):
+                            lo = mid
+                        else:
+                            hi = mid
+                    return lo, _apply
+
+                # 先試整個剛體貼合分量（保留 i 跟其他 block 既有的貼合關係）；
+                # 如果分量太大、被某個「跟這個違規本身無關」的旁觀成員卡住
+                # （i 自己其實有空間，但硬被一起搬的鄰居擋住），退而求其次只搬
+                # i 自己（會拆散 i 原本的貼合，但仍然受 boundary/cluster/HPWL
+                # 閘門保護，不會讓其他 soft constraint 或 HPWL 明顯變差）。
+                comp_mask = comp_id_mv == c
+                t_max, apply_fn = _solve(comp_mask)
+                used_mask = comp_mask
+                if t_max <= 1e-6 and int(comp_mask.sum()) > 1:
+                    solo_mask = np.zeros(k, dtype=bool)
+                    solo_mask[i] = True
+                    t_max, apply_fn = _solve(solo_mask)
+                    used_mask = solo_mask
+
+                if t_max <= 1e-6:
+                    # 連「只搬 i 自己」都卡死：多半是直線路徑上剛好卡著一、兩個
+                    # 同樣合法佔位的 obstacle（見 compact_snap_boundary docstring
+                    # 的 v4.8 討論）。單軸滑動解不開，改用「detailed placement」
+                    # 風格的做法——把擋路的 obstacle 也一起請出去，用 grid 搜尋
+                    # （跟 compact_reinsert 同一套邏輯）幫它們在別處找新家，i 直接
+                    # 佔用騰出來的位置貼齊邊界。
+                    ev_mask, ev_apply = _try_evict_boundary_obstacles(
+                        i, dx, dy, baseline_v, baseline_cluster_v, baseline_hpwl)
+                    if ev_mask is not None:
+                        t_max = 1.0
+                        apply_fn = ev_apply
+                        used_mask = ev_mask
+
+                if t_max > 1e-6:
+                    xt, yt2 = apply_fn(t_max)
+                    x[:] = xt; y[:] = yt2
+                    moved_any = True
+                    if verbose:
+                        print("compact_snap_boundary: round={} comp={} bit={} "
+                              "moved t={:.3f} ({} block(s))".format(
+                                  _round, c, bit, t_max, int(used_mask.sum())))
+
+        if not moved_any:
+            break
 
     return x, y
 
@@ -1496,6 +1986,10 @@ def legalize_lff(
     use_reinsert=True,
     reinsert_sweeps=3,
     reinsert_grid_density=12,
+    use_pair_reinsert=False,   # 實驗用：見 compact_pair_reinsert 呼叫處說明
+    pair_reinsert_sweeps=2,    # 獨立於 reinsert_sweeps，時間成本較高，預設保守一點
+    pair_reinsert_grid_density=8,
+    pair_reinsert_hpwl_slack_ratio=0.0,
     tie_break_mode="area_desc",   # 'area_desc' | 'area_asc' | 'flexibility'（實驗用）
     # v4.4 實驗：100 樣本 A/B 顯示 compact_gravity 對 area_gap/hpwl_gap/
     # V_relative 都是輕微負面（且不會修到「多個獨立衛星群共享同一條被鎖死
@@ -1509,6 +2003,8 @@ def legalize_lff(
     # 平均 hpwl_gap 代價僅 +0.16%。
     use_cluster_merge=True,
     hpwl_slack_ratio=5.0,
+    use_snap_boundary=False,   # 實驗用：見 compact_snap_boundary 呼叫處說明
+    boundary_hpwl_slack_ratio=0.0,   # 實驗用：見 compact_snap_boundary docstring
     # v4.6: 100 樣本 A/B 驗證後改為預設開啟。compact_reinsert 的局部搜尋常常
     # 開出新的「彼此貼合」機會，第一次 compact_merge_clusters（在 reinsert
     # 之前）看不到——補跑第二次讓 area_gap 24.6%→23.1%、V_relative 也同步
@@ -1966,6 +2462,25 @@ def legalize_lff(
         x, y = compact_merge_clusters(x, y, w, h, preplaced_mask=preplaced_mask,
                                       boundary_code=boundary_code, verbose=verbose)
 
+    # ---- 把還沒真正貼到邊的 boundary block 推向真實邊界（v4.8，實驗用）----
+    # compact_positions 只往 -x/-y 壓縮，剛好跟 LEFT/BOTTOM 鎖定的方向一致，
+    # 但 RIGHT/TOP 鎖定需要往 +x/+y 推，pipeline 裡沒有對應機制——這些 block
+    # 只在最初 LFF 放置時被一個會跟其他目標競爭的加權中位數軟性訊號拉過一次，
+    # 之後所有壓縮 pass 都只保護它們的位置、不會再往外推。compact_snap_
+    # boundary 直接找出目前沒貼齊的 boundary block、把它所在的剛體貼合分量
+    # 整體推向 layout 目前的真實邊界，同樣用一個獨立的 boundary_hpwl_slack_ratio
+    # 當代價閘門（見該函式 docstring；跟 compact_merge_cluster_groups 的
+    # hpwl_slack_ratio 分開，方便個別調參）。放在跟 compact_merge_cluster_groups
+    # 一樣的 pipeline 尾端位置，理由相同：避免被後續步驟撤銷。
+    if use_snap_boundary:
+        x, y = compact_snap_boundary(x, y, w, h, preplaced_mask=preplaced_mask,
+                                     boundary_code=boundary_code,
+                                     cluster_group=cluster_group,
+                                     W_int=W_int, p2b_edges=p2b_edges,
+                                     pins_pos=pins_pos,
+                                     boundary_hpwl_slack_ratio=boundary_hpwl_slack_ratio,
+                                     verbose=verbose)
+
     # ---- 針對 cluster group 本身的連通性做合併（v4.7，實驗用）----
     # compact_merge_clusters 合併的依據是「bbox 面積最大的全域主要群」，跟
     # cluster soft constraint（V_grouping，見 compute_cluster_violations：
@@ -1989,6 +2504,28 @@ def legalize_lff(
                                             pins_pos=pins_pos,
                                             hpwl_slack_ratio=hpwl_slack_ratio,
                                             verbose=verbose)
+
+    # ---- 2-block 聯合 reinsert（v4.9，實驗用）----
+    # compact_reinsert 一次只拔一個 block，看不到「兩個互相鄰近的 block 都
+    # 要挪、才能一起讓 bbox 縮小」這種組合式改善——這是 detailed placement
+    # 文獻裡標準的 local search 手法（一次移動一小群、而不是一個）。只對
+    # touching graph 上彼此鄰接的 pair 出手，只有在讓全域 bbox 面積嚴格
+    # 變小、且不讓 boundary/cluster/HPWL 變差時才採用（見 compact_pair_
+    # reinsert docstring）。刻意放在 pipeline 最尾端、所有其他幾何調整都
+    # 完成之後才做：早期實測放在 compact_reinsert 之後、compact_positions
+    # 之前，雖然每一步本身都保證讓 bbox 嚴格變小，但改變了起始點後，後續
+    # compact_positions / 兩次 compact_merge_clusters 等貪婪 pass 有時會走
+    # 到不同、甚至更差的局部最佳解（同一批 seed 中出現過 +0.36% 的淨退步）
+    # ——這正是先前 v4.6/v4.7/v4.8 都學到的教訓：任何「局部保證變好」的
+    # pass，只要後面還有其他貪婪 pass 會重新處理同一批 block，就不能保證
+    # 對「最終」結果也是單調不變差，必須放在真正的尾端才安全。
+    if use_pair_reinsert:
+        x, y = compact_pair_reinsert(x, y, w, h, preplaced_mask=preplaced_mask,
+                                     boundary_code=boundary_code, cluster_group=cluster_group,
+                                     sweeps=pair_reinsert_sweeps, grid_density=pair_reinsert_grid_density,
+                                     W_int=W_int, p2b_edges=p2b_edges, pins_pos=pins_pos,
+                                     hpwl_slack_ratio=pair_reinsert_hpwl_slack_ratio,
+                                     verbose=verbose)
 
     # ---- 保底驗證：理論上此時已經零重疊，這裡只是零成本的防禦性再確認 ----
     preplaced_idx_list = [i for i in range(k) if preplaced_mask[i]]

@@ -49,6 +49,11 @@ class Config:
     warmup_steps: int = 1000
     ema_decay: float = 0.9999
     num_workers: int = 0
+    # 固定資料 shuffle 順序 + 模型初始權重，讓「同一組設定跑兩次」或
+    # 「只改一個變因（例如 weight_soft_loss_by_alpha_bar）比較兩次」時，
+    # 差異不會被隨機初始化/shuffle 順序汙染。不保證 GPU 運算逐 bit
+    # 重現（cudnn 非決定性演算法沒關），但足以讓 A/B 比較乾淨。
+    seed: int = 42
 
     # -- Soft constraint loss 權重（v3 新增）--
     # 這些懲罰項加在 diffusion 的 MSE loss 之上，從預測的 x0 計算。
@@ -64,6 +69,25 @@ class Config:
     # 跟其他 soft loss 同步 warmup，從 warmup 之後才啟用。
     lambda_overlap: float = 0.3
     soft_loss_warmup_epochs: int = 10   # 前幾個 epoch 先只做去噪
+
+    # v5.8（實驗用，尚未訓練驗證，預設關閉）：soft constraint loss
+    # （mib/cluster/boundary/overlap）目前對所有隨機取樣到的 timestep t
+    # 一視同仁地套用同樣力道，但這些 loss 全部是從
+    # x0_pred = (x_t - sqrt(1-ᾱ_t)·noise_pred) / sqrt(ᾱ_t) 反推出來的——
+    # t 越大（雜訊越多）ᾱ_t 越接近 0，這個反推在數值上越不穩定，x0_pred
+    # 這時候基本上不可信（現在只有 clamp 防 NaN/inf，沒有依可信度調整這些
+    # loss 的貢獻）。開啟這個旗標後，每個 batch 內每個樣本的 soft loss 會
+    # 依自己那個樣本的 ᾱ_t 做加權平均（ᾱ_t 越接近 1 = t 越小 = 越可信 =
+    # 權重越大），直接重用 training_loss 裡本來就會算的 ᾱ_t，不需要額外
+    # 調參數（見 diffusion.py: GaussianDiffusion.training_loss /
+    # _soft_constraint_loss 說明）。
+    # 設 False 時完全等同這個旗標加入之前的訓練行為（mib/cluster/overlap
+    # 三項數學上完全等價，boundary 項刻意維持原本的全 batch pooled 算法，
+    # 不是逐樣本平均）——這樣可以在同一個訓練設定下只單獨測試「加不加 t
+    # 權重」這一個變因，不會混進「boundary loss 怎麼 pooled」這第二個
+    # 變因。這個功能還沒有實際訓練驗證過，先維持 False，等短跑（例如 30
+    # epoch）A/B 有訊號再考慮改預設值。
+    weight_soft_loss_by_alpha_bar: bool = False
 
     # -- Attention group bias（v3 新增）--
     use_group_attention_bias: bool = True

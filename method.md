@@ -127,6 +127,27 @@ GANs on Image Synthesis,"* NeurIPS 2021 的 classifier guidance）師出同源�
   val loss 時存 checkpoint（`model_epoch300_overlap_v4.pt` 即為本次提交使用
   的最終權重）。
 
+### 1.5 訓練端實驗：soft constraint loss 依 timestep 加權（嘗試過，未採用）
+
+Part 2 記錄的推論端調整（force-guidance 強度、legalize 後處理）在真實資料上
+逐漸摸到天花板後，第一次改動訓練本身：1.3 節的四個 soft constraint loss 都是
+從反推出的 `x0_pred` 算的，而這個反推在 t 大（雜訊多）時數值上很不穩定，但
+訓練時對所有隨機取樣到的 t 一視同仁套用同樣的 loss 力道，等於有不少訓練訊號
+來自「模型還看不清楚長什麼樣」的時間點。加了一個 `weight_soft_loss_by_alpha_
+bar` 開關，讓每個 sample 的 soft loss 依自己的 ᾱ_t（本來就要算，不需要新參數）
+加權，t 小、x0_pred 可信時權重大，t 大時自動壓低。
+
+30 epoch 短跑驗證顯示訊號正面（真實資料 raw overlap 明顯且一致變好、
+area_gap 21/30 樣本更好），跑完整 300 epoch 後用 100 樣本 paired inference
+跟目前的 `model_epoch300_overlap_v4.pt` 正式比較：模型自己生成的 raw overlap
+確實穩定變好（-15.5%，83/100 樣本更好，這是 v5.x 系列裡少數幾個訓練/推論端
+改動能讓「模型原始生成品質」有一致、可重複改善的），但這個優勢在通過
+`legalize_lff` 的強力壓縮後被大幅抹平——真正決定分數的 area_gap／V_relative
+沒有可靠的淨改善（逐樣本勝率都接近五五波），換算 cost 公式打平。**不採用**，
+`my_optimizer.py`/`inference.py` 維持使用 v4；機制與訓練出的
+`model_epoch300_overlap_v5.pt` 都保留，供日後 legalize 端有更能吃到「原始
+品質變好」這件事的改動時重新配對測試。完整實驗記錄見 CHANGELOG.md v5.8。
+
 ---
 
 ## Part 2 — Inference
@@ -360,6 +381,12 @@ constraint 被重新破壞的風險。
 | `compact_pair_reinsert`：仿 detailed placement 文獻的 2-block 聯合 remove-and-reinsert（`compact_reinsert` 一次只拔一個 block，看不到「兩個都要挪才能一起讓 bbox 縮小」的組合式改善），只對 touching graph 上彼此鄰接的 pair 出手，只有全域 bbox 嚴格變小才採用 | 合成測試（無 boundary/cluster 約束）100% 不變差、多組 seed 最多 −12.76% bbox，看起來很有效；但真實資料 100 樣本 paired 測試 **0/100 樣本有任何變化**，legalize 時間卻多了 46%。追蹤發現：選 pair 的依據（touching graph 鄰接）在真實資料上恰好選錯了目標——真實 layout 在這個 pass 之前已經被兩次 `compact_merge_clusters` 和 `compact_merge_cluster_groups` 充分拉緊過，彼此貼合的兩塊通常是有正當理由才貼在一起，拆開各自重插幾乎必定更差（追蹤到的案例新 bbox 比原本大 15-20%），安全閘門正確擋下了每一次嘗試。合成測試看似有效，是因為合成資料沒有 boundary/cluster 約束、跳過了那兩層額外拉緊機制，留下的是真正可以拆開重排的貼合對，這個差異不會在真實資料上出現 | **不採用**（機制本身正確、安全，只是在真實資料上是零效益 + 高成本的 no-op） |
 | Diffusion 採樣的 force-guidance **強度**（`grouping_force_strength`/`boundary_nudge_strength`/`repulsion_strength`，寫死後從未調過）：因為改動的是生成本身、無法像 legalize 端共用同一個 raw 輸出，改用「同一個 sample idx 固定 `torch.manual_seed`」逼近 paired 設計 | `grouping_force_strength` 0.015→0.030 讓 V_grouping 單調改善（364→359→355），加到 0.050 又惡化，甜蜜點在 2 倍；`repulsion_strength` 減半（0.05→0.025）讓 area/hpwl/V_relative 同時變好，加倍反而 area_gap 變差；`boundary_nudge_strength` 減半也小幅改善，加倍讓 V_boundary 變差（116→122）——三個力原本都偏強、蓋過模型自己學到的訊號。三個最佳值合在一起測（不是簡單相加）：area/hpwl 完全持平，V_relative 0.1092→0.1032（V_grouping 359→339），換算 cost 公式淨效益約 **−1.26%** | **採用**（v5.0，三者皆改為新預設） |
 | 在 v5.0 最佳值附近細掃（固定另外兩個力，各自往上下再測兩個值） | `grouping_force_strength` 在 0.030 兩側都變差，確認就是甜蜜點；`boundary_nudge_strength` 在 0.025~0.0375 之間打平；`repulsion_strength` 卻在 0.025 兩側（0.0125、0.0375）都比 0.025 本身好，換兩組不同 random seed 各自跑 100 樣本獨立確認，`0.0375` 都比 `0.025` 好（cost 公式估計約 -0.2%~-0.3%），只是改善來源兩次不太一致（一次主要是 V_grouping、一次主要是 V_boundary），效應本身不大但方向穩定 | **採用**（`repulsion_strength` 改為 0.0375；`grouping_force_strength`/`boundary_nudge_strength` 維持不變） |
+| `compact_reinsert_reshape`：把 `compact_reinsert` 的 remove-and-reinsert 搜尋擴充成同時重新考慮長寬比（沿用 `legalize_v2` 的 `_aspect_variants`，面積不變、在 log 空間取樣幾種長寬比），只對沒有 preplaced/fixed/MIB/boundary 約束的 block 開放重選形狀，放在 pipeline 最尾端 | 合成測試（無 boundary/cluster/MIB 約束）多組 seed 從不變差，最多 −12.21% bbox，看起來很有效；但真實資料 25 樣本 quasi-paired 測試 **22/25 完全零變化**，另外 3 個的差異是浮點數雜訊等級（相對誤差 <1e-6%），實質上等於全部零效果。追一個具體案例（k=21，9/21 block 符合可重塑條件）確認不是 bug，是結構性問題：`compact_reinsert`（純位置搜尋）在 pipeline 較早階段已經把每個 block 能找到的最佳位置窮舉過，等走到尾端的 reshape pass 時，殘留縫隙已經被壓縮到「換形狀也擠不進去」的程度；合成資料因為沒有 boundary/cluster/MIB 這些會觸發額外拉緊機制的約束，留下的縫隙比真實資料多，才會看到假的改善空間——跟 v4.9 `compact_pair_reinsert` 是同一個根因 | **不採用**（`use_reinsert_reshape=False`，程式碼保留為 opt-in 函式） |
+| EDM（Heun 2 階）取樣器 vs. DDIM，iso 前向計算量比較（DDIM 30 步 vs. EDM 15 步，兩者都約 30 次 forward）——先修好 `generate_floorplan` 沒把 v5.0 調過的力強度傳進 EDM 分支的公平性 bug（原本 EDM 分支一直在用 `edm_sample_with_forces` 自己內部寫死的 v5.0 調參前舊值） | 40 樣本 quasi-paired：area_gap 23.50%→27.70%（EDM 更差 +4.2pp）、hpwl_gap 16.14%→21.72%（更差 +5.6pp）、V_relative 0.1013→0.1251，40 個裡 28 個 DDIM 明顯更好、只有 7 個 EDM 更好，同計算量下全面落後 | **不採用**（維持 `sampler="ddim"`；EDM 分支與這次修的力強度傳遞 bug 保留為 opt-in） |
+| `n_samples` 掃描找真正上限（8/14/20/30/40，之前只調過一次 6→14） | 30 樣本：「幾乎免費」只在 N≤20 成立（時間打平在 ~1.56-1.59s），但品質在這範圍內也沒有明顯改善，純粹雜訊等級波動；N>20 出現真實時間成本（N=30 +17%、N=40 +44%），品質也非單調變好——候選排序鍵優先看 total_overlap，N 變大有時只是找到「重疊更小但 V_relative 更差」的候選。N=40 換算 cost 公式看起來約 -2.4% 淨效益，但樣本數少、雜訊大，且估計還沒扣掉 runtime 懲罰，很可能被吃掉大半 | **不採用**（維持 `n_samples=14`） |
+| 多 checkpoint ensemble（`run_one_sample` 的 `extra_checkpoints`）：不重新訓練，把另一個已有 checkpoint 的候選池併進同一套排序鍵重選，測 v4（目前預設，val_loss=0.1026）+ v2（次佳，val_loss=0.120） | 30 樣本 quasi-paired：area_gap 24.21%→23.46%（小幅改善）、V_relative 0.1238→0.1262（小幅變差），15/30 樣本真的選中 v2 候選（機制有作用），但換算 cost 公式淨效果 **+0.25%（變差）**，還沒算 diffusion 時間翻倍的真實成本。v4/v2 同一訓練系列、候選分佈可能不夠互補，結論跟 `n_samples` 掃描一致——候選池品質分佈夠集中時，加大候選池難再找到真正更好的解 | **不採用**（`extra_checkpoints` 保留在 `run_one_sample` 當 opt-in 參數，預設 `None`） |
+| `compact_gradient_finetune`（v5.2）：跳脫先前所有「離散、一次挪一兩個 block」的區域搜尋範式，改用 DREAMPlace/ePlace/RePlAce 這系列類比（analytical）global placement 的做法——把所有非 preplaced block 的 (x, y) 一次性當連續變數，PyTorch autograd + Adam 對 overlap/area/boundary/cluster/HPWL 的平滑 loss 做聯合梯度下降，跑完投影回 `hard_zero_overlap`+`compact_positions` 保證的合法解，只有 bbox 嚴格變小、各項違規不變差才採用 | 開發過程一路發現並修正兩個方法論陷阱後，一度顯示有淨效益：(1) 最初量測 legalize 時間暴增到 +2~3 秒/樣本，追出來是 PyTorch/autograd「每個 process 第一次呼叫」的一次性 warmup 成本被誤算成每樣本成本，修正量測方式後真實開銷只有 +0.36 秒/樣本；(2) overlap／HPWL 從稠密 O(k²) 矩陣改成稀疏邊表/上三角索引，單步成本再降 ~15%。lr 越高越容易讓 Adam 提早收斂到較差的局部最優（掃過 1.0/1.5/2.0/3.0 都比 0.5 差），patience 太低會殺死需要較多步數才找到的真正改善（掃過 12/20 都讓已知案例的 -4.54% 消失）——一度以 lr=0.5/patience=30 改為預設開啟。但後續要修另一個 `within_outline` 正確性檢查異常時，才發現整個 loss（overlap/area/boundary-相對自己 bbox/cluster/HPWL）對「所有座標同時平移」完全不變，Adam 對每個參數獨立正規化不保留「平移方向梯度和為 0」這個性質，幾百步下來會隨機漂移把 block 帶出 `outline_bbox` 之外而不被發覺——連當初拿來當展示案例的那筆 -4.54%，事後用正確的 outline 檢查一查也是越界的無效解。補上 `weight_anchor` 平移錨定項＋outline 硬 gate 修好這個 bug 之後，同一批 30 樣本重新量測變成 **0/30 有真正改善**，額外時間成本卻還在——機制的「效益」原來大部分是這個未被發現的 bug 造成的假象 | **不採用**（`use_gradient_finetune=False`；`compact_gradient_finetune` 與其 outline-safety gate 保留在 `utils.py` 備用） |
+| 針對上一行的問題做兩次追加修正（v5.5/v5.6，詳見 CHANGELOG）：(v5.5) 補上真正的 outline containment loss（每個 block 直接懲罰「超出 outline 邊界的距離」，而不是 v5.2 那種「不知道 outline 在哪、純粹防漂移」的錨定項）；(v5.6) 追出真正瓶頸是「boundary 違規數不變差」這條離散 gate 後，比照 `hpwl_slack_ratio` 加上 `boundary_violation_slack` 整數容忍度 | (v5.5) 30 樣本重測仍是 **0/30**，但確認瓶頸不是 outline，是 `compute_boundary_violations` 的 all-or-nothing 判定跟 loss 裡連續距離代理對不齊；(v5.6) `slack=1` 只解鎖 1/30 樣本，那個樣本換算 cost 公式（`quality*exp(BETA·V_rel)`）還是 **+0.16%（變差）**，V_relative 進指數項，一點違規換的 area 改善划不來，還沒算真實 +0.5 秒/樣本的 runtime 成本。三次獨立、針對三個不同假設瓶頸的修正嘗試全部收斂到同一結論：不是哪次沒調對，是結構性的 | **不採用**（`weight_anchor`/`weight_containment`/`boundary_violation_slack` 全部保留在 `utils.py`，預設值都是原本嚴格、無副作用的行為） |
 
 這個過程反映的核心判斷：**diffusion 端「批次內免費」的候選數（`n_samples`）
 值得投資；legalize 端單純「加碼同一種搜尋的強度」（不管是加大 `compact_reinsert`

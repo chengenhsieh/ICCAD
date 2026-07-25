@@ -276,6 +276,10 @@ def generate_floorplan(
 
     # v4.2: 二選一 sampler
     if sampler == "edm":
+        # 修正：v5.0 調過的力強度只有 threading 進 DDIM 分支，這裡漏了——
+        # edm_sample_with_forces 有自己的一份舊、v5.0 調參前的預設值
+        # （grouping=0.015/boundary=0.05/repulsion=0.05），不補上就是拿
+        # 「DDIM 用新參數 vs EDM 用舊參數」在比，對 EDM 不公平。
         generated = diffusion.edm_sample_with_forces(
             model, shape, feats_t, conn_t, mask_t,
             num_steps=edm_steps,
@@ -291,6 +295,10 @@ def generate_floorplan(
             select_metric_fn=_select_metric,
             post_repel_steps=post_repel_steps,
             clamp_bbox=clamp_bbox_norm,
+            pin_force_strength=pin_force_strength,
+            grouping_force_strength=grouping_force_strength,
+            boundary_nudge_strength=boundary_nudge_strength,
+            repulsion_strength=repulsion_strength,
         )
     else:  # sampler == "ddim"
         # v4.3 實驗：曾嘗試把 mib_clamp_until_t / pin_force_until_t /
@@ -481,6 +489,21 @@ def legalize_result(
     pair_reinsert_sweeps=2,
     pair_reinsert_grid_density=8,
     pair_reinsert_hpwl_slack_ratio=0.0,
+    use_reinsert_reshape=False,  # 實驗用：見 compact_reinsert_reshape 呼叫處說明（utils.py）
+    reinsert_reshape_sweeps=2,
+    reinsert_reshape_grid_density=8,
+    # v5.2（實驗、最終停用）：一度因為修正 warmup 量測誤差後看起來有淨改善
+    # 而短暫改為預設開啟，後來發現 compact_gradient_finetune 的 loss 對
+    # 「整體平移」完全不變，導致 Adam 在這個零梯度方向上隨機漂移、把 block
+    # 帶出 outline_bbox 之外——連當初的展示案例（-4.54%）事後查也是越界的
+    # 無效解。補上錨定項＋outline 硬 gate 修好之後，同一批樣本重測變成
+    # 0/30 有真正改善，時間成本卻還在，因此改回預設關閉（詳見 utils.py
+    # legalize_lff 呼叫處與 compact_gradient_finetune docstring 的完整說明）。
+    use_gradient_finetune=False,
+    gradient_finetune_steps=400,
+    gradient_finetune_lr=0.5,
+    gradient_finetune_patience=30,
+    gradient_finetune_hpwl_slack_ratio=0.0,
     use_second_merge_pass=True,
     weight_dist=1.0,
     weight_boundary=3.0,
@@ -541,6 +564,14 @@ def legalize_result(
             pair_reinsert_sweeps=pair_reinsert_sweeps,
             pair_reinsert_grid_density=pair_reinsert_grid_density,
             pair_reinsert_hpwl_slack_ratio=pair_reinsert_hpwl_slack_ratio,
+            use_reinsert_reshape=use_reinsert_reshape,
+            reinsert_reshape_sweeps=reinsert_reshape_sweeps,
+            reinsert_reshape_grid_density=reinsert_reshape_grid_density,
+            use_gradient_finetune=use_gradient_finetune,
+            gradient_finetune_steps=gradient_finetune_steps,
+            gradient_finetune_lr=gradient_finetune_lr,
+            gradient_finetune_patience=gradient_finetune_patience,
+            gradient_finetune_hpwl_slack_ratio=gradient_finetune_hpwl_slack_ratio,
             use_second_merge_pass=use_second_merge_pass,
             weight_dist=weight_dist,
             weight_boundary=weight_boundary,
@@ -882,15 +913,29 @@ def run_one_sample(sample_idx, official, model, config, device,
                    boundary_hpwl_slack_ratio=0.0,
                    use_pair_reinsert=False, pair_reinsert_sweeps=2, pair_reinsert_grid_density=8,
                    pair_reinsert_hpwl_slack_ratio=0.0,
+                   use_reinsert_reshape=False, reinsert_reshape_sweeps=2, reinsert_reshape_grid_density=8,
+                   use_gradient_finetune=False, gradient_finetune_steps=400, gradient_finetune_lr=0.5,
+                   gradient_finetune_patience=30, gradient_finetune_hpwl_slack_ratio=0.0,
                    use_second_merge_pass=True,
                    weight_dist=1.0, weight_boundary=3.0, weight_cluster=1.0,
                    weight_b2b=0.5, weight_p2b=0.15, weight_shape=3.0,
-                   use_cluster_adjacency=False, cluster_adjacency_bonus=5.0):
+                   use_cluster_adjacency=False, cluster_adjacency_bonus=5.0,
+                   extra_checkpoints=None):
     """
     跑單一 validation sample：
       1. 解析 inputs / GT / constraints
       2. diffusion 推論
       3. 評估 + 印報告 + 對比圖 + JSON dump
+
+    extra_checkpoints（實驗用，v5.7）：`[(model2, config2), ...]` 的 list。
+    給了的話，除了主要的 (model, config) 之外，對每個額外 checkpoint 也用
+    同一組 areas/W_int/canvas/constraints 跑一次 `generate_floorplan`
+    （各自的 `all_results` 候選池），全部候選（主要 + 額外）合併後用同一套
+    排序鍵（total_overlap, V_relative, total_hpwl, bbox_area）重新選最好的
+    一個，取代原本只從單一模型的 n_samples 個候選裡選。目的是測試不同
+    checkpoint 之間是否互補——不需要重新訓練，純粹增加 diffusion 端候選池
+    的多樣性，時間成本跟 checkpoint 數量成正比（額外的 forward 計算，
+    legalize 仍然只跑一次，因為只有最終選出的單一 best 會送進 legalize）。
 
     validation 的 label 結構與 training 不同：
       labels[0] = polygons (k, n_verts, 2)   ← 從這裡推 bbox
@@ -1016,6 +1061,36 @@ def run_one_sample(sample_idx, official, model, config, device,
         boundary_nudge_strength=boundary_nudge_strength,
         repulsion_strength=repulsion_strength,
     )
+
+    # v5.7（實驗用）：把額外 checkpoint 的候選池併進來，一起重新選最好的
+    if extra_checkpoints:
+        pooled = list(all_results)
+        for extra_model, extra_config in extra_checkpoints:
+            _, extra_results = generate_floorplan(
+                extra_model, extra_config, areas, W_int,
+                canvas_w=canvas_w, canvas_h=canvas_h,
+                x_offset=x_offset, y_offset=y_offset,
+                n_samples=n_samples, ddim_steps=ddim_steps, device=device,
+                constraints=constraints,
+                p2b_edges=p2b_edges, pins_pos=pins_pos,
+                gt_w=gt_w, gt_h=gt_h, gt_x=gt_x, gt_y=gt_y,
+                sampler=sampler, edm_steps=edm_steps, use_amp=use_amp,
+                post_repel_steps=post_repel_steps, scale_t_windows=scale_t_windows,
+                pin_force_strength=pin_force_strength,
+                grouping_force_strength=grouping_force_strength,
+                boundary_nudge_strength=boundary_nudge_strength,
+                repulsion_strength=repulsion_strength,
+            )
+            pooled.extend(extra_results)
+        pooled.sort(key=lambda r: (
+            r["overlap"],
+            r["soft"]["V_relative"],
+            r["total_hpwl"],
+            r["bbox_area"],
+        ))
+        all_results = pooled
+        best = pooled[0]
+
     t_diffusion = time.perf_counter() - t_diff_start
 
     # -- optimal 指標 --
@@ -1090,6 +1165,14 @@ def run_one_sample(sample_idx, official, model, config, device,
         pair_reinsert_sweeps=pair_reinsert_sweeps,
         pair_reinsert_grid_density=pair_reinsert_grid_density,
         pair_reinsert_hpwl_slack_ratio=pair_reinsert_hpwl_slack_ratio,
+        use_reinsert_reshape=use_reinsert_reshape,
+        reinsert_reshape_sweeps=reinsert_reshape_sweeps,
+        reinsert_reshape_grid_density=reinsert_reshape_grid_density,
+        use_gradient_finetune=use_gradient_finetune,
+        gradient_finetune_steps=gradient_finetune_steps,
+        gradient_finetune_lr=gradient_finetune_lr,
+        gradient_finetune_patience=gradient_finetune_patience,
+        gradient_finetune_hpwl_slack_ratio=gradient_finetune_hpwl_slack_ratio,
         use_second_merge_pass=use_second_merge_pass,
         weight_dist=weight_dist,
         weight_boundary=weight_boundary,

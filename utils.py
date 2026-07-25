@@ -626,6 +626,431 @@ def compact_reinsert(x, y, w, h, preplaced_mask=None, boundary_code=None,
     return x, y
 
 
+def compact_reinsert_reshape(x, y, w, h, preplaced_mask=None, fixed_mask=None,
+                             mib_group=None, boundary_code=None,
+                             sweeps=3, grid_density=12, gap_weight=0.6,
+                             n_shape_variants=5, max_aspect_ratio=8.0,
+                             verbose=False):
+    """
+    v5.1（實驗用）：`compact_reinsert` 的 remove-and-reinsert 局部搜尋只動
+    (x, y)，形狀在 `legalize_lff` 最初的 LFF 貪婪排布階段選定後就凍結——
+    但那個當下的「最佳長寬比」是在其他 block 還沒放完、佈局還沒定型時選的，
+    等整體佈局收斂後，換一種長寬比可能更貼合當下實際留下的空間形狀。這裡
+    把 `_aspect_variants`（跟 `legalize_v2` 用的同一套：面積不變、在 log
+    空間取樣幾種長寬比）接進 `compact_reinsert` 的搜尋迴圈，拔出來重插時
+    候選不再只是「不同位置、同一個形狀」，而是「不同位置 × 幾種長寬比」
+    的組合，一起比較 bbox + 緊密度成本，嚴格更小才採用。
+
+    可以重新選長寬比的 block 限定為：非 preplaced、非 fixed-shape、沒有
+    MIB 約束（`mib_group == 0`；同一個 MIB group 的 block 必須共用相同
+    形狀，牽一髮動全身，這版先不處理）、沒有 boundary 約束
+    （`boundary_code == 0`；boundary 鎖定的是「該邊界座標」不是「該座標」，
+    改形狀後要連帶調整鎖定軸的位置才不會鬆脫，這版先跳過、留給只搬不改形
+    的其他 pass 處理）。不滿足這些條件的 block 仍然可以被搬動位置（跟
+    `compact_reinsert` 一樣），只是形狀固定。
+
+    面積透過 `_aspect_variants` 的構造方式精確守恆（`w = sqrt(area*r)`、
+    `h = sqrt(area/r)`），不會違反面積 hard constraint。
+
+    刻意放在 pipeline 最尾端呼叫（見 `legalize_lff` 呼叫處說明），理由跟
+    `compact_pair_reinsert` 相同：避免被後續其他貪婪 pass 撤銷。
+    """
+    x = np.array(x, dtype=np.float64).copy()
+    y = np.array(y, dtype=np.float64).copy()
+    w = np.array(w, dtype=np.float64).copy()
+    h = np.array(h, dtype=np.float64).copy()
+    k = len(x)
+    if k < 2:
+        return x, y, w, h
+    if preplaced_mask is None:
+        preplaced_mask = np.zeros(k, dtype=bool)
+    else:
+        preplaced_mask = np.asarray(preplaced_mask, dtype=bool)
+    if fixed_mask is None:
+        fixed_mask = np.zeros(k, dtype=bool)
+    else:
+        fixed_mask = np.asarray(fixed_mask, dtype=bool)
+    if mib_group is None:
+        mib_group = np.zeros(k, dtype=np.int64)
+    else:
+        mib_group = np.asarray(mib_group, dtype=np.int64)
+    if boundary_code is None:
+        boundary_code = np.zeros(k, dtype=np.int64)
+    else:
+        boundary_code = np.asarray(boundary_code, dtype=np.int64)
+
+    reshapable = (~preplaced_mask) & (~fixed_mask) & (mib_group == 0) & (boundary_code == 0)
+    movable_idx = [i for i in range(k) if not preplaced_mask[i]]
+    n_grid = max(int(grid_density), 3)
+    avg_side = float(np.mean(np.sqrt(w * h))) if k else 1.0
+
+    for _sweep in range(sweeps):
+        moved_any = False
+        for i in movable_idx:
+            others = np.ones(k, dtype=bool)
+            others[i] = False
+            if not others.any():
+                continue
+            xo, yo, wo, ho = x[others], y[others], w[others], h[others]
+            ox_min = float(xo.min()); ox_max = float((xo + wo).max())
+            oy_min = float(yo.min()); oy_max = float((yo + ho).max())
+
+            def _nearest_gap(xc, yc, wi, hi):
+                gx = np.maximum(0.0, np.maximum(xo - (xc + wi), xc - (xo + wo)))
+                gy = np.maximum(0.0, np.maximum(yo - (yc + hi), yc - (yo + ho)))
+                return float(np.sqrt(gx * gx + gy * gy).min())
+
+            cur_x, cur_y, cur_w, cur_h = float(x[i]), float(y[i]), float(w[i]), float(h[i])
+            cur_cost = (((max(ox_max, cur_x + cur_w) - min(ox_min, cur_x)) *
+                         (max(oy_max, cur_y + cur_h) - min(oy_min, cur_y)))
+                        + gap_weight * avg_side * _nearest_gap(cur_x, cur_y, cur_w, cur_h))
+
+            if reshapable[i]:
+                shape_candidates = _aspect_variants(cur_w, cur_h, n=n_shape_variants,
+                                                    max_ratio=max_aspect_ratio)
+            else:
+                shape_candidates = [(cur_w, cur_h)]
+
+            lock_x = bool(int(boundary_code[i]) & 3)
+            lock_y = bool(int(boundary_code[i]) & 12)
+
+            best_cost = cur_cost
+            best_pick = (cur_x, cur_y, cur_w, cur_h)
+            for wi, hi in shape_candidates:
+                x_candidates = [cur_x] if lock_x else np.linspace(ox_min - wi, ox_max, n_grid)
+                y_candidates = [cur_y] if lock_y else np.linspace(oy_min - hi, oy_max, n_grid)
+                for xc in x_candidates:
+                    xc = float(xc)
+                    ox_arr = np.minimum(xc + wi, xo + wo) - np.maximum(xc, xo)
+                    x_touches = ox_arr > 1e-9
+                    for yc in y_candidates:
+                        yc = float(yc)
+                        if xc == cur_x and yc == cur_y and wi == cur_w and hi == cur_h:
+                            continue
+                        oy_arr = np.minimum(yc + hi, yo + ho) - np.maximum(yc, yo)
+                        if np.any(x_touches & (oy_arr > 1e-9)):
+                            continue   # 跟某個 block 重疊，跳過
+                        bbox_cost = ((max(ox_max, xc + wi) - min(ox_min, xc)) *
+                                     (max(oy_max, yc + hi) - min(oy_min, yc)))
+                        cost = bbox_cost + gap_weight * avg_side * _nearest_gap(xc, yc, wi, hi)
+                        if cost < best_cost - 1e-9:
+                            best_cost = cost
+                            best_pick = (xc, yc, wi, hi)
+
+            if best_pick != (cur_x, cur_y, cur_w, cur_h):
+                x[i], y[i], w[i], h[i] = best_pick
+                moved_any = True
+                if verbose and (w[i] != cur_w or h[i] != cur_h):
+                    print("compact_reinsert_reshape: sweep={} block={} reshaped "
+                          "({:.2f},{:.2f})->({:.2f},{:.2f})".format(
+                              _sweep, i, cur_w, cur_h, w[i], h[i]))
+
+        if not moved_any:
+            break
+
+    return x, y, w, h
+
+
+def compact_gradient_finetune(x, y, w, h, preplaced_mask=None, boundary_code=None,
+                              cluster_group=None, W_int=None, outline_bbox=None,
+                              n_steps=400, lr=0.5, patience=30, min_delta=1e-3,
+                              weight_overlap=50.0, weight_area=1.0,
+                              weight_boundary=2.0, weight_cluster=1.0, weight_hpwl=0.3,
+                              weight_anchor=0.1, weight_containment=20.0,
+                              hpwl_slack_ratio=0.0, boundary_violation_slack=0,
+                              verbose=False):
+    """
+    v5.2（實驗用）：跟前面所有 `compact_*` pass 不同範式的一個嘗試——之前
+    每個 pass 都是「一次挪一、兩個 block」的離散區域搜尋，`compact_pair_
+    reinsert`／`compact_reinsert_reshape` 兩次證明這條路在真實資料上已經
+    觸頂（`compact_reinsert` 的位置搜尋早就把殘留縫隙搜刮乾淨，尾端再加新
+    pass 找不到東西）。這裡改用 DREAMPlace／ePlace／RePlAce 這系列類比
+    (analytical) global placement 的核心概念：把「所有」非 preplaced
+    block 的 (x, y) 一次性當成連續可微分變數，用 PyTorch autograd + Adam
+    對一個平滑 loss 做梯度下降——不是一次一兩個 block 的離散移動，而是全部
+    block 同時、連續地互相讓位，理論上能找到離散單/雙 block 搜尋永遠碰
+    不到的整體更緊密排布。
+
+    Loss = weight_overlap·重疊懲罰（可微分：pairwise 的 clamp(min,max) 面積）
+         + weight_area·bbox 面積（可微分：直接用 x.max()/x.min() 之類，
+           梯度會流到當下取到極值的那個 block）
+         + weight_boundary·邊界懲罰（每個 boundary block 到目前 bbox 對應
+           邊的平方距離，概念上跟 compute_boundary_violations 一致，但用
+           連續距離取代離散判定式）
+         + weight_cluster·分組懲罰（每個 cluster group 內成員中心到組重心
+           的平方距離）
+         + weight_hpwl·HPWL（可微分：跟 compute_hpwl_vectorized 同一套
+           span-based 公式）
+         + weight_anchor·錨定懲罰（movable block 平均座標到「優化開始前」
+           平均座標的平方距離；理由見下方「已知問題」段落）
+         + weight_containment·outline 圍堵懲罰（若提供 outline_bbox：每個
+           block 超出 outline 邊界的距離平方，只在真的超出時才非零）
+
+    已知問題與修法（v5.2 踩過、v5.5 補強）：overlap／area／boundary（相對
+    自己當下 bbox 邊）／cluster（相對組內重心）／HPWL 這五項全部是**平移
+    不變**的（把所有座標同時加一個常數 c，loss 完全不變）——這代表整體
+    平移方向在梯度上是一片平坦（真正的梯度和沿這個方向剛好是 0），理論上
+    不該漂移。但 Adam 對每個參數獨立做二階動量正規化，不保留「原始梯度和
+    為 0」這個性質，實測幾百步下來會在這個方向隨機漂移、把整層 block 帶出
+    outline 之外（投影階段的 hard_zero_overlap／compact_positions 都只
+    保證彼此不重疊，不保證回到原本的 outline 座標系）。v5.2 只加了
+    weight_anchor（把 movable block 的平均座標拉回優化開始前的位置）堵住
+    這個平移方向，但這只是「不知道 outline 在哪裡、純粹不讓它漂移」的
+    土法煉鋼，跟真正的 hard constraint（outline_bbox）本身沒有直接關係。
+    v5.5 補上 weight_containment：對每個 block 直接算「超出 outline 邊界
+    的距離」平方懲罰（只要沒超出就是 0，不影響 outline 內部的正常優化），
+    是這個約束真正對應的可微分寫法——讓優化器一邊找更緊密的排布、一邊自己
+    知道 outline 在哪裡，而不是先自由漂移再事後被 gate 擋下來。
+    weight_anchor 保留（權重更小）當這個方向上的第二層保險，避免 outline
+    有餘裕（block 離邊界還有一段距離）時 containment loss 是 0、又退化回
+    v5.2 的無梯度漂移。
+
+    梯度下降過程中**不保證**任何 hard/soft constraint（中途可能暫時比
+    legalize 剛出來時還亂）——這是刻意的，把它當一個「提案產生器」：跑完
+    之後一定會先過 `hard_zero_overlap` 把重疊修正投影回合法解，再用
+    `compact_positions` 把投影後可能留下的縫隙壓一輪，最後才跟套用前的
+    狀態比較，只有**同時滿足**以下全部條件才採用（否則整個操作等於沒發生，
+    退回原本已經保證合法的解）：
+      1. bbox 面積嚴格變小；
+      2. boundary 違規數不超過 `baseline + boundary_violation_slack`（v5.6，
+         見下方「boundary gate 加 slack」段落，預設 slack=0 等同原本的
+         「不變差」）；
+      3. cluster 違規數不變差；
+      4. 總 HPWL 增加量不超過 `hpwl_slack_ratio * avg_side`（若提供
+         W_int；閘門邏輯跟其他 v4.7+ 機制一致）；
+      5. 若提供 `outline_bbox`：投影後所有 block 仍完整落在其內（見上方
+         「已知問題」段落——weight_anchor／weight_containment 只是把違規
+         機率壓低，不是硬保證，這一條才是真正的硬 gate，浮點數上不論
+         違規多寡都會被擋下來）。
+
+    boundary gate 加 slack（v5.6，實驗用）：v5.5 修好平移漂移／outline
+    containment 之後，30 樣本真實資料重測仍是 0/30 有改善，追一個具體
+    案例（idx=16，原本用來當展示案例的 -4.54%）發現真正卡住它的不是
+    outline，而是這一條「boundary 違規數不變差」——這是離散 all-or-
+    nothing 判定（`compute_boundary_violations` 算的是「有沒有真的貼到
+    邊」，不是連續距離），跟 loss 裡用連續距離當代理的 `boundary_loss`
+    對不齊：bbox 縮小的過程中，被縮小的那條邊本身在移動，貼邊的判定
+    可能因此翻面，即使 area 改善很大，只要有 1 個 block 從「貼邊」變成
+    「差一點」，離散 gate 就會整個否決掉。跟 `hpwl_slack_ratio` 一樣的
+    精神，開放 `boundary_violation_slack`（違規數整數容忍度）讓這種
+    「用一點點 boundary 違規换 area 改善」的交易有機會通過——**預設值
+    仍是 0（跟 v5.5 之前完全一樣的嚴格行為）**，只有明確傳入正整數才會
+    放寬，需要在真實資料上驗證淨效益（V_relative 變差是否被 area_gap
+    改善划算）才能決定要不要真的當預設值用。
+
+    只優化 (x, y)，不碰形狀（MIB group 的形狀一致性因此不受影響，不需要
+    額外處理）；preplaced block 的座標維持不動（不當可微分變數）。
+
+    `n_steps` 是上限，不是每次都跑滿：real data 上多數樣本在幾十步內就已
+    經收斂（loss 不再下降）或根本沒有改善空間，跑滿 400 步是純浪費時間
+    （100 樣本量測過 legalize 時間可以到 +1.5~3.6 秒／樣本，換算 contest
+    cost 公式的 runtime 懲罰後很可能不划算）。用 `patience`：連續
+    `patience` 步 loss 都沒有下降超過 `min_delta`，就提前停止。
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    w = np.asarray(w, dtype=np.float64)
+    h = np.asarray(h, dtype=np.float64)
+    k = len(x)
+    if k < 2:
+        return x.copy(), y.copy()
+    if preplaced_mask is None:
+        preplaced_mask = np.zeros(k, dtype=bool)
+    else:
+        preplaced_mask = np.asarray(preplaced_mask, dtype=bool)
+    if boundary_code is None:
+        boundary_code = np.zeros(k, dtype=np.int64)
+    else:
+        boundary_code = np.asarray(boundary_code, dtype=np.int64)
+    has_cluster = cluster_group is not None
+    if has_cluster:
+        cluster_group = np.asarray(cluster_group, dtype=np.int64)
+    else:
+        cluster_group = np.zeros(k, dtype=np.int64)
+    check_hpwl = W_int is not None
+    avg_side = float(np.mean(np.sqrt(w * h))) if k else 1.0
+
+    baseline_bbox = (float((x + w).max()) - float(x.min())) * (float((y + h).max()) - float(y.min()))
+    baseline_v = compute_boundary_violations(x, y, w, h, boundary_code)
+    baseline_cluster_v = compute_cluster_violations(x, y, w, h, cluster_group) if has_cluster else 0
+    baseline_hpwl = compute_hpwl_vectorized(x, y, w, h, W_int) if check_hpwl else 0.0
+    hpwl_slack = max(0.0, hpwl_slack_ratio) * avg_side
+
+    movable = ~preplaced_mask
+    m_idx = np.nonzero(movable)[0]
+    if len(m_idx) == 0:
+        return x.copy(), y.copy()
+    orig_mean_x = float(x[m_idx].mean())
+    orig_mean_y = float(y[m_idx].mean())
+
+    w_t = torch.tensor(w, dtype=torch.float64)
+    h_t = torch.tensor(h, dtype=torch.float64)
+    x_full = torch.tensor(x, dtype=torch.float64)
+    y_full = torch.tensor(y, dtype=torch.float64)
+    x_param = torch.nn.Parameter(x_full[m_idx].clone())
+    y_param = torch.nn.Parameter(y_full[m_idx].clone())
+
+    left_mask = torch.tensor((boundary_code & 1) > 0)
+    right_mask = torch.tensor((boundary_code & 2) > 0)
+    top_mask = torch.tensor((boundary_code & 4) > 0)
+    bottom_mask = torch.tensor((boundary_code & 8) > 0)
+
+    has_outline = outline_bbox is not None
+    if has_outline:
+        c_oxmin, c_oymin, c_oxmax, c_oymax = (float(v) for v in outline_bbox)
+
+    cluster_ids = sorted(set(int(g) for g in cluster_group if g > 0)) if has_cluster else []
+    cluster_masks = [torch.tensor(cluster_group == gid) for gid in cluster_ids]
+
+    # HPWL 用稀疏邊表（只列出 W_int 非零的 pair），而不是每步都算一次完整
+    # k×k 矩陣——真實資料的 B2B 連線通常很稀疏（一個樣本常常只有幾十條邊，
+    # 相對 k^2/2 可能的 pair 數少很多），稀疏化直接把這項的每步成本從
+    # O(k^2) 降到 O(edges)，是目前 profiling 下來單步最貴的項目之一。
+    if check_hpwl:
+        ei, ej = np.nonzero(np.triu(W_int, k=1))
+        edge_w = W_int[ei, ej]
+        edge_i_t = torch.tensor(ei, dtype=torch.long)
+        edge_j_t = torch.tensor(ej, dtype=torch.long)
+        edge_w_t = torch.tensor(edge_w, dtype=torch.float64)
+    else:
+        edge_i_t = edge_j_t = edge_w_t = None
+    # 重疊懲罰是對稱的（pair (i,j) 跟 (j,i) 算出來的重疊面積一樣），先算好
+    # 只算上三角（i<j）需要的索引，避免每一步都建構、相乘整個 k×k 矩陣再乘
+    # 布林遮罩去掉下三角——直接用索引取值，計算量直接砍半，且不必配置那兩個
+    # k×k 的中間矩陣。
+    triu_i, triu_j = np.triu_indices(k, k=1)
+    triu_i_t = torch.tensor(triu_i, dtype=torch.long)
+    triu_j_t = torch.tensor(triu_j, dtype=torch.long)
+
+    opt = torch.optim.Adam([x_param, y_param], lr=lr)
+
+    best_loss = float("inf")
+    no_improve = 0
+    n_used = 0
+    for step in range(n_steps):
+        n_used = step + 1
+        opt.zero_grad()
+        xt = x_full.clone(); yt = y_full.clone()
+        xt[m_idx] = x_param
+        yt[m_idx] = y_param
+
+        xr = xt + w_t; ytop = yt + h_t
+        xi_p, xj_p = xt[triu_i_t], xt[triu_j_t]
+        yi_p, yj_p = yt[triu_i_t], yt[triu_j_t]
+        xri_p, xrj_p = xr[triu_i_t], xr[triu_j_t]
+        ytopi_p, ytopj_p = ytop[triu_i_t], ytop[triu_j_t]
+        ox = torch.clamp(torch.minimum(xri_p, xrj_p) - torch.maximum(xi_p, xj_p), min=0.0)
+        oy = torch.clamp(torch.minimum(ytopi_p, ytopj_p) - torch.maximum(yi_p, yj_p), min=0.0)
+        overlap_loss = (ox * oy).sum()
+
+        xmin = xt.min(); xmax = xr.max(); ymin = yt.min(); ymax = ytop.max()
+        area_loss = (xmax - xmin) * (ymax - ymin)
+
+        boundary_loss = torch.tensor(0.0, dtype=torch.float64)
+        if left_mask.any():
+            boundary_loss = boundary_loss + ((xt[left_mask] - xmin) ** 2).sum()
+        if right_mask.any():
+            boundary_loss = boundary_loss + ((xr[right_mask] - xmax) ** 2).sum()
+        if top_mask.any():
+            boundary_loss = boundary_loss + ((ytop[top_mask] - ymax) ** 2).sum()
+        if bottom_mask.any():
+            boundary_loss = boundary_loss + ((yt[bottom_mask] - ymin) ** 2).sum()
+
+        cluster_loss = torch.tensor(0.0, dtype=torch.float64)
+        cx = xt + w_t / 2.0; cy = yt + h_t / 2.0
+        for cm in cluster_masks:
+            if cm.sum() < 2:
+                continue
+            gcx = cx[cm].mean(); gcy = cy[cm].mean()
+            cluster_loss = cluster_loss + (((cx[cm] - gcx) ** 2 + (cy[cm] - gcy) ** 2)).sum()
+
+        hpwl_loss = torch.tensor(0.0, dtype=torch.float64)
+        if edge_i_t is not None and len(edge_i_t) > 0:
+            xi, xj = xt[edge_i_t], xt[edge_j_t]
+            yi, yj = yt[edge_i_t], yt[edge_j_t]
+            xri, xrj = xr[edge_i_t], xr[edge_j_t]
+            ytopi, ytopj = ytop[edge_i_t], ytop[edge_j_t]
+            span_x = torch.maximum(xri, xrj) - torch.minimum(xi, xj)
+            span_y = torch.maximum(ytopi, ytopj) - torch.minimum(yi, yj)
+            hpwl_loss = (edge_w_t * (span_x + span_y)).sum()
+
+        anchor_loss = (x_param.mean() - orig_mean_x) ** 2 + (y_param.mean() - orig_mean_y) ** 2
+
+        containment_loss = torch.tensor(0.0, dtype=torch.float64)
+        if has_outline:
+            left_over = torch.clamp(c_oxmin - xt[m_idx], min=0.0)
+            right_over = torch.clamp(xr[m_idx] - c_oxmax, min=0.0)
+            bottom_over = torch.clamp(c_oymin - yt[m_idx], min=0.0)
+            top_over = torch.clamp(ytop[m_idx] - c_oymax, min=0.0)
+            containment_loss = (left_over ** 2 + right_over ** 2
+                                + bottom_over ** 2 + top_over ** 2).sum()
+
+        loss = (weight_overlap * overlap_loss + weight_area * area_loss
+                + weight_boundary * boundary_loss + weight_cluster * cluster_loss
+                + weight_hpwl * hpwl_loss + weight_anchor * anchor_loss
+                + weight_containment * containment_loss)
+        loss.backward()
+        opt.step()
+
+        loss_val = float(loss)
+        if loss_val < best_loss - min_delta:
+            best_loss = loss_val
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        if verbose and step % 100 == 0:
+            print("compact_gradient_finetune: step={:3d} loss={:.2f} overlap={:.4f} "
+                  "area={:.1f}".format(step, float(loss), float(overlap_loss), float(area_loss)))
+
+        if no_improve >= patience:
+            break
+
+    if verbose:
+        print("compact_gradient_finetune: stopped after {} / {} steps".format(n_used, n_steps))
+
+    x_prop = x_full.clone(); y_prop = y_full.clone()
+    x_prop[m_idx] = x_param.detach()
+    y_prop[m_idx] = y_param.detach()
+    x_prop = x_prop.numpy(); y_prop = y_prop.numpy()
+
+    preplaced_idx_list = [i for i in range(k) if preplaced_mask[i]]
+    x_proj, y_proj = hard_zero_overlap(x_prop, y_prop, w, h, preplaced_indices=preplaced_idx_list)
+    canvas_bbox = tuple(float(v) for v in outline_bbox) if outline_bbox is not None else None
+    x_proj, y_proj = compact_positions(x_proj, y_proj, w, h, preplaced_mask=preplaced_mask,
+                                       boundary_code=boundary_code, canvas_bbox=canvas_bbox)
+
+    new_bbox = (float((x_proj + w).max()) - float(x_proj.min())) * \
+               (float((y_proj + h).max()) - float(y_proj.min()))
+    new_v = compute_boundary_violations(x_proj, y_proj, w, h, boundary_code)
+    new_cluster_v = compute_cluster_violations(x_proj, y_proj, w, h, cluster_group) if has_cluster else 0
+    new_hpwl = compute_hpwl_vectorized(x_proj, y_proj, w, h, W_int) if check_hpwl else 0.0
+
+    within_outline = True
+    if outline_bbox is not None:
+        oxmin, oymin, oxmax, oymax = canvas_bbox
+        within_outline = (float(x_proj.min()) >= oxmin - 1e-6
+                          and float(y_proj.min()) >= oymin - 1e-6
+                          and float((x_proj + w).max()) <= oxmax + 1e-6
+                          and float((y_proj + h).max()) <= oymax + 1e-6)
+
+    accept = (new_bbox < baseline_bbox - 1e-6
+              and within_outline
+              and new_v <= baseline_v + max(0, int(boundary_violation_slack))
+              and new_cluster_v <= baseline_cluster_v
+              and (not check_hpwl or new_hpwl <= baseline_hpwl + hpwl_slack + 1e-6))
+
+    if verbose:
+        print("compact_gradient_finetune: bbox {:.1f}->{:.1f}  V_bnd {}->{}  "
+              "V_cluster {}->{}  hpwl {:.2f}->{:.2f}  within_outline={}  accept={}".format(
+                  baseline_bbox, new_bbox, baseline_v, new_v,
+                  baseline_cluster_v, new_cluster_v, baseline_hpwl, new_hpwl, within_outline, accept))
+
+    if accept:
+        return x_proj, y_proj
+    return x.copy(), y.copy()
+
+
 def _reinsert_best_position(idx, x, y, w, h, others_mask, boundary_code, avg_side,
                             grid_density, gap_weight):
     """
@@ -1990,6 +2415,26 @@ def legalize_lff(
     pair_reinsert_sweeps=2,    # 獨立於 reinsert_sweeps，時間成本較高，預設保守一點
     pair_reinsert_grid_density=8,
     pair_reinsert_hpwl_slack_ratio=0.0,
+    use_reinsert_reshape=False,   # 實驗用：見 compact_reinsert_reshape 呼叫處說明
+    reinsert_reshape_sweeps=2,
+    reinsert_reshape_grid_density=8,
+    # v5.2（實驗、最終停用）：一度因為修正 warmup 量測誤差＋稀疏化後看起來
+    # 有淨改善而短暫改為預設開啟，但後來發現 compact_gradient_finetune 的
+    # loss 對「整體平移」完全不變（overlap/area/boundary-相對自己 bbox/
+    # cluster/HPWL 五項都是平移不變量），導致 Adam 在這個零梯度方向上隨機
+    # 漂移，把 block 帶出 outline_bbox 之外而不被發覺——連當初拿來當展示
+    # 案例的 -4.54% 那筆，事後用正確的 outline 檢查一查也是越界的無效解。
+    # 補上 weight_anchor 錨定項＋outline 硬 gate 修好這個 bug 之後，同一批
+    # 30 樣本重新量測變成 0/30 有真正改善，額外時間成本卻還在（約 +0.43
+    # 秒／樣本）——整個機制的「效益」原來大部分是這個 bug 的假象。因此改回
+    # 預設關閉；compact_gradient_finetune 與其 outline-safety gate 邏輯保留
+    # 在 utils.py 內備用，之後如果想再嘗試（例如換一種平移錨定方式、或用
+    # 不同的優化器設定去找回真正的改善），程式碼架構已經在了。
+    use_gradient_finetune=False,
+    gradient_finetune_steps=400,
+    gradient_finetune_lr=0.5,
+    gradient_finetune_patience=30,
+    gradient_finetune_hpwl_slack_ratio=0.0,
     tie_break_mode="area_desc",   # 'area_desc' | 'area_asc' | 'flexibility'（實驗用）
     # v4.4 實驗：100 樣本 A/B 顯示 compact_gravity 對 area_gap/hpwl_gap/
     # V_relative 都是輕微負面（且不會修到「多個獨立衛星群共享同一條被鎖死
@@ -2526,6 +2971,47 @@ def legalize_lff(
                                      W_int=W_int, p2b_edges=p2b_edges, pins_pos=pins_pos,
                                      hpwl_slack_ratio=pair_reinsert_hpwl_slack_ratio,
                                      verbose=verbose)
+
+    # ---- Remove-and-reinsert 局部搜尋，同時重新考慮長寬比（v5.1，實驗用）----
+    # legalize_lff 最初的 LFF 貪婪排布階段，每個 block 放置當下會試幾種長寬
+    # 比（面積不變），但一旦放完，形狀從此凍結——後面所有壓縮 pass 都只動
+    # (x, y)，不會重新考慮形狀。但「當下」最好的長寬比，等其他 block 陸續
+    # 放進來、整體佈局改變後，未必還是最好的。compact_reinsert_reshape 把
+    # `_aspect_variants` 接進跟 compact_reinsert 一樣的 remove-and-reinsert
+    # 搜尋迴圈，候選變成「不同位置 × 幾種長寬比」的組合。只對沒有 MIB／
+    # boundary 約束的 block 開放重新選長寬比（見該函式 docstring 說明限制
+    # 原因），其餘 block 仍可搬位置、形狀不變。刻意放在 pipeline 最尾端，
+    # 理由跟 compact_pair_reinsert 相同：避免被後續其他貪婪 pass 撤銷。
+    if use_reinsert_reshape:
+        x, y, w, h = compact_reinsert_reshape(x, y, w, h, preplaced_mask=preplaced_mask,
+                                              fixed_mask=fixed_mask, mib_group=mib_group,
+                                              boundary_code=boundary_code,
+                                              sweeps=reinsert_reshape_sweeps,
+                                              grid_density=reinsert_reshape_grid_density,
+                                              verbose=verbose)
+
+    # ---- 可微分全域微調（v5.2，實驗用）----
+    # 前面所有 compact_* pass 都是離散、一次挪一兩個 block 的區域搜尋——
+    # compact_pair_reinsert／compact_reinsert_reshape 兩次證明這條路在真實
+    # 資料上已經觸頂。這裡改用類比（analytical）global placement 的核心
+    # 概念（DREAMPlace/ePlace/RePlAce 這一系列）：把所有非 preplaced block
+    # 的 (x, y) 一次性當連續變數，用 PyTorch autograd + Adam 對一個平滑
+    # loss（重疊 + bbox 面積 + boundary + cluster + HPWL）做梯度下降，讓
+    # 全部 block 同時、連續地互相讓位——不保證中途合法，跑完一定會投影回
+    # `hard_zero_overlap` + `compact_positions` 保證的合法解，且只有
+    # bbox 嚴格變小、boundary/cluster 違規不變差、HPWL 代價在
+    # `gradient_finetune_hpwl_slack_ratio` 之內時才採用，否則整個操作
+    # 視同沒發生（見 compact_gradient_finetune docstring）。
+    if use_gradient_finetune:
+        x, y = compact_gradient_finetune(x, y, w, h, preplaced_mask=preplaced_mask,
+                                         boundary_code=boundary_code,
+                                         cluster_group=cluster_group, W_int=W_int,
+                                         outline_bbox=(oxmin, oymin, oxmax, oymax),
+                                         n_steps=gradient_finetune_steps,
+                                         lr=gradient_finetune_lr,
+                                         patience=gradient_finetune_patience,
+                                         hpwl_slack_ratio=gradient_finetune_hpwl_slack_ratio,
+                                         verbose=verbose)
 
     # ---- 保底驗證：理論上此時已經零重疊，這裡只是零成本的防禦性再確認 ----
     preplaced_idx_list = [i for i in range(k) if preplaced_mask[i]]

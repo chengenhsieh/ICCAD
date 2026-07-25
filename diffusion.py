@@ -82,7 +82,10 @@ class GaussianDiffusion:
         group_ids: (B, N) long，0 表無組
         mask:      (B, N) float，0/1（padding=0）
 
-        回傳 scalar = sum over (b, gid>0) of var_within_group。
+        回傳 (B,) tensor：每個 sample 自己的 sum over (gid>0) of
+        var_within_group（v5.8 改成逐 sample 回傳，之前是整個 batch
+        加總成一個 scalar——呼叫端想要舊行為時自己再 `.sum()`／`.mean()`
+        即可，`.mean()` 在數學上完全等於舊版的 `.sum() / B`，不是近似）。
 
         實作：用 scatter_add 一次跨 batch 算完。
         """
@@ -92,7 +95,7 @@ class GaussianDiffusion:
         # max() 在 GPU 上會引起 sync，但只在這個 batch 算一次而已
         G_max = int(group_ids.max().item()) + 1   # +1 因為 0 也算一個 bucket
         if G_max <= 1:
-            return values.new_zeros(())   # 整個 batch 都沒組
+            return values.new_zeros(B)   # 整個 batch 都沒組
 
         # 對每個 (b, gid) 算 sum, sum_sq, count
         # flat index = b * G_max + gid
@@ -126,14 +129,29 @@ class GaussianDiffusion:
 
         # 只算 cnt >= 2 的組
         weight = (cnt >= 2).float()
-        return (var * weight).sum()
+        return (var * weight).sum(dim=1)   # (B,)
 
-    def _soft_constraint_loss(self, x0_pred, batch, weights):
+    def _soft_constraint_loss(self, x0_pred, batch, weights, t_weight=None):
         """
-        回傳 (total, (mib, cluster, boundary))，皆為 scalar。
+        回傳 (total, (mib, cluster, boundary, overlap))，total 為 scalar，
+        後四項為 detached scalar（純粹給 log 用，跨 epoch 比較同一種
+        定義的 loss 大小，不受 t_weight 影響）。
         向量化版：用 scatter_add 跨整個 batch 計算組內變異數，
         移除原本的 `for b in range(B): for gid in unique:` 雙重迴圈
         以及每次 `gid.item()` 造成的 GPU→CPU 同步。
+
+        t_weight（v5.8，實驗用）：None（預設）= 完全比照 v5.7 以前的算法
+        （mib/cluster/overlap 三項在數學上跟舊版逐 batch 加總再除以 B
+        完全等價，不是近似；boundary 項刻意保留原本「整個 batch 所有貼邊
+        block 一起 pooled 平均」的算法，不動）。
+        給 (B,) tensor 時 = 每個 sample 各自的 t 加權權重（見 training_loss
+        呼叫處說明），四個 soft loss 全部先各自攤成 per-sample (B,)，
+        再依權重做加權平均——這時候 boundary 項的池化方式會變成「每個
+        sample 各自平均、sample 間再平均」，跟 t_weight=None 時的「整個
+        batch 逐 block 平均」語意不同（前者每個 sample 權重相等，後者每個
+        貼邊 block 權重相等），這是支援逐樣本 t 加權必須付出的代價，但也
+        代表 t_weight=None 這個分支被刻意設計成跟這個功能加入之前的訓練
+        行為完全一致，方便做「加不加 t 權重」的單一變因 A/B。
         """
         device = x0_pred.device
         B, N, _ = x0_pred.shape
@@ -147,29 +165,23 @@ class GaussianDiffusion:
         cluster_group = batch["cluster_group"].to(device, non_blocking=True)
         bnd = batch["boundary_code"].to(device, non_blocking=True)
 
-        # ---- MIB: 同組 log_r 一致 → 組內變異數總和 ----
-        mib_loss = self._group_variance_loss(log_r, mib_group, mask)
+        # ---- MIB: 同組 log_r 一致 → 組內變異數總和，(B,) per-sample ----
+        mib_loss_ps = self._group_variance_loss(log_r, mib_group, mask)
 
-        # ---- cluster: 同組中心靠近 → 組內 x 變異 + y 變異 ----
-        cluster_loss = (self._group_variance_loss(x, cluster_group, mask) +
-                        self._group_variance_loss(y, cluster_group, mask))
+        # ---- cluster: 同組中心靠近 → 組內 x 變異 + y 變異，(B,) per-sample ----
+        cluster_loss_ps = (self._group_variance_loss(x, cluster_group, mask) +
+                           self._group_variance_loss(y, cluster_group, mask))
 
         # ---- boundary: 該貼邊的 block 對應座標接近 0 或 1 ----
         b_left   = ((bnd & 1) > 0).float() * mask
         b_right  = ((bnd & 2) > 0).float() * mask
         b_top    = ((bnd & 4) > 0).float() * mask
         b_bottom = ((bnd & 8) > 0).float() * mask
-        boundary_loss = (
-            (b_left   * (x - 0.0) ** 2).sum() +
-            (b_right  * (x - 1.0) ** 2).sum() +
-            (b_top    * (y - 1.0) ** 2).sum() +
-            (b_bottom * (y - 0.0) ** 2).sum()
-        )
-        denom = (b_left.sum() + b_right.sum() + b_top.sum() + b_bottom.sum()).clamp(min=1)
-        boundary_loss = boundary_loss / denom
-
-        mib_loss = mib_loss / B
-        cluster_loss = cluster_loss / B
+        b_num = (b_left   * (x - 0.0) ** 2 +
+                 b_right  * (x - 1.0) ** 2 +
+                 b_top    * (y - 1.0) ** 2 +
+                 b_bottom * (y - 0.0) ** 2)                # (B, N)
+        b_cnt = b_left + b_right + b_top + b_bottom        # (B, N)
 
         # ---- v4.0: Overlap loss ----
         # 用 x0_pred 算每對 block 的 bbox 重疊面積（可微）。
@@ -181,7 +193,7 @@ class GaussianDiffusion:
         #   (b) sqrt(0) 反向梯度 = inf。對 areas 加 epsilon 避免梯度爆炸，
         #       而不是只 clamp forward 數值。
         #   (c) 強制升 fp32 算（AMP fp16 在 pair-wise N^2 累積容易溢位）。
-        overlap_loss = x0_pred.new_zeros(())
+        overlap_loss_ps = x0_pred.new_zeros(B)
         if "areas_norm" in batch:
             areas = batch["areas_norm"].to(device, non_blocking=True).float()    # (B, N)
             # 強制升 fp32（從 AMP 的 fp16 升回來）
@@ -219,14 +231,31 @@ class GaussianDiffusion:
                 # 除 k 讓 loss 量級提高到 ~0.1（跟 MSE 同量級），配合 lambda=1.0
                 # 貢獻約 50%。同時「大 k sample 貢獻大」，因為大 k 天然重疊 pair 多。
                 k_per_sample = mask.sum(dim=1).clamp(min=1)                  # (B,)
-                overlap_loss = (overlap_sum / k_per_sample).mean()
+                overlap_loss_ps = overlap_sum / k_per_sample                 # (B,)
 
-        total = (weights["lambda_mib"] * mib_loss +
-                 weights["lambda_cluster"] * cluster_loss +
-                 weights["lambda_boundary"] * boundary_loss +
-                 weights.get("lambda_overlap", 0.0) * overlap_loss)
-        return total, (mib_loss.detach(), cluster_loss.detach(),
-                       boundary_loss.detach(), overlap_loss.detach())
+        if t_weight is None:
+            # ---- 跟 v5.8 之前完全一致的算法 ----
+            mib_loss = mib_loss_ps.mean()
+            cluster_loss = cluster_loss_ps.mean()
+            boundary_loss = b_num.sum() / b_cnt.sum().clamp(min=1)
+            overlap_loss = overlap_loss_ps.mean()
+            total = (weights["lambda_mib"] * mib_loss +
+                     weights["lambda_cluster"] * cluster_loss +
+                     weights["lambda_boundary"] * boundary_loss +
+                     weights.get("lambda_overlap", 0.0) * overlap_loss)
+            return total, (mib_loss.detach(), cluster_loss.detach(),
+                           boundary_loss.detach(), overlap_loss.detach())
+
+        # ---- t 加權：四項都先攤成 per-sample，再依 t_weight 加權平均 ----
+        boundary_loss_ps = b_num.sum(dim=1) / b_cnt.sum(dim=1).clamp(min=1)   # (B,)
+        total_ps = (weights["lambda_mib"] * mib_loss_ps +
+                    weights["lambda_cluster"] * cluster_loss_ps +
+                    weights["lambda_boundary"] * boundary_loss_ps +
+                    weights.get("lambda_overlap", 0.0) * overlap_loss_ps)     # (B,)
+        w = t_weight.clamp(min=0.0)
+        total = (total_ps * w).sum() / w.sum().clamp(min=1e-8)
+        return total, (mib_loss_ps.mean().detach(), cluster_loss_ps.mean().detach(),
+                       boundary_loss_ps.mean().detach(), overlap_loss_ps.mean().detach())
 
     # ----------------------------------------------------------------
     # Training loss
@@ -239,9 +268,26 @@ class GaussianDiffusion:
                    state, block_features, conn_weights, group_bias, mask,
                    mib_group, cluster_group, boundary_code
             soft_weights: None 表示這步不加 soft loss（warmup 用）；
-                          否則為 dict(lambda_mib, lambda_cluster, lambda_boundary)
+                          否則為 dict(lambda_mib, lambda_cluster, lambda_boundary,
+                          lambda_overlap, weight_soft_loss_by_alpha_bar)
         Returns:
             loss (scalar), info (dict)
+
+        v5.8（實驗用，timestep 加權）：soft constraint loss（mib/cluster/
+        boundary/overlap）都是從 x0_pred 反推出來的，這個反推
+        `x0_pred = (x_t - sqrt(1-ᾱ_t)·noise_pred) / sqrt(ᾱ_t)` 在 t 大
+        （雜訊多，ᾱ_t 接近 0）時數值上很不穩定，x0_pred 這時候基本上不可信
+        （`_soft_constraint_loss` 裡的 overlap 分支有 clamp 純粹是防
+        NaN/inf，不是說這個範圍內的值就可信）。如果 `soft_weights` 裡
+        `weight_soft_loss_by_alpha_bar=True`，就把 ᾱ_t（本來就要算來重建
+        x0_pred，不需要多算）當每個 sample 的權重傳給
+        `_soft_constraint_loss`，讓 t 小（雜訊少、x0_pred 可信）的樣本
+        在 soft loss 裡佔比較大的份量，t 大的樣本自動被壓低——不新增任何
+        需要另外調的超參數。預設關閉（見 `config.py:
+        weight_soft_loss_by_alpha_bar`），開啟後跟關閉時的訓練行為在
+        mib/cluster/overlap 三項數學上完全等價、只有 boundary 項的 pooling
+        方式會變（見 `_soft_constraint_loss` docstring），方便單獨驗證這一
+        個改動的效果。
         """
         device = next(model.parameters()).device
         x0 = batch["state"].to(device, non_blocking=True)
@@ -267,7 +313,13 @@ class GaussianDiffusion:
         if soft_weights is not None:
             alpha_bar_t = self._extract(self.alphas_cumprod, t, x_t.shape)
             x0_pred = (x_t - torch.sqrt(1 - alpha_bar_t) * noise_pred) / torch.sqrt(alpha_bar_t)
-            soft_loss, (ml, cl, bl, ol) = self._soft_constraint_loss(x0_pred, batch, soft_weights)
+
+            t_weight = None
+            if soft_weights.get("weight_soft_loss_by_alpha_bar", False):
+                t_weight = alpha_bar_t.view(B)   # (B,)，見上方 docstring
+
+            soft_loss, (ml, cl, bl, ol) = self._soft_constraint_loss(
+                x0_pred, batch, soft_weights, t_weight=t_weight)
             loss = loss + soft_loss
             info.update({"soft": soft_loss.detach(), "mib": ml, "cluster": cl,
                          "boundary": bl, "overlap": ol})

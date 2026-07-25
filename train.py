@@ -127,6 +127,8 @@ def _soft_weights_for_epoch(config, epoch):
         "lambda_cluster": config.lambda_cluster,
         "lambda_boundary": config.lambda_boundary,
         "lambda_overlap": getattr(config, "lambda_overlap", 0.0),   # v4.0
+        # v5.8：見 config.py / diffusion.py 說明，預設 False
+        "weight_soft_loss_by_alpha_bar": getattr(config, "weight_soft_loss_by_alpha_bar", False),
     }
 
 
@@ -145,11 +147,16 @@ def _auto_num_workers(config):
 # ============================================================
 
 def train(config):
+    # 固定 seed，放在任何會消耗隨機數的操作（模型初始化、DataLoader shuffle）
+    # 之前——見 config.py: seed 說明，讓「只改一個變因」的比較乾淨。
+    seed = getattr(config, "seed", 42)
+    torch.manual_seed(seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = getattr(config, "use_amp", True) and device.type == "cuda"
 
     os.makedirs(config.output_dir, exist_ok=True)
-    loss_png_path = os.path.join(config.output_dir, "loss_curve_300epoch_overlap_v4.png")
+    loss_png_path = os.path.join(config.output_dir, "loss_curve_300epoch_overlap_v5.png")
 
     # In-memory history（取代 csv），畫 loss curve 用
     history = {k: [] for k in [
@@ -161,15 +168,18 @@ def train(config):
 
     print("=" * 60)
     print("Training started")
+    print("Seed: {}".format(seed))
     print("Device: {} | AMP: {} | OS: {} | num_workers: {}".format(
         device, use_amp, platform.system(), num_workers))
     print("Output dir: {}".format(os.path.abspath(config.output_dir)))
     print("Config: d_model={}, enc={}, dec={}, batch={}, epochs={}".format(
         config.d_model, config.encoder_layers, config.denoiser_layers,
         config.batch_size, config.epochs))
-    print("Soft loss: lambda_mib={}, lambda_cluster={}, lambda_boundary={}, warmup={}".format(
+    print("Soft loss: lambda_mib={}, lambda_cluster={}, lambda_boundary={}, warmup={}, "
+          "weight_soft_loss_by_alpha_bar={}".format(
         config.lambda_mib, config.lambda_cluster, config.lambda_boundary,
-        config.soft_loss_warmup_epochs))
+        config.soft_loss_warmup_epochs,
+        getattr(config, "weight_soft_loss_by_alpha_bar", False)))
 
     # -- 載入資料 --
     print("Loading FloorSet datasets...")
@@ -320,7 +330,7 @@ def train(config):
         if is_best or epoch % config.save_interval == 0 or epoch == config.epochs:
             ema.apply_shadow()
             tag = "best" if is_best else "epoch{}".format(epoch)
-            path = os.path.join(config.output_dir, "model_{}_overlap_v4.pt".format(tag))
+            path = os.path.join(config.output_dir, "model_{}_overlap_v5.pt".format(tag))
             torch.save({
                 "epoch": epoch,
                 "global_step": global_step,
@@ -365,4 +375,7 @@ if __name__ == "__main__":
     # config.encoder_layers = 4
     # config.denoiser_layers = 6
     # config.epochs = 60
+    # 正式訓練（v5，300 epoch）：epochs/soft_loss_warmup_epochs 都是
+    # Config 預設值，這裡不用再蓋一次，只需要打開 weighted 這個實驗旗標。
+    config.weight_soft_loss_by_alpha_bar = True   # v5.8：30 epoch 短跑驗證過（raw overlap -17%、area_gap 21/30 樣本更好），正式訓練沿用
     train(config)

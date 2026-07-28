@@ -156,7 +156,7 @@ def train(config):
     use_amp = getattr(config, "use_amp", True) and device.type == "cuda"
 
     os.makedirs(config.output_dir, exist_ok=True)
-    loss_png_path = os.path.join(config.output_dir, "loss_curve_300epoch_overlap_v5.png")
+    loss_png_path = os.path.join(config.output_dir, "loss_curve_300epoch_overlap_v7.png")
 
     # In-memory history（取代 csv），畫 loss curve 用
     history = {k: [] for k in [
@@ -180,6 +180,13 @@ def train(config):
         config.lambda_mib, config.lambda_cluster, config.lambda_boundary,
         config.soft_loss_warmup_epochs,
         getattr(config, "weight_soft_loss_by_alpha_bar", False)))
+    print("v5.9: use_qk_norm={}, use_min_snr_main_loss={} (gamma={})".format(
+        getattr(config, "use_qk_norm", False),
+        getattr(config, "use_min_snr_main_loss", False),
+        getattr(config, "min_snr_gamma", None)))
+    print("v5.10: use_coord_sincos={} (n_freqs={})".format(
+        getattr(config, "use_coord_sincos", False),
+        getattr(config, "coord_n_freqs", None)))
 
     # -- 載入資料 --
     print("Loading FloorSet datasets...")
@@ -228,6 +235,10 @@ def train(config):
     best_val_loss = float("inf")
     global_step = 0
 
+    # v5.9：跟 soft_weights 不同，Min-SNR 不受 soft_loss_warmup_epochs
+    # 影響（作用在主要去噪 loss，從 epoch 1 就該套用），所以在迴圈外算一次。
+    min_snr_gamma = config.min_snr_gamma if getattr(config, "use_min_snr_main_loss", False) else None
+
     for epoch in range(1, config.epochs + 1):
         model.train()
         soft_w = _soft_weights_for_epoch(config, epoch)
@@ -254,7 +265,8 @@ def train(config):
 
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=use_amp):
-                loss, info = diffusion.training_loss(model, batch, soft_weights=soft_w)
+                loss, info = diffusion.training_loss(model, batch, soft_weights=soft_w,
+                                                      min_snr_gamma=min_snr_gamma)
 
             if use_amp:
                 scaler.scale(loss).backward()
@@ -330,7 +342,7 @@ def train(config):
         if is_best or epoch % config.save_interval == 0 or epoch == config.epochs:
             ema.apply_shadow()
             tag = "best" if is_best else "epoch{}".format(epoch)
-            path = os.path.join(config.output_dir, "model_{}_overlap_v5.pt".format(tag))
+            path = os.path.join(config.output_dir, "model_{}_overlap_v7.pt".format(tag))
             torch.save({
                 "epoch": epoch,
                 "global_step": global_step,
@@ -375,7 +387,14 @@ if __name__ == "__main__":
     # config.encoder_layers = 4
     # config.denoiser_layers = 6
     # config.epochs = 60
-    # 正式訓練（v5，300 epoch）：epochs/soft_loss_warmup_epochs 都是
-    # Config 預設值，這裡不用再蓋一次，只需要打開 weighted 這個實驗旗標。
-    config.weight_soft_loss_by_alpha_bar = True   # v5.8：30 epoch 短跑驗證過（raw overlap -17%、area_gap 21/30 樣本更好），正式訓練沿用
+    # 正式訓練（v7，300 epoch）：v5.10 30-epoch 短跑結論——raw overlap
+    # -5.1%、20/30 樣本較好（接近 2:1，量級接近 QK-norm 跑滿 300 epoch 才
+    # 達到的效果），area_gap/hpwl_gap 比較模糊（接近銅板），訊號沒有
+    # QK-norm 短跑那次乾淨，但這個改動只加約 2000 個參數（一個小 MLP），
+    # 不像 QK-norm 有量測到的真實 +21% 單步計算成本，效益/成本比可能更好，
+    # 值得投入完整訓練驗證。QK-norm/Min-SNR 維持 False，避免混淆變因。
+    # epochs/soft_loss_warmup_epochs 用 Config 預設值（300/10），不用再蓋。
+    config.use_qk_norm = False
+    config.use_min_snr_main_loss = False
+    config.use_coord_sincos = True            # v5.10：30 epoch 短跑驗證過，正式訓練沿用
     train(config)

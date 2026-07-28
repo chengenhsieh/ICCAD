@@ -10,6 +10,21 @@ Utility Functions v3 — 新增 soft violation 計算 + optimal/inference 並排
 import torch
 import numpy as np
 
+# v5.11：compute_cluster_violations 改用官方同款的 Shapely 多邊形聯集
+# 判斷連通分量（見該函式說明）。跟 iccad2026_evaluate.py 一樣用 try/except
+# 包起來、缺套件時退回舊的 pairwise 邊緣距離近似判定（並印警告），不讓
+# 整個 utils.py 因為缺一個非核心依賴而完全掛掉。
+try:
+    from shapely.geometry import box as _shapely_box
+    from shapely.ops import unary_union as _shapely_unary_union
+    _SHAPELY_AVAILABLE = True
+except ImportError:
+    _SHAPELY_AVAILABLE = False
+    print("WARNING: shapely not available -- compute_cluster_violations falls back to "
+          "an approximate pairwise-edge-distance check that can disagree with the "
+          "official iccad2026_evaluate.py judging (see utils.py v5.11 notes). "
+          "Install shapely for exact-matching V_grouping.")
+
 
 # ============================================================
 # 座標轉換
@@ -137,7 +152,17 @@ def _connected_components(members, adj):
 
 
 def compute_cluster_violations(x, y, w, h, cluster_group):
-    """V_grouping = sum_p (cp - 1)。cluster_group: (k,) 組別 ID（0=無）。"""
+    """
+    V_grouping = sum_p (cp - 1)。cluster_group: (k,) 組別 ID（0=無）。
+
+    v5.11 修正：改用 Shapely 的 `unary_union` 判斷同組 block 合起來是不是
+    一塊連通的多邊形（跟 `iccad2026_evaluate.py` 官方判定邏輯完全一致），
+    取代舊版用 `_blocks_share_edge`（pairwise 邊緣距離 < tol）近似判定
+    連通分量的做法——舊版只檢查「邊緣距離夠近」，官方是精確的幾何聯集，
+    在 20 個真實案例的交叉驗證中舊版有 3 個案例算出來跟官方差 1（見
+    CHANGELOG.md v5.11）。Shapely 不可用時（極少數環境沒裝這個非核心
+    依賴）退回舊的近似判定，並印一次警告，不讓整個函式掛掉。
+    """
     x, y, w, h = [np.array(a, dtype=np.float64) for a in [x, y, w, h]]
     cluster_group = np.array(cluster_group)
     v = 0
@@ -147,14 +172,28 @@ def compute_cluster_violations(x, y, w, h, cluster_group):
         members = [i for i in range(len(x)) if cluster_group[i] == gid]
         if len(members) < 2:
             continue
-        cp = _connected_components(
-            members, lambda a, b: _blocks_share_edge(x, y, w, h, a, b))
+        if _SHAPELY_AVAILABLE:
+            polys = [_shapely_box(x[i], y[i], x[i] + w[i], y[i] + h[i]) for i in members]
+            union = _shapely_unary_union(polys)
+            cp = len(union.geoms) if union.geom_type == "MultiPolygon" else 1
+        else:
+            cp = _connected_components(
+                members, lambda a, b: _blocks_share_edge(x, y, w, h, a, b))
         v += (cp - 1)
     return v
 
 
-def compute_mib_violations(w, h, mib_group, tol=1e-3):
-    """V_mib = sum_q (sq - 1)，sq = 組內 distinct (w,h) 數。"""
+def compute_mib_violations(w, h, mib_group, decimals=4):
+    """
+    V_mib = sum_q (sq - 1)，sq = 組內 distinct (w,h) 數。
+
+    v5.11 修正：`round(w[i], decimals)` 直接比照官方
+    `round(positions[i][2], 4)` 的精度（4 位小數），取代舊版
+    `round(w[i]/tol)`、`tol=1e-3`（等於只取到 3 位小數）——官方精度更高，
+    理論上比舊版更容易把「其實有微小差異的形狀」判定為不同形狀（V_mib
+    更嚴格）。20 個真實案例交叉驗證中沒看到這項造成差異，但既然要求全部
+    對齊官方就一併修正精度，避免边缘案例不一致。
+    """
     w, h = np.array(w, dtype=np.float64), np.array(h, dtype=np.float64)
     mib_group = np.array(mib_group)
     v = 0
@@ -164,21 +203,30 @@ def compute_mib_violations(w, h, mib_group, tol=1e-3):
         members = [i for i in range(len(w)) if mib_group[i] == gid]
         if len(members) < 2:
             continue
-        shapes = []
+        shapes = set()
         for i in members:
-            key = (round(w[i] / tol), round(h[i] / tol))
-            if key not in shapes:
-                shapes.append(key)
+            key = (round(float(w[i]), decimals), round(float(h[i]), decimals))
+            shapes.add(key)
         v += (len(shapes) - 1)
     return v
 
 
-def compute_boundary_violations(x, y, w, h, boundary_code, tol=1e-2):
+def compute_boundary_violations(x, y, w, h, boundary_code, tol=1e-6):
     """
     V_boundary = sum_b 1b（block 沒貼到指定邊/角 = 1）。
     邊界以「整個 floorplan 的 bounding box」為準。
     bit0=left, bit1=right, bit2=top, bit3=bottom。
     座標系原點左下、y 向上：top=y 最大、bottom=y 最小。
+
+    v5.11 修正：容忍度改成絕對值 `tol=1e-6`，直接比照
+    `iccad2026_evaluate.py` 官方判定邏輯（`eps=1e-6`，逐 bit 檢查
+    `abs(...) < eps`）。舊版用的是「layout 自己邊長的 1% 相對容忍度」
+    （`tol=1e-2` 乘上邊長），對一個 100 單位大小的佈局等於放寬到快 1 個
+    完整單位——這個容忍度太寬，會把「其實沒真的貼邊、只是離得比較近」的
+    block 誤判成合法貼邊，導致 V_boundary 被嚴重低估（100 樣本官方
+    validation set 上平均 V_relative 從官方的 0.2518 錯算成 ~0.10-0.13，
+    見 CHANGELOG.md v5.11）。用官方結果反推驗證過，改成這個絕對容忍度後
+    在 20 個真實案例上跟官方 `violations_relative` 100% 精確吻合。
     """
     x, y, w, h = [np.array(a, dtype=np.float64) for a in [x, y, w, h]]
     boundary_code = np.array(boundary_code, dtype=np.int64)
@@ -188,7 +236,6 @@ def compute_boundary_violations(x, y, w, h, boundary_code, tol=1e-2):
     xmax = (x + w).max()
     ymin = y.min()
     ymax = (y + h).max()
-    rel = tol * max(xmax - xmin, ymax - ymin, 1e-6)
     v = 0
     for i in range(len(x)):
         code = int(boundary_code[i])
@@ -196,13 +243,13 @@ def compute_boundary_violations(x, y, w, h, boundary_code, tol=1e-2):
             continue
         ok = True
         if code & 1:  # left
-            ok = ok and (abs(x[i] - xmin) <= rel)
+            ok = ok and (abs(x[i] - xmin) < tol)
         if code & 2:  # right
-            ok = ok and (abs((x[i] + w[i]) - xmax) <= rel)
+            ok = ok and (abs((x[i] + w[i]) - xmax) < tol)
         if code & 4:  # top
-            ok = ok and (abs((y[i] + h[i]) - ymax) <= rel)
+            ok = ok and (abs((y[i] + h[i]) - ymax) < tol)
         if code & 8:  # bottom
-            ok = ok and (abs(y[i] - ymin) <= rel)
+            ok = ok and (abs(y[i] - ymin) < tol)
         if not ok:
             v += 1
     return v

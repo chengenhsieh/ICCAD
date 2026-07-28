@@ -212,7 +212,444 @@ best_softconstraints=0.132），確認已經是最佳選擇，不用換。
 
 ---
 
-## 目前的官方 evaluate 結果（100 樣本，`my_optimizer.py`）
+## v5.1 —— `compact_reinsert_reshape`（不採用，保留 opt-in）
+
+**改了什麼**：`legalize_lff` 最初的 LFF 貪婪排布階段，每個 block 放置當下
+會試幾種長寬比（面積不變，沿用 `legalize_v2` 用的 `_aspect_variants`），
+但放完就凍結，後面所有壓縮 pass 都只動 (x, y)、不會重新考慮形狀。新增
+`compact_reinsert_reshape`，把 `_aspect_variants` 接進跟 `compact_
+reinsert` 一樣的 remove-and-reinsert 搜尋迴圈，候選變成「不同位置 × 幾種
+長寬比」的組合。只對沒有 preplaced/fixed/MIB/boundary 約束的 block 開放
+重選長寬比（MIB group 成員必須共用同一個形狀、boundary 鎖定的是座標不是
+位置，這兩種先跳過不處理），放在 pipeline 最尾端。
+
+**結果**：合成測試（無 boundary/cluster/MIB 約束）多組 seed 從不變差，
+最多 −12.21% bbox，看起來很有效；但真實資料 25 樣本 quasi-paired 測試
+**22/25 完全零變化**，另外 3 個的差異是浮點數雜訊等級（相對誤差
+<1e-6%），實質上等於全部零效果。追一個具體案例（k=21，9/21 block 符合
+可重塑條件、搜尋範圍正常）確認不是 bug，是結構性問題：`compact_
+reinsert`（純位置搜尋）在 pipeline 較早階段已經把每個 block 能找到的
+最佳位置窮舉過，等走到尾端的 reshape pass 時，殘留縫隙已經被壓縮到
+「換形狀也擠不進去」的程度；合成資料因為沒有 boundary/cluster/MIB 這些
+會觸發額外拉緊機制的約束，留下的縫隙比真實資料多，才會看到假的改善
+空間——**跟 v4.9 `compact_pair_reinsert` 是同一個根因**，這是這批「往
+pipeline 尾端加新的局部搜尋 pass」類型的嘗試第二次踩到同樣的陷阱。
+
+**決定**：不採用（`use_reinsert_reshape=False`），程式碼保留為 opt-in
+函式。
+
+---
+
+## v5.2 —— `compact_gradient_finetune`（不採用，保留 opt-in）
+
+**改了什麼**：v4.4–v5.1 全部都是「離散、一次挪一兩個 block」的區域搜尋
+（`compact_pair_reinsert`/`compact_reinsert_reshape` 兩次證明這條路在
+真實資料上已經觸頂）。這次改用完全不同的範式——DREAMPlace／ePlace／
+RePlAce 這系列類比（analytical）global placement：把所有非 preplaced
+block 的 (x, y) 一次性當連續變數，PyTorch autograd + Adam 對一個平滑 loss
+（overlap + bbox 面積 + boundary + cluster + HPWL，全部可微分）做聯合梯度
+下降，讓所有 block 同時、連續地互相讓位。梯度下降過程不保證任何 hard/soft
+constraint，跑完一定投影回 `hard_zero_overlap` + `compact_positions`
+保證的合法解，只有 bbox 嚴格變小、boundary/cluster 違規不變差、HPWL 代價
+在 slack 內時才採用。
+
+**兩個先發現、先修正的方法論陷阱**：
+1. **一次性 warmup 成本污染量測**：最初量測 legalize 時間從 ~0.2-0.4s
+   暴增到 1.8-3.8s/樣本，看起來是災難性的開銷。追查發現這是 PyTorch/
+   autograd「每個 process 第一次呼叫」才會付的一次性初始化成本（同一
+   process 內第二次呼叫起降到 ~0.16s），實際生產環境（單一長跑 process
+   跑完 100 樣本）只會付一次，修正量測方式後真實開銷只有 +0.36 秒/樣本。
+2. **稠密計算浪費**：overlap／HPWL 原本每步都建構完整 k×k 矩陣，真實資料
+   的 B2B 連線通常很稀疏；改成稀疏邊表（HPWL）+ 只算上三角索引
+   （overlap），單步成本再降 ~15%。
+
+**lr/patience 掃描**（負面結果）：lr 越高越容易讓 Adam 提早收斂到較差的
+局部最優（掃過 1.0/1.5/2.0/3.0 都比 0.5 差，過大的步伐直接跳過真正的好
+解）；patience 太低會殺死需要較多步數才找到的真正改善（掃過 12/20 都讓
+已知能找到 -4.54% 的案例變成 0%，該案例需要約 130-145 步才能跳出一個
+loss 平原）。找不到「免費」的降時間成本方法——最終以 `lr=0.5`、
+`patience=30` 改為預設開啟，接受約 +0.36 秒/樣本（總時間 +16%）的成本
+換 area_gap 改善。
+
+**修另一個 bug 時意外發現的致命問題**：在跑合成正確性測試時，`test_lff.py`
+的 `within_outline` 檢查對 2/12 個案例回報 `False`。追查發現：整個 loss
+（overlap／area／boundary-相對自己當下 bbox 邊／cluster-相對組內重心／
+HPWL）全部是**平移不變**的（把所有座標同時加一個常數，loss 完全不變）
+——這個方向上真正的梯度和理論上是 0，但 Adam 對每個參數獨立做二階動量
+正規化、不保留這個「梯度和為 0」的性質，實測幾百步下來會在這個零約束
+方向上隨機漂移，把整層 block 帶出 `outline_bbox` 之外而不被投影階段的
+`hard_zero_overlap`/`compact_positions`（兩者都只保證彼此不重疊，不保證
+回到原本的座標系）發現。追蹤發現連當初拿來當展示案例的那筆 idx=16、
+-4.54% 的改善，事後用正確的 outline 檢查一查，**同一條優化軌跡走出來的
+候選解本身就是越界的無效解**——只是原本的程式碼從未檢查過這件事。
+
+**修法**：(1) 加一個很小的 `weight_anchor` 平移錨定項，把 movable block
+的平均座標拉回優化開始前的平均座標——這是平移方向上唯一有梯度的項，足以
+消除漂移且不影響其餘四項的正常優化（梯度方向正交）；(2) 補上真正的硬
+gate：投影後明確檢查所有 block 是否落在 `outline_bbox` 內，不符合就直接
+拒絕、退回原本已保證合法的解（跟其他 v4.7+ 機制的安全閘門邏輯一致）。
+
+**修好之後的結果**：同一批 30 樣本重新量測，`n_improved` 從 1/30（那筆
+-4.54%）變成 **0/30**——原本以為的「淨效益」其實大部分是這個未被發現的
+bug 造成的假象：一部分「改善」根本是越界的無效解，被 outline gate 正確
+擋下，而真正合法、又比原本明顯更好的解，在剩下的 29 個案例裡從未出現過。
+額外時間成本（約 +0.36~0.43 秒/樣本）仍然存在。
+
+**決定**：不採用（`use_gradient_finetune=False`）。`compact_gradient_
+finetune` 本體與新加的 `weight_anchor`／outline 硬 gate 保留在
+`utils.py` 備用——修正過的正確性基礎已經在，日後如果想換一種平移錨定
+方式或優化器設定去找回真正的改善空間，不需要從頭再踩一次這個 bug。
+
+**後續追加（v5.5）——補上真正的 outline containment loss**：weight_anchor
+只是「不知道 outline 在哪裡、純粹不讓它漂移」的土法煉鋼，補上
+`weight_containment`：對每個 block 直接算「超出 outline_bbox 邊界的
+距離」平方懲罰（只在真的超出時才非零），讓優化器一邊優化一邊自己知道
+outline 在哪，而不是先自由漂移再事後被 gate 擋下來。30 樣本重測**仍是
+0/30**，但追一個具體案例（idx=16）發現真正卡住的瓶頸換了——已經不是
+outline，而是「boundary 違規數不變差」這條離散 gate：`compute_boundary_
+violations` 判定的是「有沒有真的貼到邊」的 all-or-nothing 結果，跟 loss
+裡用連續距離當代理的 `boundary_loss` 對不齊，bbox 縮小的過程中被縮小的
+那條邊本身在移動，貼邊判定可能因此翻面，即使 area 改善很大，只要 1 個
+block 從「貼邊」變成「差一點」，離散 gate 就整個否決。決定：仍不採用，
+但這次是有結構性理由的負面結果（不是優化器選錯或漂移沒修好），`weight_
+containment` 保留在 `utils.py`。
+
+**再後續追加（v5.6）——boundary gate 加 slack**：既然瓶頸是 boundary
+violation 硬 gate，比照 `hpwl_slack_ratio` 的精神加上
+`boundary_violation_slack`（違規數整數容忍度，預設 0＝跟之前完全一樣
+的嚴格行為），測 `slack=1`（多容忍 1 個違規）30 樣本 paired：只解鎖了
+**1/30** 樣本（其餘 29 個結果不變，代表其他樣本的瓶頸根本不是這條
+gate），而那唯一被解鎖的樣本換算 cost 公式（`quality * exp(BETA*V_rel)`
+這部分）反而是 **+0.16%（變差）**——V_relative 進 cost 公式是指數項，
+一點點違規增加換到的 area 改善划不來，這還沒算上真實的 +0.5 秒/樣本
+runtime 成本。**決定**：不採用（`boundary_violation_slack` 預設維持
+0）。三次獨立、針對三個不同假設瓶頸的修正嘗試（漂移／containment／
+gate 寬容度）全部收斂到同一個結論：這個機制在目前的離散安全閘門架構下，
+對這份真實資料沒有可及的淨效益——不是哪一次沒調對，是結構性的。程式碼
+（`weight_anchor`／`weight_containment`／`boundary_violation_slack`）
+全部保留在 `utils.py` 備用，預設值都退回原本嚴格、無副作用的行為。
+
+---
+
+## v5.3 —— EDM 取樣器品質 A/B（不採用）
+
+**背景**：v4.2 加了 EDM（Heun 2 階）取樣器當 DDIM 的替代選項，但從那之後
+只測過 DDIM 自己的步數（100→30），EDM 本身從未真的驗證過品質。
+
+**先修一個公平性 bug**：`generate_floorplan` 的 EDM 分支呼叫
+`edm_sample_with_forces` 時沒有把 v5.0 調過的力強度
+（`grouping_force_strength`/`boundary_nudge_strength`/`repulsion_strength`）
+傳進去，導致 EDM 分支一直在用 `edm_sample_with_forces` 自己內部寫死、
+v5.0 調參前的舊值（0.015/0.05/0.05 vs. 新的 0.030/0.025/0.0375）。不修
+這個就是拿「DDIM 用新參數 vs EDM 用舊參數」在比，對 EDM 不公平——已在
+`inference.py` 補上傳遞。
+
+**測法**：iso 前向計算量比較——DDIM 30 步（30 次 forward）vs. EDM 15 步
+（Heun 2 階，每步 2 次 forward，約 30 次 forward），quasi-paired（同一個
+sample idx 固定 `torch.manual_seed`）40 樣本。
+
+**結果**：EDM 在每一項都更差——area_gap 23.50%→27.70%（+4.2pp）、
+hpwl_gap 16.14%→21.72%（+5.6pp）、V_relative 0.1013→0.1251，40 樣本中
+28 個 DDIM 的 area_gap 明顯更好、只有 7 個 EDM 更好。同計算量下 DDIM
+全面勝出，沒有必要再花更多步數幫 EDM 追——即使追上，換算 runtime 增加後
+的 cost 公式也未必划算。
+
+**決定**：不採用，維持 `sampler="ddim"`。EDM 分支保留（連同這次修的力
+強度傳遞 bug）當 opt-in 選項，`edm_sample_with_forces` 本身沒有問題，只是
+在這個任務上目前不如 DDIM。
+
+---
+
+## v5.4 —— `n_samples` 掃描找真正上限（不採用，維持 14）
+
+**背景**：method.md 記錄 `n_samples` 之前只調過一次（6→14），理由是
+best-of-N 候選共用同一個 GPU batch、時間幾乎不變。這次掃更大的值
+（8/14/20/30/40）找真正的邊際效益消失點。
+
+**結果**（30 樣本 quasi-paired）：
+
+| N | area_gap | hpwl_gap | V_relative | avg total time |
+|---|---|---|---|---|
+| 8 | 24.28% | 15.38% | 0.1111 | 1.56s |
+| 14（目前預設） | 24.83% | 14.24% | 0.1083 | 1.59s |
+| 20 | 24.29% | 13.54% | 0.1184 | 1.56s |
+| 30 | 22.74% | 14.40% | 0.1148 | 1.87s |
+| 40 | 22.77% | 14.37% | 0.1032 | 2.29s |
+
+「幾乎免費」的說法只在 N≤20 成立（時間確實打平在 ~1.56-1.59s），但品質
+在這個範圍內也沒有明顯改善、純粹是雜訊等級的上下波動。N>20 開始有真實
+時間成本（N=30 +17%、N=40 +44%），品質也不是單調變好：area_gap 在
+N≥30 確實下降，但 V_relative 反而在 N=20/30 變差、N=40 才又變好——因為
+候選排序鍵優先看 total_overlap，N 變大有時只是找到「重疊更小但
+V_relative 更差」的候選，不保證每一項都同步變好。換算 cost 公式，N=40
+看起來有約 -2.4% 的淨效益，但只用 30 樣本雜訊偏大，且這個估計還沒扣掉
+runtime 項（N=40 時間多 44%，換算 cost 公式的 runtime 懲罰後很可能把
+這個淨效益吃掉大半甚至轉負）。
+
+**決定**：不採用，維持 `n_samples=14`。訊號太弱、時間成本又是實打實的，
+不值得為了雜訊等級的差異冒進。
+
+---
+
+## v5.7 —— 多 checkpoint ensemble（不採用）
+
+**改了什麼**：`run_one_sample` 加上實驗用的 `extra_checkpoints` 參數
+（`[(model2, config2), ...]`）。給了的話，除了主要模型外，對每個額外
+checkpoint 用同一組 areas/W_int/canvas/constraints 也跑一次
+`generate_floorplan`，把所有候選（主要 + 額外）用同一套排序鍵
+（total_overlap, V_relative, total_hpwl, bbox_area）合併重選，取代原本
+只從單一模型的 `n_samples` 個候選裡選——不用重新訓練，純粹用已有的另一個
+checkpoint 增加候選池多樣性。legalize 仍然只跑一次（只送最終選出的單一
+best 進去），時間成本只在 diffusion 端跟 checkpoint 數量成正比。
+
+**測法**：`model_epoch300_overlap_v4.pt`（目前預設，val_loss=0.1026）+
+`model_epoch300_overlap_v2.pt`（次佳，val_loss=0.120）兩個 checkpoint
+合併候選池，vs. 純 v4，quasi-paired 30 樣本。
+
+**結果**：area_gap 24.21%→23.46%（小幅改善）、hpwl_gap 13.43%→13.41%
+（打平）、V_relative 0.1238→0.1262（小幅變差）——15/30 樣本 ensemble
+真的選中 v2 的候選（不是沒作用，兩個 checkpoint 確實會生成不同結果），
+但淨效果被 V_relative 的小幅退步抵銷：換算 cost 公式（`quality *
+exp(BETA·V_rel)` 這部分）**+0.25%（變差）**，這還沒算 diffusion 時間
+翻倍（1.21s→2.43s）的真實 runtime 成本。v4/v2 來自同一個訓練系列（只是
+不同 checkpoint/超參數變體），彼此的候選分佈可能高度相關、不夠互補；
+這個結果也跟 v5.4 的 `n_samples` 掃描結論一致——不管是同一個模型多取樣、
+還是跨 checkpoint 多取樣，只要候選池本身的品質分佈夠集中，加大候選池
+都很難再找到真正更好的解。
+
+**決定**：不採用。`extra_checkpoints` 保留在 `run_one_sample` 當 opt-in
+參數（預設 `None`，不影響任何既有呼叫）。
+
+---
+
+## v5.8 —— 訓練端 timestep 加權 soft constraint loss（不採用，維持 v4）
+
+**背景**：v5.2-v5.7 都是推論端（生成完之後的後處理/取樣策略）的嘗試，
+在真實資料上一致找不到淨效益，逼近「後處理已經榨乾」的天花板。這是這輪
+第一次改動訓練本身。
+
+**改了什麼**：`diffusion.py` 的 `training_loss` 裡，soft constraint loss
+（mib/cluster/boundary/overlap）原本對所有隨機取樣到的 timestep t 一視同仁
+套用同樣力道，但這些 loss 全部是從 `x0_pred = (x_t - sqrt(1-ᾱ_t)·noise_
+pred) / sqrt(ᾱ_t)` 反推出來的——t 越大（雜訊越多）這個反推在數值上越不
+穩定，x0_pred 這時候基本上不可信（原本只有 clamp 防 NaN/inf，沒有依可信
+度調整這些 loss 的貢獻）。新增 `config.weight_soft_loss_by_alpha_bar`
+（預設 `False`），開啟後把訓練 loop 裡本來就會算的 ᾱ_t 直接拿來當每個
+sample 的權重，讓 t 小（雜訊少、x0_pred 可信）的樣本在 soft loss 裡佔比較
+大的份量——不需要新增任何要另外調的超參數。`_group_variance_loss`／
+`_soft_constraint_loss` 同步改成先攤成 per-sample 再視情況加權平均，並用
+pure unit test（合成 tensor，不牽涉訓練/資料集）驗證過關閉這個旗標時跟
+改動前的訓練行為數學上完全等價（mib/cluster/overlap 三項精確一致，
+boundary 項刻意維持原本的全 batch pooled 算法不動）。
+
+**30 epoch 短跑驗證**（`weighted` vs `unweighted`，固定 seed=42，只差這
+一個變因）：`val_loss`（去噪 MSE）從 0.1993 降到 0.1894；更重要的是拿兩個
+30-epoch checkpoint 直接跑真實資料 inference（30 樣本 quasi-paired）：
+raw overlap（legalize 之前，最直接反映模型本身生成品質）990→822（明顯
+且一致地變好），area_gap 27.46%→24.22%（21/30 樣本更好），但 V_relative
+只小幅改善且逐樣本勝率接近五五波。訊號夠有希望，決定投入完整 300 epoch
+正式訓練（`model_epoch300_overlap_v5.pt`）。
+
+**300 epoch 正式訓練結果**：
+- `val_loss` 單一最後 epoch 讀數（v4: 0.1026 vs v5: 0.1362）具誤導性——
+  兩個模型的 val MSE 曲線在整個訓練過程都劇烈震盪（100 樣本 validation
+  set 雜訊很大，在 0.05~0.30 之間來回），單一 epoch 的讀數不能代表真實
+  差異；更穩定的 train MSE 趨勢兩者其實相近（v5 略低）。
+- 真正的下游 inference 比較（100 樣本 quasi-paired，跟 v4 目前 production
+  checkpoint 直接對比）：raw overlap 1004.3→848.8（**-15.5%，83/100 樣本
+  更好**，這個信號在 300 epoch 依然穩固），hpwl_gap 15.70%→14.68%（小幅
+  改善）；但 area_gap 23.42%→23.73%（**略變差**，只 42/100 樣本更好）、
+  V_relative 0.1054→0.1056（打平，34/100 vs 35/100，逐樣本幾乎是銅板）、
+  換算 cost 公式的綜合值只有 **-0.25%**、逐樣本勝率 51/100 vs 49/100
+  ——統計上就是打平。也就是說：模型自己生成的原始 layout 確實一致變好，
+  但這個優勢在通過 `legalize_lff` 的強力壓縮/去重疊後被大幅抹平，實際
+  決定分數的下游指標（area_gap、V_relative）沒有可靠的淨改善。
+- 額外拿 `my_optimizer.py`（沿用 v4 調過的其他預設參數，只換 checkpoint）
+  跑了一次官方 `iccad2026_evaluate.py`：Total Score 2.0949（v4 先前記錄
+  ~2.0128），單次數字看起來更好，但這個專案自己的經驗是單次 evaluate
+  雜訊約 ±2%（過去版本比較都用兩次獨立評估平均來過濾這個雜訊），這次
+  +4.1% 的落差比典型雜訊帶大，卻跟前面更嚴謹的 100 樣本 paired 比較
+  （明確打平）方向不一致——只跑了一次，沒有重複驗證，不足以推翻 paired
+  比較的結論。
+
+**決定**：不採用，`my_optimizer.py`／`inference.py` 維持使用
+`model_epoch300_overlap_v4.pt`。`weight_soft_loss_by_alpha_bar` 機制與
+`model_epoch300_overlap_v5.pt` checkpoint 都保留——這是目前唯一一次讓
+「模型自己生成的原始品質」有穩定、一致改善的訓練端嘗試（v5.2-v5.7 的
+推論端修改連這一步都做不到），只是這個優勢目前沒能穿透 legalize 後處理
+反映到分數上；如果之後 legalize 端有新的、對原始品質更敏感的改動，這個
+checkpoint／機制值得重新拿出來配對測試。
+
+---
+
+## v5.9 —— QK-norm + Min-SNR main loss（QK-norm 單獨保留 opt-in，Min-SNR 不採用）
+
+**背景**：v5.8 之後上網查了幾個「跟現有 attention 架構相容、不用換
+backbone」的訓練端小改動，挑了兩個文獻上驗證過、彼此獨立、改動範圍小的
+來試：
+
+1. **QK-norm**（Dehghani et al. 2023；Qwen3/Gemma3 等近期 LLM 常用）：對
+   每個 attention head 的 Q/K 在算 logits 之前先做 RMSNorm，避免 logits
+   隨訓練無界增長。`model.py` 新增 `RMSNorm` 類別，經
+   `ConnectivityBiasedAttention` → `TransformerBlock` →
+   `BlockEncoder`/`Denoiser` → `FloorplanDiffusionModel` 一路傳遞
+   `config.use_qk_norm`（預設 `False`）。會新增可學習參數，舊 checkpoint
+   不能直接載入這個設定。
+2. **Min-SNR-gamma 主要去噪 loss 加權**（Hang et al., ICCV 2023）：
+   `diffusion.py: training_loss` 新增 `min_snr_gamma` 參數，依
+   `w = min(SNR_t, gamma)/SNR_t` 加權，`config.use_min_snr_main_loss`
+   控制開關（預設 `False`）。純 loss 層面改動，不影響模型參數。
+
+兩者都先用合成 tensor 的 pure unit test 驗證過：關閉時跟改動前數學上
+完全等價（不是近似），開啟時能正常運算、不產生 NaN/inf。
+
+**效能量測**：合成 benchmark（production 尺寸：d_model=256, batch=64,
+N=120）顯示 Min-SNR 幾乎不吃計算成本（1.00x），QK-norm 則有真實的
+**+21% 計算開銷**——換成 PyTorch 內建的 fused `F.rms_norm` 結果一樣
+（1.22x vs 1.22x），確認這不是「很多小 kernel launch」的可優化開銷，是
+這個模型尺寸下 28 次額外正規化運算的真實計算成本。
+
+**30 epoch 短跑，三輪拆解**（固定 seed，quasi-paired 30 樣本真實資料
+inference 比較，聚焦 raw overlap 這個「legalize 之前、最直接反映模型
+本身生成品質」的指標）：
+
+| 組合 | raw overlap vs baseline | 結論 |
+|---|---|---|
+| QK-norm + Min-SNR 都開 | 990.0→1880.1（**+90%**，30/30 樣本一致變差） | 明確負面訊號 |
+| 只開 Min-SNR | 990.0→1947.1（**+97%**，30/30 樣本一致變差） | 跟上面幾乎同樣嚴重，鎖定真兇 |
+| 只開 QK-norm | 990.0→1006.4（+1.7%，噪音等級），area_gap 19/30 樣本明顯較好 | QK-norm 清白，訊號正面 |
+
+Min-SNR 把訓練力氣從「t 小、雜訊少」的步驟移開、讓給「t 大、雜訊多」的
+步驟去學全域結構——但「block 間會不會重疊」剛好是一個高度依賴低雜訊
+階段精確定位的任務，被 Min-SNR 系統性犧牲掉，這個因果關係跟量測到的
+現象吻合，不像巧合。
+
+**QK-norm 完整 300 epoch 訓練**（`model_epoch300_overlap_v6.pt`，
+`use_qk_norm=True`, `use_min_snr_main_loss=False`）：
+- 100 樣本 paired inference（跟 v4 對比）：area_gap 23.42%→23.12%
+  （44/100 較好）、V_relative 0.1049→0.1017（40/100 較好）、raw overlap
+  1004.3→945.1（**-5.9%，67/100 較好**，接近 2:1）、hpwl_gap 小幅變差
+  （15.72%→16.07%）。換算 cost 公式綜合值 **-0.61%**，55/100 樣本較好
+  ——方向一致、有 100 樣本統計支撐，明顯比 v5.8 那次（-0.25%，51:49 幾乎
+  是雜訊）更紮實。
+- 拿 `my_optimizer.py` 跑兩次獨立官方 evaluate（同 v4.7 的作法，過濾單次
+  ±2% 雜訊）：Total Score 1.9803 / 2.0235，平均 **2.0019**，跟 v4 的
+  2.0128 相比只差約 -0.5%，落在雜訊範圍內、大致打平——但兩次的 **Avg
+  Runtime 都明顯偏高**（2.67s / 2.87s，平均 2.77s，比 v4 的 2.46s 多
+  **+12.6%**），兩次都一致偏高、不是單次雜訊，直接對應到前面量測到的
+  QK-norm 單步 +21% 計算成本。本地 evaluate 用 `RuntimeFactor=1.0`
+  （中性）沒有把這個時間差異真的算進分數，但正式比賽的 cost 公式會把
+  runtime 算進去，換算過去會是真實的扣分項。
+
+**決定**：QK-norm 不採用為預設（`my_optimizer.py`／`inference.py` 維持
+`model_epoch300_overlap_v4.pt`）——品質面的改善是真的（配對比較跟兩次
+evaluate 平均都支持），但代價（真實的 +21% 單步計算成本、+12.6% 完整
+pipeline runtime）在換算完整 cost 公式後，不足以確定是淨正效益，整體是
+一個溫和但方向不夠壓倒性的取捨，選擇維持現狀。Min-SNR 確認不採用
+（`use_min_snr_main_loss=False`）——30/30 樣本一致的 raw overlap 惡化
+是結構性的，不是雜訊。`use_qk_norm`／`use_min_snr_main_loss` 機制與
+`model_epoch300_overlap_v6.pt` checkpoint 都保留在程式碼／`checkpoints/`
+備用；如果之後想在「品質 vs. 時間」這個取捨上做別的選擇（例如比賽情境
+本身對 runtime 沒那麼敏感），QK-norm 這個方向的正確性基礎已經在，不需要
+重新走一次這輪的診斷過程。
+
+---
+
+## v5.10 —— 座標 Fourier 編碼 `CoordFourierEmbedding`（不採用）
+
+**背景**：上網查文獻找「跟 attention 無關」的訓練端改動方向時，找到
+*Chip Placement with Diffusion Models*（ICML 2025）——跟本專案同樣是用
+diffusion 生成 2D 座標式佈局，其消融實驗顯示替座標加上 NeRF 風格的
+multi-frequency sinusoidal 編碼（`sin(2^k·π·p)`／`cos(2^k·π·p)`,
+k=0..n_freqs-1）對定位精度有幫助——跟座標回歸任務普遍已知的「座標本身
+是低頻訊號、網路難以直接學到高頻定位細節」現象一致。
+
+**實作**：`model.py` 新增 `CoordFourierEmbedding` 類別（`n_freqs=16`，
+輸出 `4*n_freqs` 維），接一個 2 層 MLP（`coord_proj`）投影回
+`d_model`，再以**相加**的方式併入 `Denoiser` 的 embedding 加總。刻意
+沒有重用既有的 `SinusoidalEmbedding`（那是替 diffusion timestep 調過頻率
+範圍的，跟 `[0,1]` 附近的正規化座標不是同一個頻率尺度）。`config.py` 新增
+`use_coord_sincos`（預設 `False`）、`coord_n_freqs`（預設 16）。只加在
+`Denoiser`，不加在 `BlockEncoder`（後者的座標本來就是要被生成的目標，
+不是已知輸入）。單元測試驗證參數量差恰好等於新 MLP 大小，且模型輸出
+對座標平移確實敏感（編碼有被正確接進計算圖，不是死代碼）。
+
+**30 epoch 短跑**（quasi-paired 30 樣本）：raw overlap -5.1%（20/30 樣本
+較好），area_gap 好壞參半（13:14，接近雜訊等級）——訊號不算壓倒性，但
+raw overlap 這個「legalize 前最直接反映模型生成品質」的指標方向一致，
+值得跑完整 300 epoch 驗證。
+
+**完整 300 epoch 訓練**（`model_epoch300_overlap_v7.pt`）：
+
+- 100 樣本 paired inference 對比 v4：area_gap 大致打平、V_relative 小幅
+  領先、raw overlap 明顯領先（77/100 樣本較好，-5.7%），換算 cost 公式
+  綜合值 **-0.53%**。單看這組數字，方向是正面的。
+- 但這組 paired 比較是在 **v5.11 違規判定 bug 修好之前**跑的（見下一節）
+  ——而 v5.11 修的東西直接影響 legalize pipeline 內部的安全閘門判斷邏輯，
+  不只是回報數字，代表 v7 vs v4 的公平比較必須在**同一套（修好的）
+  codebase** 下重跑才算數，不能沿用舊結果。
+- 拿修好 v5.11 之後的 codebase，`my_optimizer.py` 分別指向 v7 跟 v4 各跑
+  兩次獨立官方 evaluate（同慣例作法，過濾單次 ±2% 雜訊）：v7 平均
+  **1.5482**，v4（同一套修好的 codebase 下重新評估）平均 **1.5248**——
+  v7 其實略差，而且差距落在單次評估雜訊範圍內，不構成可靠的改善。
+
+**決定**：`use_coord_sincos` **不採用**（`my_optimizer.py` 維持
+`model_epoch300_overlap_v4.pt`）——30 epoch 短跑跟修 bug 前的 100 樣本
+paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後 codebase）的
+官方 evaluate 重新檢驗後，訊號沒有存活下來。這是本 session 抓到「v5.11
+修法本身會改變比較基準」這個陷阱之後，主動回頭補做公平驗證才發現的——
+提醒之後任何牽涉 legalize 安全閘門邏輯改動前後的比較，都必須注意基準
+是否一致。機制與 `model_epoch300_overlap_v7.pt` 保留備用。
+
+---
+
+## v5.11 —— 修正 `utils.py` 的 soft violation 判定，跟官方對齊（bug fix）
+
+**發現**：`my_optimizer_results.json`（官方 `iccad2026_evaluate.py --evaluate`
+的輸出）裡記錄的 `violations_relative`，跟我們自己用 `utils.py:
+compute_soft_violations` 對同一組 positions 重算出來的 V_relative 對不
+起來。100 樣本平均：官方 0.2518，我們算出來 ~0.10-0.13——**這代表這整個
+session 用來做決策的 V_relative 數字，絕對值一直被系統性低估到官方的
+40-50%**。
+
+**根因逐項排查**（把 `iccad2026_evaluate.py` 的判定邏輯完整複製一份、
+拿官方 100 樣本已記錄的真實 positions 反推驗證，`reproduced_official_
+style` 對 100/100 樣本精確吻合官方數字，確認複製對了，才拿去跟
+`utils.py` 現有的三個函式逐一比對）：
+
+1. **`compute_boundary_violations`（主因，佔壓倒性多數差距）**：舊版用
+   「layout 自己邊長的 1% 相對容忍度」（`tol=1e-2` 乘上邊長）判定是否
+   貼邊，對一個 100 單位大小的佈局等於放寬到快 1 個完整單位——把「其實
+   沒真的貼邊、只是離得比較近」的 block 大量誤判成合法。官方用的是
+   `eps=1e-6`（近乎精確貼齊）。20 個案例交叉驗證：我們算出的 V_boundary
+   常常只有官方的 1/4~1/8（例如某案例我們算 1、官方算 8）。
+2. **`compute_cluster_violations`（次因，影響小很多）**：舊版用
+   `_blocks_share_edge`（pairwise 邊緣距離 < tol 的近似判定）算連通分量，
+   20 個案例裡有 3 個跟官方（Shapely 精確多邊形聯集）差 1。
+3. **`compute_mib_violations`（未觀察到實際影響，但精度本來就對不齊）**：
+   舊版四捨五入到 3 位小數（`tol=1e-3`），官方是 4 位小數。
+
+**修法**：三個函式都改成跟官方逐位元對齊——`compute_boundary_violations`
+容忍度改成絕對值 `tol=1e-6`；`compute_cluster_violations` 改用 Shapely
+的 `unary_union` 判斷連通分量（跟官方完全一致的演算法，不是近似），
+Shapely 不可用時退回舊的近似判定並印警告；`compute_mib_violations` 精度
+改成 4 位小數。修完後拿 100 個官方已記錄的真實 positions 重算，
+**100/100 樣本精確吻合**官方 `violations_relative`（差距 < 1e-9）。
+
+**影響範圍與後續**：這三個函式不只是最終回報用的診斷指標，也被
+`compact_pair_reinsert`／`compact_reinsert_reshape`／
+`compact_merge_cluster_groups`／`compact_gradient_finetune` 等多個
+legalize pass 拿來當「這個候選解有沒有讓違規變差」的安全閘門判斷依據
+（`baseline_v`／`new_v` 比較）——舊版容忍度過鬆，代表這些安全閘門過去
+可能比實際設計的意圖更寬鬆。修完後跑過一次合成正確性測試
+（`test_lff.py`），所有 hard constraint（overlap/area/preplaced/fixed）
+仍然全部通過，沒有引入新的錯誤或明顯效能劣化。**但這也代表本 session
+之前每一輪 A/B／paired 比較裡「V_relative 变好/变差多少」這類絕對數字
+的判斷，都是基於被低估的舊算法**——各版本之間「哪個相對比較好」的方向性
+結論，因為 A/B 兩邊用的是同一套（有問題的）算法，大機率還是站得住腳；
+但任何牽涉到 V_relative 絕對量級的判斷（尤其 cost 公式裡
+`exp(BETA·V_relative)` 這個指數項，真實影響力比先前以為的更大）如果要
+嚴謹重新確認，需要拿修正後的版本重跑。
 
 | 版本 | Total Score | Avg Runtime |
 |---|---|---|
@@ -223,4 +660,39 @@ best_softconstraints=0.132），確認已經是最佳選擇，不用換。
 
 （單次 evaluate 本身有約 ±2% 的雜訊，各版本之間的小幅波動不一定代表真實
 差異——真正控制雜訊的是 quasi-paired/paired 100 樣本測試，數字見上方
-各版本說明。）
+各版本說明。以上都是 v5.11 修 bug **之前**跑的，`violations_relative`
+被系統性低估，不能跟下面的修後數字直接比大小。）
+
+**修 bug 之後重新評估 v4**（目前 production checkpoint，
+`model_epoch300_overlap_v4.pt`，`my_optimizer.py --evaluate`，100 樣本）：
+
+| 指標 | 數值 |
+|---|---|
+| Total Score（`RuntimeFactor=1.0` 中性） | **1.499129** |
+| Total Score（換算 alpha-test 實際 median runtime，見下方） | **1.2322** |
+| avg area_gap | 0.2266 |
+| avg hpwl_gap | 0.2688 |
+| avg V_relative（官方精確定義，修完全對齊） | 0.1090 |
+| avg runtime | 2.485s（max 5.786s） |
+| n_infeasible | 0 / 100 |
+
+修完 bug 後 Total Score 從 ~2.0 降到 1.50（中性 runtime）——這不是「回報
+數字變準了所以看起來變好」，而是真實效果：`compute_boundary_violations`
+等函式也被 `compact_pair_reinsert`／`compact_gradient_finetune`／
+`compact_merge_cluster_groups` 拿去當安全閘門用，修嚴之後這些 legalize
+pass 真的會更積極拒絕會讓真實違規變差的候選解，直接改變了
+`legalize_lff` 的實際輸出，不只是診斷報告的數字。可以看到代價：
+hpwl_gap 比修 bug 前的估計（~15.7-16.1%）明顯變差（26.88%）——這是可以
+理解的取捨，閘門變嚴之後，一部分「當年被誤判為安全、其實會讓真實違規
+變差」的 HPWL 改善移動現在會被正確擋下來；而 cost 公式裡
+`exp(2·V_relative)` 是指數項，V_relative 的真實改善（從真正意義上的
+~0.25 降到 0.109）換算下來遠遠壓過 hpwl_gap 變差的代價，Total Score
+淨效果是大幅改善。
+
+**用真實 median runtime 換算的分數**（`C_Median Runtime per Testcase
+(Alpha).csv`，alpha test 100 個 test case 的實際 median runtime）：
+本專案 99/100 個 test case 都比 alpha-test median 快，換算
+`RuntimeFactor = my_runtime / median_runtime` 後代入
+`max(0.7, RuntimeFactor^0.3)`，Total Score 從中性版的 1.499129 進一步降到
+**1.2322**——`RuntimeFactor` 帶來的加成比原本以為的更明顯，這也是「不
+盲目追求最快、把預算留給品質」這個取捨在真實比賽情境下的量化依據。

@@ -89,6 +89,33 @@ class Config:
     # epoch）A/B 有訊號再考慮改預設值。
     weight_soft_loss_by_alpha_bar: bool = False
 
+    # v5.9（實驗用，尚未訓練驗證，預設關閉）：兩個從網路研究來的、跟現有
+    # attention 架構相容（不換 backbone）的小改動，見 method.md 1.5 節。
+    #   - use_qk_norm：對每個 head 的 Q/K 在算 attention logits 之前先各自
+    #     做 RMSNorm（見 model.py: RMSNorm/ConnectivityBiasedAttention）。
+    #     這個 attention 的 logits 是 QK^T/sqrt(d_k) 再疊加兩個 additive
+    #     bias（b2b 連線、同組），沒有機制防止 logits 隨訓練變大，QK-norm
+    #     是近期 LLM（Qwen3/Gemma3 等）常用的穩定手法。會改變參數量（新增
+    #     RMSNorm 的可學習 scale），舊 checkpoint（v4/v5）不能直接載入這個
+    #     設定，需要重新訓練。
+    #   - use_min_snr_main_loss + min_snr_gamma：主要去噪 MSE 依 Min-SNR-
+    #     gamma（Hang et al., ICCV 2023）加權，見 diffusion.py:
+    #     GaussianDiffusion.training_loss 說明。gamma 用論文預設值，不當
+    #     成要掃的超參數。純 loss 層面的改動，不影響模型參數/架構，可以跟
+    #     use_qk_norm 獨立開關。
+    use_qk_norm: bool = False
+    use_min_snr_main_loss: bool = False
+    min_snr_gamma: float = 5.0
+
+    # v5.10（實驗用，尚未訓練驗證，預設關閉）：座標的 Fourier 位置編碼，
+    # 參考"Chip Placement with Diffusion Models"（ICML 2025，同領域的晶片
+    # 巨集擺放 diffusion 論文）——他們的 ablation 顯示拿掉這個編碼會讓
+    # 合法擺放率下降（0.960→0.949），作者說能提升精確擺放小物件的能力。
+    # 見 model.py: CoordFourierEmbedding/Denoiser 說明。會新增可學習參數
+    # （coord_proj），舊 checkpoint 不能直接載入這個設定，需要重新訓練。
+    use_coord_sincos: bool = False
+    coord_n_freqs: int = 16
+
     # -- Attention group bias（v3 新增）--
     use_group_attention_bias: bool = True
 

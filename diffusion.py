@@ -260,7 +260,7 @@ class GaussianDiffusion:
     # ----------------------------------------------------------------
     # Training loss
     # ----------------------------------------------------------------
-    def training_loss(self, model, batch, soft_weights=None):
+    def training_loss(self, model, batch, soft_weights=None, min_snr_gamma=None):
         """
         Args:
             model: FloorplanDiffusionModel
@@ -270,6 +270,40 @@ class GaussianDiffusion:
             soft_weights: None 表示這步不加 soft loss（warmup 用）；
                           否則為 dict(lambda_mib, lambda_cluster, lambda_boundary,
                           lambda_overlap, weight_soft_loss_by_alpha_bar)
+            min_snr_gamma: None（預設）= 主要去噪 MSE 不加權，跟 v5.9 之前
+                          完全一樣的算法（整個 batch 攤平算一個 loss，不看
+                          各 sample 有效 block 數差異）。給浮點數時 = Min-SNR-
+                          gamma 加權（Hang et al., "Efficient Diffusion
+                          Training via Min-SNR Weighting Strategy," ICCV
+                          2023）：每個 sample 依自己的 SNR_t = ᾱ_t/(1-ᾱ_t)
+                          算權重 w = min(SNR_t, gamma)/SNR_t。
+
+                          注意方向跟 v5.8 的 weight_soft_loss_by_alpha_bar
+                          剛好相反，不要搞混：這裡 t 小（雜訊少、SNR 遠大於
+                          gamma）時 w 被壓得很小（實測 t=1 時 w≈0.001），
+                          t 中大（SNR ≤ gamma，實測約 t≳150 之後）時 w=1、
+                          完全不壓。原因是 epsilon-prediction 這種「noise-
+                          space 權重恆定為 1」的 loss，換算到 x0 重建誤差的
+                          隱含權重正比於 SNR(t)——t 小的步驟 SNR 極大，雖然
+                          「本來就很好學」（幾乎沒雜訊，預測誤差對 x0 影響
+                          極小），卻在原始 loss 裡分到不成比例地大的梯度
+                          預算，把「t 大、真正要學怎麼從雜訊生出全域結構」
+                          這些更難、更重要的步驟給比下去，導致不同 t 之間
+                          的最佳梯度方向互相衝突、拖慢收斂。Min-SNR 把 t 小
+                          這端的權重「封頂」在 gamma，讓訓練力氣更公平地
+                          分給 t 大的步驟，論文報告 3.4x 收斂加速。
+
+                          跟 v5.8 的差異：v5.8 是「downweight 不可信的 t 大
+                          樣本」（x0_pred 反推在 t 大時數值不穩定，作用在
+                          從 x0_pred 算出的輔助 soft constraint loss 上）；
+                          這裡是「downweight 已經佔太多梯度預算的 t 小樣本」
+                          （作用在主要的 noise-prediction MSE 上，跟數值
+                          穩不穩定無關，是梯度預算的重新分配）——方向相反、
+                          道理也不同，只是剛好都用「依 t 調整 loss 貢獻」
+                          這個手段，不要因為手段像就以為兩者在做同一件事。
+                          gamma 用論文預設值 5，不當成需要另外掃的超參數
+                          （見呼叫處 config.py:
+                          min_snr_gamma）。
         Returns:
             loss (scalar), info (dict)
 
@@ -303,8 +337,20 @@ class GaussianDiffusion:
 
         # 主要去噪 MSE loss（masked）
         mask_expanded = mask.unsqueeze(-1).float()
-        mse = F.mse_loss(noise_pred * mask_expanded, noise * mask_expanded, reduction="sum")
-        mse = mse / mask_expanded.sum().clamp(min=1)
+        if min_snr_gamma is None:
+            # 跟 Min-SNR 加入之前完全一樣：整個 batch 攤平一起算
+            mse = F.mse_loss(noise_pred * mask_expanded, noise * mask_expanded, reduction="sum")
+            mse = mse / mask_expanded.sum().clamp(min=1)
+        else:
+            sq_err = (noise_pred - noise) ** 2 * mask_expanded              # (B, N, 3)
+            per_sample_num = sq_err.sum(dim=(1, 2))                         # (B,)
+            per_sample_cnt = mask_expanded.sum(dim=(1, 2)).clamp(min=1)     # (B,)
+            per_sample_mse = per_sample_num / per_sample_cnt                # (B,)
+
+            alpha_bar_flat = self._extract(self.alphas_cumprod, t, x_t.shape).view(B)
+            snr = alpha_bar_flat / (1.0 - alpha_bar_flat).clamp(min=1e-8)
+            min_snr_w = torch.clamp(snr, max=min_snr_gamma) / snr.clamp(min=1e-8)
+            mse = (per_sample_mse * min_snr_w).mean()
 
         info = {"mse": mse.detach()}
         loss = mse

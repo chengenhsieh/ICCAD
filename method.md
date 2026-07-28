@@ -148,6 +148,58 @@ area_gap 21/30 樣本更好），跑完整 300 epoch 後用 100 樣本 paired in
 `model_epoch300_overlap_v5.pt` 都保留，供日後 legalize 端有更能吃到「原始
 品質變好」這件事的改動時重新配對測試。完整實驗記錄見 CHANGELOG.md v5.8。
 
+### 1.6 訓練端實驗：QK-norm + Min-SNR 主 loss 加權（QK-norm 保留 opt-in，Min-SNR 未採用）
+
+刻意限定在「不換 attention backbone」的前提下找了兩個文獻驗證過的小改動：
+**QK-norm**（Q/K 算 attention logits 前先做 RMSNorm，近期 LLM 常用的穩定
+手法）跟 **Min-SNR-gamma**（依 `min(SNR_t, gamma)/SNR_t` 重新分配不同
+timestep 對主要去噪 loss 的梯度預算，Hang et al. ICCV 2023）。
+
+30 epoch 短跑先合開兩者，raw overlap（legalize 前最直接反映模型生成品質
+的指標）30/30 樣本一致變差 +90%——拆開單獨測試後鎖定真兇是 Min-SNR
+（單獨開一樣 +97%、30/30 一致變差），QK-norm 本身是清白的（單獨開幾乎
+打平，+1.7%，且 area_gap 19/30 樣本明顯較好）。Min-SNR 把梯度預算從
+「t 小、雜訊少」的步驟移給「t 大」的步驟去學全域結構，但這個任務裡
+「block 會不會重疊」剛好高度依賴低雜訊階段的精確定位，被系統性犧牲掉，
+跟量測到的現象吻合。
+
+QK-norm 單獨跑完整 300 epoch（`model_epoch300_overlap_v6.pt`）：100 樣本
+paired inference 對比 v4，area_gap／V_relative／raw overlap 都溫和變好
+（raw overlap -5.9%、67/100 樣本較好），換算 cost 公式 -0.61%，比 v5.8
+那次的雜訊等級（-0.25%）紮實得多。但 QK-norm 有真實的計算成本——合成
+benchmark 量測單步 +21%（換 PyTorch 內建 fused `F.rms_norm` 結果一樣，
+確認不是可優化的 kernel-launch 開銷，是真實計算量），兩次獨立官方
+evaluate 的 Avg Runtime 也一致偏高（+12.6%），正式比賽的 cost 公式會把
+這個算進分數。**最終決定不採用**——品質面的改善方向一致、有統計支撐，
+但换算完整 runtime 成本後，淨效益不夠確定，選擇維持 v4。`use_qk_norm`／
+`use_min_snr_main_loss` 機制與 `model_epoch300_overlap_v6.pt` 都保留
+備用。完整實驗記錄見 CHANGELOG.md v5.9。
+
+### 1.7 訓練端實驗：座標 Fourier 編碼 `CoordFourierEmbedding`（未採用）
+
+找文獻找到 *Chip Placement with Diffusion Models*（ICML 2025）——跟本專案
+同樣是用 diffusion 生成 2D 座標式佈局，其消融實驗顯示替座標加上 NeRF 風格
+的 multi-frequency sinusoidal 編碼（`sin(2^k·π·p)`／`cos(2^k·π·p)`）對
+定位精度有幫助。`model.py` 新增 `CoordFourierEmbedding`（16 個頻率），
+接 2 層 MLP 投影後以相加方式併入 `Denoiser` 的 embedding（刻意不重用
+`SinusoidalEmbedding`，那是替 timestep 調過頻率範圍的，跟正規化座標不是
+同一個尺度），`config.use_coord_sincos` 控制開關，預設 `False`。
+
+30 epoch 短跑（quasi-paired）：raw overlap -5.1%（20/30 較好），
+area_gap 好壞參半，訊號不算壓倒性但值得跑完整訓練驗證。完整 300 epoch
+（`model_epoch300_overlap_v7.pt`）100 樣本 paired inference 對比 v4：
+raw overlap 明顯領先（-5.7%，77/100 較好），換算 cost 公式 -0.53%，
+看起來是正面結果。
+
+但這組 paired 比較是在 v5.11（見下方 Part 2 的違規判定修正）**修 bug
+之前**跑的，而 v5.11 改的正是 legalize 內部安全閘門的判斷邏輯，代表
+v7 vs v4 的比較基準本身變了、必須在同一套修好的 codebase 下重新驗證。
+修完 v5.11 之後，`my_optimizer.py` 分別指向 v7、v4 各跑兩次獨立官方
+evaluate：v7 平均 1.5482，v4（同一套修好的 codebase）平均
+**1.5248**——v7 其實略差，且差距落在單次評估雜訊範圍內，不構成可靠改善。
+**最終決定不採用**，維持 v4。機制與 checkpoint 保留備用。完整實驗記錄見
+CHANGELOG.md v5.10。
+
 ---
 
 ## Part 2 — Inference
@@ -429,21 +481,55 @@ pipeline 已經跑完 `compact_reinsert`/`compact_positions`、整個 layout 被
 才能解的問題，不是單軸滑動能修的範疇。這說明「照搬同一套修復手法」不能
 保證跨違規類型都有效，仍然需要針對每種違規的實際成因分別驗證。
 
+### 2.4 修正 soft violation 判定，跟官方對齊（bug fix，v5.11）
+
+發現 `iccad2026_evaluate.py --evaluate` 記錄的 `violations_relative`，跟
+`utils.py` 自己對同一組 positions 重算出來的數字對不起來（100 樣本平均：
+官方 0.2518，內部算出 ~0.10-0.13）。逐項排查後找到根因：
+`compute_boundary_violations` 用的是「layout 邊長 1% 的相對容忍度」，比
+官方的絕對容忍度 `eps=1e-6` 鬆了近百倍，把大量「其實沒真的貼邊」的
+block 誤判成合法；`compute_cluster_violations` 的 pairwise 邊緣距離近似
+判定跟官方的 Shapely 精確多邊形聯集也有少量落差；`compute_mib_violations`
+的四捨五入精度（3 位小數）跟官方（4 位小數）不一致。三者都改成跟官方
+逐位元對齊，用 100 個官方已記錄的真實 positions 重算，**100/100 樣本
+精確吻合**官方數字。
+
+這三個函式不只是回報用的診斷指標，也被 `compact_pair_reinsert`／
+`compact_gradient_finetune`／`compact_merge_cluster_groups` 等 legalize
+pass 拿來當「候選解有沒有讓違規變差」的安全閘門依據——修嚴之後這些
+pass 的實際行為也變了，不只是回報數字變準，`legalize_lff` 的真實輸出
+本身變好了：v4 的官方 evaluate Total Score 從 ~2.0（修 bug 前，中性
+runtime）降到 **1.499**（修 bug 後，V_relative 真實值從 ~0.25 降到
+0.109），代價是 hpwl_gap 從 ~15.7-16.1% 變差到 26.88%（一部分曾被誤判
+為安全、其實會讓真實違規變差的 HPWL 改善移動，現在被正確擋下）——
+`exp(2·V_relative)` 這個指數項的真實改善遠遠壓過 hpwl_gap 變差的代價，
+淨效果是大幅改善。完整根因分析、修法細節與影響範圍見 CHANGELOG.md
+v5.11。
+
 ---
 
 ## 最終結果（100 樣本官方 validation set）
 
+以下數字取自修完 v5.11 違規判定 bug 之後、拿 `my_optimizer.py`（v4，
+`model_epoch300_overlap_v4.pt`）跑官方 `iccad2026_evaluate.py --evaluate`
+的實測結果，是目前已知最準確的版本（`violations_relative` 跟官方
+100/100 精確吻合，見 §2.4／CHANGELOG.md v5.11）：
+
 | 指標 | 數值 |
 |---|---|
 | Hard constraint 違規 | 0 / 100（zero overlap, exact preplaced/fixed shape, area ≤1% error, 皆保證滿足） |
-| Area gap（vs. optimal） | ~23.5%（v5.0：v4.7 legalize 設定 + force-guidance 強度細掃後的最終值） |
-| HPWL gap（vs. optimal） | ~15.7-16.1% |
-| Soft constraint 違規率（V_relative） | ~0.103-0.104 |
-| 平均單樣本總時間 | ~2.3-2.5s（diffusion ~1.2s + legalize ~1.0-1.2s） |
+| Area gap（vs. optimal） | 22.66% |
+| HPWL gap（vs. optimal） | 26.88% |
+| Soft constraint 違規率（V_relative，官方精確定義） | 0.1090 |
+| 平均單樣本總時間 | 2.485s（max 5.786s） |
+| Total Score（`RuntimeFactor=1.0` 中性，官方 evaluate 直接輸出） | 1.499129 |
+| Total Score（換算 alpha-test 實際 median runtime） | **1.2322**（99/100 樣本比 alpha-test median 快） |
 
 （diffusion sampling 未固定 random seed，同一組參數重跑 100 樣本時上述數字
-本身會有 ±0.01 左右的自然波動，屬於量測雜訊而非參數變化造成——這也是為何
-v4.7 的驗證過程改用 paired 設計，見上一節。）
+本身會有若干自然波動，屬於量測雜訊而非參數變化造成——這也是為何 v4.7 之後
+的驗證過程多半改用 paired 設計，見上一節。中性 runtime 版本的 Total Score
+沒有反映真實比賽的 RuntimeFactor 加成，換算 alpha-test 真實 median runtime
+的版本更接近實際競賽會拿到的分數。）
 
 ---
 

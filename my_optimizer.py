@@ -71,7 +71,15 @@ class MyOptimizer(FloorplanOptimizer):
     # 2.485s→1.84s。見 CHANGELOG.md v5.15。
     DDIM_STEPS = 10
     N_SAMPLES = 14
-    POST_REPEL_STEPS = 30
+    # v5.16（採用）：同一套真實 median runtime 換算方法論套用到
+    # POST_REPEL_STEPS。34 樣本分層抽樣：30→20→15→10 real cost 持續變好
+    # （1.117→1.091，-2.4%），但 `0`（完全關閉）V_relative 從 ~0.10 跳到
+    # 0.19、real cost 反彈到 1.294——post-repel 不是純冗餘，對
+    # boundary/overlap 有 legalize 自己補不回來的清理效果。完整 100 樣本
+    # 官方 evaluate 確認兩次（在 DDIM_STEPS=10 之上疊加）：real score
+    # 1.1807 / 1.1577，平均 1.1692，比純 DDIM_STEPS=10 的 1.178 再進步
+    # 約 -0.75%，0/100 infeasible。見 CHANGELOG.md v5.16。
+    POST_REPEL_STEPS = 10
     # v5.0: 100-sample quasi-paired sweep found the hardcoded force-guidance
     # strengths in diffusion.py were too strong, overriding the model's own
     # learned signal. grouping_force_strength 0.015->0.030 (sweet spot; both

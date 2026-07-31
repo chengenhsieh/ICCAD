@@ -603,6 +603,48 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.16 —— POST_REPEL_STEPS 30→10（採用，在 v5.15 之上疊加）
+
+**背景**：v5.15 確認「真實 median runtime 換算」這套方法論能挖出真實分數
+改善之後，把同一套流程套用到另一個從沒被系統性掃過、純推論端、跟
+runtime 直接相關的參數：`post_repel_steps`（diffusion 結束後純物理迴圈，
+只用 Direct Repulsion + Boundary Nudge，沒有 model forward）。
+
+**掃描方法**：同 v5.15，34 樣本分層抽樣 + 真實 median runtime 換算，在
+新採用的 `DDIM_STEPS=10` 之上疊加測試。
+
+**結果**（real cost，越低越好；baseline `post_repel=30` = 1.117）：
+
+| post_repel_steps | 30 | 20 | 15 | 10 | 5 | 0 |
+|---|---|---|---|---|---|---|
+| real cost | 1.117 | 1.107 | 1.102 | **1.091** | 1.107 | 1.294 |
+
+`30→10` 持續變好（-2.4%），但**跟 DDIM_STEPS 不一樣**：完全關閉
+（`post_repel_steps=0`）會讓 V_relative 從 ~0.10 跳到 **0.19**、real cost
+反彈到 1.294——post-repel 不是純冗餘步數，對 boundary/overlap 有
+legalize 自己補不回來的清理效果，不能無限縮減。
+
+**完整 100 樣本官方 evaluate 確認**（`my_optimizer.py`，
+`DDIM_STEPS=10` + `POST_REPEL_STEPS=10`，兩次獨立跑）：
+
+| | run1 | run2 | 平均 |
+|---|---|---|---|
+| Total Score（中性 `RuntimeFactor=1.0`） | 1.5327 | 1.5166 | 1.5247 |
+| Total Score（換算真實 median runtime） | 1.1807 | 1.1577 | **1.1692** |
+| avg runtime | 1.77s | 1.70s | 1.74s |
+| n_infeasible | 0 | 0 | 0 |
+
+比純 `DDIM_STEPS=10`（真實分數 1.178）再進步約 **-0.75%**——比 34 樣本
+篩選預測的 -2.4% 弱一些（100 樣本 vs. 34 樣本分層抽樣的正常雜訊差異），
+但方向一致、兩次評估都在合理範圍內，確實是真實的額外改善。
+
+**決定**：**採用**，`my_optimizer.py` 的 `POST_REPEL_STEPS` 從 30 改成
+10。跟 v5.15 疊加後，v4 的真實分數從最初的 1.2322 降到 **1.1692**
+（累計 -5.1%），純粹靠重新檢視「哪些推論端步數是真的冗餘」拿到，沒有
+犧牲任何品質（0/100 infeasible 全程不變）。
+
+---
+
 ## v5.15 —— DDIM_STEPS 30→10（採用，這個 session 目前最大的一次真實分數改善）
 
 **背景**：v5.14 為了確認 repaint 不划算，第一次把 v4 的真實

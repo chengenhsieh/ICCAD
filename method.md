@@ -270,9 +270,9 @@ v5.15）產生高品質樣本。
    （目前設定為 `0.7 × ddim_steps`）時，用一個近似 overlap 分數選出當下最好的
    候選，把它複製到所有 batch slot、加入少量噪聲後繼續跑完剩下的步數——讓好
    候選有機會被進一步 refine，而非在半路就固定死。
-5. **Post-repel**：DDIM 步驟結束後，再跑 `post_repel_steps=30` 步「純物理、
-   無 model」的 repulsion + boundary nudge 迴圈。100 樣本 A/B 測試證實這一步
-   仍然必要：拿掉後 V_relative（soft constraint 違規率）從 0.117 惡化到
+5. **Post-repel**：DDIM 步驟結束後，再跑 `post_repel_steps=10`（v5.16 起，
+   原為 30）步「純物理、無 model」的 repulsion + boundary nudge 迴圈。100
+   樣本 A/B 測試證實這一步仍然必要：拿掉後 V_relative（soft constraint 違規率）從 0.117 惡化到
    0.198（近乎翻倍），因為它給了 legalize 階段一個「起點已經比較有秩序」的
    佈局，legalize 自己的局部搜尋沒辦法完全補回這個落差。
 
@@ -425,7 +425,8 @@ constraint 被重新破壞的風險。
 | Legalize 用多種 tie-break 順序取最佳 bbox（legalize 版 best-of-N） | 單一輸入下不同順序确實能差到 ±10% bbox，但套用 `compact_reinsert` 後這個差異幾乎被磨平；時間成本卻是線性倍增 | 不採用（保留為可選功能） |
 | `compact_gravity`（每個 block 各自往全域重心走一小步）當額外壓縮 pass | area gap、hpwl gap、V_relative 都輕微變差，且不會處理「多個獨立衛星群共享同一條邊界鎖」這種情況 | 不採用（保留為可選功能） |
 | `compact_merge_clusters` 加入**家族協同移動**（多個衛星分量共享同一條邊界鎖時一起剛體平移）+ `rounds: 5 → 20` | 100 樣本 area gap 24.7% → **23.8%**（實質改善），legalize 最差情況時間反而下降（5.10s → 3.58s），V_relative 小幅上升（0.109 → 0.113），0/100 infeasible 不變 | **採用** |
-| `post_repel_steps` 掃描 15/30/45/60 | area gap 24.1%/24.2%/23.9%/24.2%、hpwl gap 15.2%/15.9%/16.1%/16.0%、V_relative 0.112/0.112/0.119/0.115——四組數字在雜訊範圍內互相交疊，沒有單調趨勢 | 維持原設定（30），不值得為了雜訊等級的差異改參數 |
+| `post_repel_steps` 掃描 15/30/45/60（中性 runtime 評估） | area gap 24.1%/24.2%/23.9%/24.2%、hpwl gap 15.2%/15.9%/16.1%/16.0%、V_relative 0.112/0.112/0.119/0.115——四組數字在雜訊範圍內互相交疊，沒有單調趨勢 | 當時維持 30（後被 v5.16 用真實 runtime 方法論推翻，見下一行） |
+| `post_repel_steps: 30 → 10`（v5.16，改用真實 median runtime 換算，見 CHANGELOG.md）| 34 樣本分層抽樣：30→20→15→10 real cost 持續變好（-2.4%），但 `0`（完全關閉）V_relative 從 ~0.10 跳到 0.19——post-repel 對 boundary/overlap 有 legalize 補不回來的清理效果，不能無限縮減。完整 100 樣本官方 evaluate 確認兩次，在 `DDIM_STEPS=10` 之上疊加，換算真實 median runtime 的 Total Score 再降 -0.75%（1.178→1.1692），0/100 infeasible | **採用** |
 | Legalize 放置階段加入「同 cluster group 貼靠候選位置」偏好（`use_cluster_adjacency`，對每個候選自由矩形額外嘗試貼齊同組已放置 block 的 4 個邊、給予成本折扣） | 純合成測試（無 B2B/P2B 連線）V_grouping 大幅下降、看似有效；但 100 樣本真實資料上 area gap 23.7%→25.5%、hpwl gap 16.5%→19.0%、V_relative 0.116→0.134，三項同時變差。根因：合成測試產生器從不建立 B2B/P2B 連線，等於讓「貼靠折扣」在測試中完全沒有 HPWL 目標可以競爭，因此系統性低估了真實資料中的代價 | **不採用**（已還原，程式碼保留為 opt-in 參數） |
 | `compact_reinsert`/`compact_positions` 之後再補跑一次 `compact_merge_clusters`（`use_second_merge_pass`） | `compact_reinsert` 的局部搜尋常會移動原本卡住的衛星分量、開出新的「彼此貼合」機會，第一次 merge（在 reinsert 之前）看不到。100 樣本 A/B：area gap 24.6%→**23.1%**、V_relative 0.112→**0.106**，兩項同時改善，時間幾乎不變（第一輪多半立即收斂） | **採用**（v4.6，改為預設開啟） |
 | 依 `compute_cluster_violations` 精確定義（`_blocks_share_edge`）逐 cluster group 補做剛體貼合（`compact_merge_cluster_groups` 早期版本，只有全域違規不增加的安全閘門、沒有 HPWL 閘門） | 修正過連通性判定與「移動整個剛體可能牽動其他 group」的問題後，100 樣本測試 V_relative 仍在雜訊範圍內小幅上升（0.113→0.118），沒有取得可靠的淨改善 | **不採用**（見下一行：加上 HPWL 閘門後的版本才是後來採用的 v4.7） |
@@ -513,21 +514,21 @@ v5.11。
 ## 最終結果（100 樣本官方 validation set）
 
 以下數字取自 `my_optimizer.py`（v4 checkpoint `model_epoch300_overlap_v4.pt`
-+ `DDIM_STEPS=10`，v5.15 採用後的目前 production 設定）跑官方
-`iccad2026_evaluate.py --evaluate` 的實測結果（兩次獨立評估平均），是
-目前已知最準確、最新的版本（`violations_relative` 跟官方 100/100 精確
-吻合，見 §2.4／CHANGELOG.md v5.11；`DDIM_STEPS` 調整見 CHANGELOG.md
-v5.15）：
++ `DDIM_STEPS=10` + `POST_REPEL_STEPS=10`，v5.15／v5.16 採用後的目前
+production 設定）跑官方 `iccad2026_evaluate.py --evaluate` 的實測結果
+（兩次獨立評估平均），是目前已知最準確、最新的版本（`violations_relative`
+跟官方 100/100 精確吻合，見 §2.4／CHANGELOG.md v5.11；`DDIM_STEPS`／
+`POST_REPEL_STEPS` 調整見 CHANGELOG.md v5.15／v5.16）：
 
 | 指標 | 數值 |
 |---|---|
 | Hard constraint 違規 | 0 / 100（zero overlap, exact preplaced/fixed shape, area ≤1% error, 皆保證滿足） |
-| Area gap（vs. optimal） | 22.91% |
-| HPWL gap（vs. optimal） | 28.40% |
-| Soft constraint 違規率（V_relative，官方精確定義） | 0.1106 |
-| 平均單樣本總時間 | 1.84s（`DDIM_STEPS=30` 時為 2.485s，-26%） |
-| Total Score（`RuntimeFactor=1.0` 中性，官方 evaluate 直接輸出） | 1.5177 |
-| Total Score（換算 alpha-test 實際 median runtime） | **1.178**（`DDIM_STEPS=30` 時為 1.2322，-4.4%） |
+| Area gap（vs. optimal） | 23.06% |
+| HPWL gap（vs. optimal） | 28.64% |
+| Soft constraint 違規率（V_relative，官方精確定義） | 0.1090 |
+| 平均單樣本總時間 | 1.74s（`DDIM_STEPS=30`／`POST_REPEL_STEPS=30` 時為 2.485s，-30%） |
+| Total Score（`RuntimeFactor=1.0` 中性，官方 evaluate 直接輸出） | 1.5247 |
+| Total Score（換算 alpha-test 實際 median runtime） | **1.1692**（原始 v4 為 1.2322，累計 -5.1%） |
 
 （diffusion sampling 未固定 random seed，同一組參數重跑 100 樣本時上述數字
 本身會有若干自然波動，屬於量測雜訊而非參數變化造成——這也是為何 v4.7 之後

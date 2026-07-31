@@ -603,6 +603,73 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.15 —— DDIM_STEPS 30→10（採用，這個 session 目前最大的一次真實分數改善）
+
+**背景**：v5.14 為了確認 repaint 不划算，第一次把 v4 的真實
+（換算 alpha-test median runtime）分數拆開來看，順便算出一個之前沒注意到
+的數字：v4 平均 `RuntimeFactor^0.3`（cost 公式的時間乘項）約 **0.837**，
+離公式下限 **0.7** 還有 **16.4%** 空間沒被利用到——意思是還有明確、可
+量化的空間可以靠純粹加速拿到分數，不需要犧牲品質。回頭檢查發現
+`DDIM_STEPS=30` 是這整個 session 從沒被系統性掃過的核心超參數：它是
+序列迴圈（每步等前一步），是 diffusion 時間的主要驅動者（不像
+`N_SAMPLES`，候選共用同一個 GPU batch，v5.4 已驗證幾乎不影響時間）。
+
+**過去為什麼沒試過**：這個 session 之前所有跟 runtime 有關的判斷，幾乎
+都只看「中性 `RuntimeFactor=1.0`」的官方 evaluate 或不含 runtime 項的
+cost-proxy 公式——v5.14 才第一次確認這個方法論會嚴重低估「本來就比賽場
+快的 checkpoint」的真實 runtime 價值。`DDIM_STEPS` 從一開始就沿用官方
+baseline 附近的預設值，沒有被重新檢視過。
+
+**掃描方法**：34 樣本分層抽樣（`test_id` 每隔 3 個取一個，涵蓋 21~140
+block 的完整規模範圍，而不是只挑小案例），對每個樣本量測**真實** wall
+time（而非 cost-proxy 假設 `RuntimeFactor=1.0`），用
+`C_Median Runtime per Testcase(Alpha).csv` 換算真實 `RuntimeFactor`、
+代入完整官方 cost 公式。
+
+**結果**（real cost，越低越好；baseline `steps=30` = 1.263）：
+
+| DDIM_STEPS | 30 | 24 | 20 | 16 | 12 | 10 | 8 | 6 | 4 | 2 | 1 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| real cost | 1.263 | 1.194 | 1.165 | 1.16 | 1.155 | 1.119 | **1.109** | 1.148 | 1.125 | 1.845 | 1.909 |
+
+從 30 降到 4，real cost **持續變好或打平**（品質幾乎不受影響——
+area_gap／hpwl_gap 在雜訊範圍內波動，V_relative 甚至常常比 30 步更低，
+34 樣本全部 0 infeasible），最低點在 `steps=8` 附近（比 baseline 好約
+12%）；`steps=2` 才突然崩潰（hpwl_gap 0.17→0.61、V_relative
+0.11→0.29）。懸崖比原本預期的位置晚很多——DDIM 在這個任務上顯然有相當
+大的步數冗餘。
+
+**最終選擇 `steps=10`**（不選懸崖邊的 `steps=8`）：只用 34/100 樣本、
+懸崖離 `steps=4` 這麼近，選一個離懸崖 2 倍以上安全邊際、但仍拿到大半效益
+的值更穩健，避免不在樣本裡的邊緣案例（特別大或特別不規則的問題）踩到
+沒被發現的局部懸崖。
+
+**完整 100 樣本官方 evaluate 確認**（`my_optimizer.py`，兩次獨立跑，
+`DDIM_STEPS=10`，其餘不變）：
+
+| | run1 | run2 | 平均 |
+|---|---|---|---|
+| Total Score（中性 `RuntimeFactor=1.0`） | 1.5133 | 1.5221 | 1.5177 |
+| Total Score（換算真實 median runtime） | 1.1945 | 1.1614 | **1.178** |
+| avg area_gap | 0.2308 | 0.2274 | 0.2291 |
+| avg hpwl_gap | 0.2803 | 0.2877 | 0.2840 |
+| avg V_relative | 0.1094 | 0.1118 | 0.1106 |
+| avg runtime | 1.87s | 1.81s | 1.84s |
+| n_infeasible | 0 | 0 | 0 |
+
+跟 v4（`DDIM_STEPS=30`）的真實分數 **1.2322** 相比，兩次獨立評估**各自**
+都更好（1.1945、1.1614），平均 **-4.4%**——品質幾乎沒有差異（area/hpwl/
+V_relative 三項都在雜訊範圍內），純粹靠 runtime 從 2.485s 降到 1.84s
+（-26%）拿到的真實分數改善。
+
+**決定**：**採用**，`my_optimizer.py` 的 `DDIM_STEPS` 從 30 改成 10。這是
+這個 session 目前唯一一個「不用犧牲任何品質、純粹靠重新檢視方法論假設
+（中性 runtime → 真實 median runtime）就找到」的真實分數改善，也印證了
+v5.14 教訓的價值：runtime 相關的判斷一定要換算真實 median runtime，不能
+只看中性 evaluate。
+
+---
+
 ## v5.14 —— RePaint 式 harmonization resampling（不採用，關鍵教訓：必須用真實 median runtime 驗證）
 
 **背景**：`ddim_sample_with_forces` 每一步都對 preplaced/fixed 的已知

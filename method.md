@@ -212,7 +212,8 @@ constraint 的初始佈局，**(B) 決定性 legalize**把它轉成一個 hard c
 
 採樣器基於 **DDIM**（Song, Meng, Ermon, *"Denoising Diffusion Implicit
 Models,"* ICLR 2021）的非馬可夫、可跳步反向過程，而非原始 DDPM 的逐步採樣——
-這讓我們能用遠少於 `T=1000` 的步數（目前設定 `ddim_steps=30`）產生高品質樣本。
+這讓我們能用遠少於 `T=1000` 的步數（目前設定 `ddim_steps=10`，見 §2.3
+v5.15）產生高品質樣本。
 每一步反向擴散之外，還疊加以下機制：
 
 1. **Hard inpainting**：對 preplaced block，每一步都把該 block 的 state 直接
@@ -416,6 +417,7 @@ constraint 被重新破壞的風險。
 | 嘗試 | 結果 | 決定 |
 |---|---|---|
 | `ddim_steps: 100 → 30` | 總時間 -50%，品質指標在雜訊範圍內無明顯下降 | 採用 |
+| `ddim_steps: 30 → 10`（v5.15，見 CHANGELOG.md）| 34 樣本分層抽樣（涵蓋完整 block 數規模範圍）+ 真實 median runtime 換算：從 30 降到 4 real cost 持續變好或打平（品質幾乎不受影響），`steps=2` 才崩潰（hpwl_gap 0.17→0.61）。選 10（離懸崖 2 倍安全邊際）用完整 100 樣本官方 evaluate 確認兩次，換算真實 median runtime 的 Total Score 從 1.2322 降到 **1.178**（-4.4%），純粹靠 avg runtime 2.485s→1.84s 拿到，area/hpwl/V_relative 三項都在雜訊範圍內。起因：v5.14 意外發現 v4 平均 `RuntimeFactor^0.3` 約 0.837，離公式下限 0.7 還有 16% 空間沒被利用到，才回頭系統性掃這個從沒被檢視過的參數 | **採用** |
 | `n_samples: 6 → 14` | best-of-N 候選共用一個 GPU batch，時間幾乎不變，HPWL/V_rel 小幅改善 | 採用 |
 | Mixed precision（fp16 autocast）推論 | 小模型下 dtype 轉換開銷蓋過算力節省，反而慢 20% | 不採用 |
 | 依 `ddim_steps` 等比例縮放 force-guidance 的 timestep 窗口 | 100 樣本測試前後幾乎沒有差異 | 不採用（已還原） |
@@ -510,26 +512,30 @@ v5.11。
 
 ## 最終結果（100 樣本官方 validation set）
 
-以下數字取自修完 v5.11 違規判定 bug 之後、拿 `my_optimizer.py`（v4，
-`model_epoch300_overlap_v4.pt`）跑官方 `iccad2026_evaluate.py --evaluate`
-的實測結果，是目前已知最準確的版本（`violations_relative` 跟官方
-100/100 精確吻合，見 §2.4／CHANGELOG.md v5.11）：
+以下數字取自 `my_optimizer.py`（v4 checkpoint `model_epoch300_overlap_v4.pt`
++ `DDIM_STEPS=10`，v5.15 採用後的目前 production 設定）跑官方
+`iccad2026_evaluate.py --evaluate` 的實測結果（兩次獨立評估平均），是
+目前已知最準確、最新的版本（`violations_relative` 跟官方 100/100 精確
+吻合，見 §2.4／CHANGELOG.md v5.11；`DDIM_STEPS` 調整見 CHANGELOG.md
+v5.15）：
 
 | 指標 | 數值 |
 |---|---|
 | Hard constraint 違規 | 0 / 100（zero overlap, exact preplaced/fixed shape, area ≤1% error, 皆保證滿足） |
-| Area gap（vs. optimal） | 22.66% |
-| HPWL gap（vs. optimal） | 26.88% |
-| Soft constraint 違規率（V_relative，官方精確定義） | 0.1090 |
-| 平均單樣本總時間 | 2.485s（max 5.786s） |
-| Total Score（`RuntimeFactor=1.0` 中性，官方 evaluate 直接輸出） | 1.499129 |
-| Total Score（換算 alpha-test 實際 median runtime） | **1.2322**（99/100 樣本比 alpha-test median 快） |
+| Area gap（vs. optimal） | 22.91% |
+| HPWL gap（vs. optimal） | 28.40% |
+| Soft constraint 違規率（V_relative，官方精確定義） | 0.1106 |
+| 平均單樣本總時間 | 1.84s（`DDIM_STEPS=30` 時為 2.485s，-26%） |
+| Total Score（`RuntimeFactor=1.0` 中性，官方 evaluate 直接輸出） | 1.5177 |
+| Total Score（換算 alpha-test 實際 median runtime） | **1.178**（`DDIM_STEPS=30` 時為 1.2322，-4.4%） |
 
 （diffusion sampling 未固定 random seed，同一組參數重跑 100 樣本時上述數字
 本身會有若干自然波動，屬於量測雜訊而非參數變化造成——這也是為何 v4.7 之後
 的驗證過程多半改用 paired 設計，見上一節。中性 runtime 版本的 Total Score
 沒有反映真實比賽的 RuntimeFactor 加成，換算 alpha-test 真實 median runtime
-的版本更接近實際競賽會拿到的分數。）
+的版本更接近實際競賽會拿到的分數；`DDIM_STEPS=30→10` 正是靠重新檢視這個
+換算方式才發現的改善空間，品質幾乎不受影響，純粹是 runtime 下降帶來的
+真實分數提升。）
 
 ---
 

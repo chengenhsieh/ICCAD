@@ -60,7 +60,16 @@ class MyOptimizer(FloorplanOptimizer):
     # diffusion-side force-strength tuning). ~2.5s/sample avg, 0/100
     # infeasible; see the evaluate run for area/hpwl/V_rel.
     CHECKPOINT_NAME = "model_epoch300_overlap_v4.pt"
-    DDIM_STEPS = 30
+    # v5.15（採用）：v4 原本平均 RuntimeFactor^0.3 約 0.837，離公式下限 0.7
+    # 還有 16% 空間沒被利用到——DDIM_STEPS=30 從沒被系統性掃過。34 樣本
+    # 分層抽樣（真實 median runtime 換算）發現從 30 降到 4 real cost 持續
+    # 變好或打平（品質幾乎不變，甚至 V_relative 常常更低），steps=2 才
+    # 崩潰（hpwl_gap 0.17→0.61）。選 10（離懸崖 2 倍以上安全邊際）用完整
+    # 100 樣本官方 evaluate 確認兩次：real score（換算真實 median
+    # runtime）1.1945 / 1.1614，平均 1.178，比 v4 原本的 1.2322 好
+    # -4.4%，兩次都個別優於 baseline、0/100 infeasible，avg runtime
+    # 2.485s→1.84s。見 CHANGELOG.md v5.15。
+    DDIM_STEPS = 10
     N_SAMPLES = 14
     POST_REPEL_STEPS = 30
     # v5.0: 100-sample quasi-paired sweep found the hardcoded force-guidance

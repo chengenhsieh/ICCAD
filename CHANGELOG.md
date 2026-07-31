@@ -603,6 +603,147 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.14 —— RePaint 式 harmonization resampling（不採用，關鍵教訓：必須用真實 median runtime 驗證）
+
+**背景**：`ddim_sample_with_forces` 每一步都對 preplaced/fixed 的已知
+區域做 hard inpainting（強制貼回已知加噪版本），但這個「貼回去」只在
+當前這一步發生一次，已知區域跟自由生成區域之間的資訊只靠下一步的
+attention 慢慢傳遞，容易在交界處留下不協調的痕跡。RePaint
+（Lugmayr et al., CVPR 2022）針對這個已知的 DDPM inpainting 缺陷提出
+resampling：同一個 t 做完一次 reverse step 後，先把結果加噪聲跳回同一個
+t，再重跑一次同樣的 step，重複 `repaint_resample_steps` 次，讓已知/未知
+區域有更多機會在同一雜訊量級上互相對齊。
+
+**實作**：`diffusion.py: ddim_sample_with_forces` 新增
+`repaint_resample_steps` 參數（預設 1 = 關閉，跟改動前完全等價），新增
+`_repaint_jump_back` 輔助方法（用跟既有 re-noise 檢查點一致的 DDPM 邊際
+分布公式，把 x 從 t_prev 往回加噪聲跳到 t_cur）。只有存在
+preplaced/fixed 硬限制的樣本才會觸發，其餘樣本零成本。單元測試驗證
+`steps=1` 逐位元不變、`steps>1` 確實改變輸出，且 preplaced block 的位置
+在任何 `steps` 下都精確不變（hard inpainting 機制沒被破壞）。
+`inference.py` 一路傳遞。純推論端，不需要重新訓練。
+
+**驗證（第一階段，很有希望）**：
+
+- 30 樣本 quasi-paired 掃 `steps ∈ {2, 3}`：cost-proxy 分別 -3.08% / -3.86%，
+  raw overlap 大幅下降（424→266→208），是這個 session 目前**paired 測試
+  訊號最強**的一次。
+- 放大到 **100 樣本 paired** 確認 `steps=2`：area_gap／hpwl_gap／
+  V_relative／raw overlap **四項全部同向變好**（raw overlap 992→627，
+  -37%），cost-proxy -1.77%（60/100 較好）——訊號存活。
+- 兩次獨立官方 evaluate（中性 `RuntimeFactor=1.0`）：1.5220 / 1.5098，
+  平均 **1.5159**，比 v4 baseline（同一套 codebase 下的 1.5248）
+  **看起來略好 -0.58%**——是這個 session 第一個「paired 測試 + 中性官方
+  evaluate 都撐住」的正面結果。
+
+**驗證（第二階段，用真實 median runtime 重算才發現真相）**：
+
+user 直接追問「這樣加入 RuntimeFactor 考慮過後，整體成績是不是會下滑」，
+促成用 `C_Median Runtime per Testcase(Alpha).csv` 重算真實分數（同
+v5.11 章節最後用的方法）。結果：
+
+| | 中性（`RuntimeFactor=1.0`） | 真實（換算 alpha-test median runtime） |
+|---|---|---|
+| v4 baseline | 1.499129 | **1.2322** |
+| repaint steps=2（兩次平均） | 1.5159 | **1.3319**（**+8.1%，明顯變差**） |
+
+v4 本來就比 alpha-test median 快很多（99/100 樣本比 median 快，avg
+runtime 2.485s），這個速度優勢讓它在真實分數裡拿到比中性分數低 18% 的
+大幅折扣。repaint 把 avg runtime 拉到 3.505s（+41%，只算受影響樣本的
+邊際成本被拉低到全體平均），大幅吃掉這個折扣——中性 evaluate 因為兩邊
+runtime 都用假設值 1.0，完全看不出這個代價，甚至讓 repaint 顯得「略勝」，
+是會誤導判斷的假象。這跟 QK-norm（v5.9）當初被拒絕是同一個機制（真實
+compute 成本 vs. 品質改善的取捨），只是這次沒有先做真實 runtime 換算，
+一度差點做出錯誤的「採用」判斷。
+
+**決定**：`repaint_resample_steps` **不採用**（`my_optimizer.py` 維持
+`REPAINT_RESAMPLE_STEPS=1`）。機制保留備用。**方法論教訓**：任何會實質
+增加 runtime 的改動，不能只看中性 `RuntimeFactor=1.0` 的官方 evaluate
+結果來判斷——對一個本來就比賽場平均快很多的 checkpoint，中性分數會系統性
+低估 runtime 增加的真實代價，必須換算 `C_Median Runtime per
+Testcase(Alpha).csv` 的真實 median runtime 才能看到完整圖像。之後任何
+runtime 相關的實驗都應該比照這個流程。
+
+---
+
+## v5.13 —— 推論端 best-of-N 加權重抽樣（不採用）
+
+**背景**：現有 best-of-N 機制在 70% 那個 checkpoint，是把 N 個候選裡
+overlap 分數最好的「唯一一個」複製到全部 N 個 batch slot、各自加噪聲重跑
+剩下步驟，其餘 N-1 個候選直接丟棄——是 SMC/Feynman-Kac 類文獻裡
+resampling 步驟的一個退化特例（全部權重收斂到單一 particle）。文獻認為
+這種硬性 collapse 通常不如「依分數做加權重新抽樣、保留多個較好候選」
+有效。
+
+**實作**：`diffusion.py: ddim_sample_with_forces` 新增
+`resample_temperature` 參數（預設 `None` = 關閉，跟改動前完全等價）。
+給正浮點數時，分數先做 z-score 正規化，再用
+`softmax(-normalized_scores / temperature)` 當機率、`torch.multinomial`
+做加權重抽樣決定新的 N 個 batch slot 各自複製哪個候選，取代 `argmin`
+硬選。`inference.py` 一路傳遞。單元測試驗證 `temperature=None` 逐位元
+不變、給值後確實改變輸出。純推論端，不需要重新訓練。
+
+**驗證**：30 樣本 quasi-paired 掃 `temperature ∈ {0.3, 0.6, 1.0, 2.0}`，
+四組**全部都是「變差的樣本數 > 變好的樣本數」**（13:17、13:17、12:18、
+10:20），沒有任何一組看起來值得往下做 100 樣本/官方 evaluate 確認，訊號
+明顯比 v5.12、v5.14 都弱，決定不繼續深入。
+
+推測原因：現有機制在 70% 對「贏家」軌跡做 N 次獨立加噪聲延伸，本來就有
+多樣性來源；加權重抽樣改的是「用比較弱的候選當種子」，但排序分數（純
+overlap 近似）在 70% 這個時間點本身就不夠準（HPWL、V_relative 這些真正
+決定最終品質的指標，在 state 階段根本算不出來），讓「相信次好候選」的
+價值打了折扣——文獻裡提到的「中途評分很難準確預測最終品質」這個已知
+難題，在這裡看起來確實成立。
+
+**決定**：`resample_temperature` **不採用**（維持 `None`）。機制保留
+備用。
+
+---
+
+## v5.12 —— 推論端 force-guidance 信心加權排程（不採用）
+
+**背景**：上網查「純推論端、不用重訓」的品質改善方向，找到 inference-time
+scaling for diffusion models 這條文獻——guidance 強度隨去噪過程調整（早期
+弱、晚期強，或反過來）通常比整段固定強度好。`ddim_sample_with_forces`
+的四個 force（pin/grouping/repulsion/boundary）目前各自有 v5.0 調過的
+on/off t 窗口，但窗口內是固定常數強度。production 只用 30 步 DDIM，直接
+在窗口邊界做平滑淡入淡出可用的 step 數太少（部分窗口本身只覆蓋 1-2 個
+離散 step），改成让整個窗口內的強度依 `alpha_bar_t`（denoising 信心，
+隨 t 從 999→0 單調從接近 0 升到 1）連續縮放更有意義。
+
+**實作**：`diffusion.py: ddim_sample_with_forces` 新增
+`force_confidence_power` 參數（預設 0.0，`alpha_bar_t**0=1` 恆等於 1，
+跟改動前完全等價），四個 force 各自的有效強度改成
+`base_strength * alpha_bar_t**power`。窗口本身（何時開始/結束）與
+`power=0` 時的滿強度數值完全沿用 v5.0 已驗證的預設，不變。單元測試驗證
+`power=0.0` 兩次獨立跑（同 seed）逐位元相同，`power≠0.0` 確實改變輸出
+（機制有接上，不是死代碼）。`inference.py: generate_floorplan`／
+`run_one_sample` 一路傳遞這個參數。純推論端改動，不需要重新訓練，直接用
+現有 `model_epoch300_overlap_v4.pt` 測試。
+
+**驗證**：
+
+- 30 樣本 quasi-paired 掃 `power ∈ {0.5, 1.0, 2.0}`：`power=1.0` 看起來
+  最好，cost 公式 -2.42%（20/30 較好）。
+- 放大到 **100 樣本 paired**（更可靠）重測 `power=1.0`：area_gap
+  0.2258→0.2241、hpwl_gap 0.1633→0.1556、V_relative 0.1077→0.1065、raw
+  overlap 1007.6→997.4——**四項指標全部同向變好**（不像大多數先前實驗
+  是「一項變好、一項變差」的取捨），但幅度都不大，cost 公式僅
+  **-0.55%**（53/100 較好、47/100 較差，接近打平）。
+- 拿 `my_optimizer.py`（`FORCE_CONFIDENCE_POWER=1.0`）跑兩次獨立官方
+  evaluate（同慣例作法）：**1.5189 / 1.5620**，平均 **1.5405**——跟
+  v4 baseline（同一套修好的 v5.11 codebase 下重新評估的平均
+  1.5248，見 v5.10 章節）相比，反而**略差 +1.0%**，沒有通過確認。
+
+**決定**：`force_confidence_power` **不採用**（`my_optimizer.py` 維持
+`FORCE_CONFIDENCE_POWER=0.0`）——100 樣本 paired 測試的訊號雖然乾淨（四項
+指標同向），但幅度太小，扛不住官方 evaluate 本身的單次 ±2% 雜訊，兩次
+獨立評估平均沒有支持「變好」的結論，反而略偏負面。機制（`diffusion.py`／
+`inference.py` 裡的 `force_confidence_power` 參數）保留備用，之後如果想
+在其他 power 值或搭配其他窗口設計上繼續試，不需要重新走一次接線過程。
+
+---
+
 ## v5.11 —— 修正 `utils.py` 的 soft violation 判定，跟官方對齊（bug fix）
 
 **發現**：`my_optimizer_results.json`（官方 `iccad2026_evaluate.py --evaluate`

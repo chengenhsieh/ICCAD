@@ -85,6 +85,18 @@ def generate_floorplan(
     grouping_force_strength=0.030,
     boundary_nudge_strength=0.025,
     repulsion_strength=0.0375,
+    # v5.12: 純推論端實驗，只用於 ddim 分支——見 diffusion.py:
+    # ddim_sample_with_forces 的 force_confidence_power docstring。
+    # 預設 0.0 = 關閉，跟改動前完全等價。
+    force_confidence_power=0.0,
+    # v5.13: 純推論端實驗，只用於 ddim 分支——見 diffusion.py:
+    # ddim_sample_with_forces 的 resample_temperature docstring。
+    # 預設 None = 關閉，跟改動前完全等價。
+    resample_temperature=None,
+    # v5.14: 純推論端實驗，只用於 ddim 分支——見 diffusion.py:
+    # ddim_sample_with_forces 的 repaint_resample_steps docstring。
+    # 預設 1 = 關閉，跟改動前完全等價。
+    repaint_resample_steps=1,
 ):
     """
     Args:
@@ -336,6 +348,9 @@ def generate_floorplan(
             grouping_force_strength=grouping_force_strength,
             boundary_nudge_strength=boundary_nudge_strength,
             repulsion_strength=repulsion_strength,
+            force_confidence_power=force_confidence_power,
+            resample_temperature=resample_temperature,
+            repaint_resample_steps=repaint_resample_steps,
         )
 
     preplaced_indices = [i for i in range(k) if preplaced_mask_np[i]]
@@ -908,6 +923,8 @@ def run_one_sample(sample_idx, official, model, config, device,
                    scale_t_windows=False, reinsert_sweeps=3, reinsert_grid_density=12,
                    pin_force_strength=0.02, grouping_force_strength=0.030,
                    boundary_nudge_strength=0.025, repulsion_strength=0.0375,
+                   force_confidence_power=0.0, resample_temperature=None,
+                   repaint_resample_steps=1,
                    tie_break_modes=None, use_gravity=False, gravity_iters=40,
                    use_cluster_merge=True, hpwl_slack_ratio=5.0, use_snap_boundary=False,
                    boundary_hpwl_slack_ratio=0.0,
@@ -1060,6 +1077,9 @@ def run_one_sample(sample_idx, official, model, config, device,
         grouping_force_strength=grouping_force_strength,
         boundary_nudge_strength=boundary_nudge_strength,
         repulsion_strength=repulsion_strength,
+        force_confidence_power=force_confidence_power,
+        resample_temperature=resample_temperature,
+        repaint_resample_steps=repaint_resample_steps,
     )
 
     # v5.7（實驗用）：把額外 checkpoint 的候選池併進來，一起重新選最好的

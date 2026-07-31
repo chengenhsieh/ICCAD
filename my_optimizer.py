@@ -79,6 +79,25 @@ class MyOptimizer(FloorplanOptimizer):
     GROUPING_FORCE_STRENGTH = 0.030
     BOUNDARY_NUDGE_STRENGTH = 0.025
     REPULSION_STRENGTH = 0.0375
+    # v5.12（不採用，見 CHANGELOG.md）：純推論端，force 強度乘上
+    # alpha_bar_t**power，讓每個力剛進窗口時弱、隨 x0_pred 信心平滑增強到滿
+    # 強度。100 樣本 paired 測試 power=1.0 四項指標同向變好、但幅度小
+    # （cost-proxy -0.55%，53/100）；兩次獨立官方 evaluate 平均反而比 v4
+    # baseline 略差（+1.0%），沒有通過確認，維持關閉（0.0 = 跟改動前完全
+    # 等價）。
+    FORCE_CONFIDENCE_POWER = 0.0
+    # v5.14（不採用，見 CHANGELOG.md）：RePaint 式 harmonization resampling。
+    # 100 樣本 paired 測試 steps=2：area/hpwl/V_relative/raw overlap 四項
+    # 全部同向變好（raw overlap -37%），cost-proxy -1.77%——是這個 session
+    # 目前 paired 訊號最乾淨的一次。兩次官方 evaluate（中性 RuntimeFactor）
+    # 平均 1.5159，看起來甚至略優於 v4 baseline 的 1.5248。但 v4 本來就比
+    # alpha-test median runtime 快很多（99/100 樣本比 median 快），換算
+    # 真實 median runtime 後 v4 real score 只有 1.2322；repaint 平均 runtime
+    # 從 2.485s 拉到 3.505s（+41%），把這個速度優勢吃掉一大半，real score
+    # 變成 1.3319（**+8.1%，明顯變差**）——中性 evaluate 完全看不出這個
+    # 代價，必須換算真實 median runtime 才會現形。維持關閉（1 = 跟改動前
+    # 完全等價）。
+    REPAINT_RESAMPLE_STEPS = 1
 
     def __init__(self, verbose: bool = False):
         super().__init__(verbose)
@@ -175,6 +194,8 @@ class MyOptimizer(FloorplanOptimizer):
             grouping_force_strength=self.GROUPING_FORCE_STRENGTH,
             boundary_nudge_strength=self.BOUNDARY_NUDGE_STRENGTH,
             repulsion_strength=self.REPULSION_STRENGTH,
+            force_confidence_power=self.FORCE_CONFIDENCE_POWER,
+            repaint_resample_steps=self.REPAINT_RESAMPLE_STEPS,
         )
 
         legalized = legalize_result(

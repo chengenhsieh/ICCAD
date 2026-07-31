@@ -804,6 +804,12 @@ class GaussianDiffusion:
         # v3.9: pin bbox clamp 上下限，套力後把 block 中心拉回 bbox 內
         clamp_bbox=None,                   # (xmin, ymin, xmax, ymax) normalized
         use_amp=False,                     # 只把 model forward 包進 autocast(fp16)，其餘算術維持 fp32
+        # v5.12: 純推論端實驗，見下方 docstring 說明
+        force_confidence_power=0.0,
+        # v5.13: 純推論端實驗，見下方 docstring 說明
+        resample_temperature=None,
+        # v5.14: 純推論端實驗，見下方 docstring 說明
+        repaint_resample_steps=1,
     ):
         """
         GNN-style force-guided diffusion sampler。
@@ -816,6 +822,62 @@ class GaussianDiffusion:
           5. (在 t == renoise_at_t 時做 Best-of-N + re-noise)
 
         然後 Post-repel 階段（純物理迴圈、無 model）。
+
+        force_confidence_power (v5.12，預設 0.0 = 關閉，跟改動前完全等價):
+            四個 force（pin/grouping/repulsion/boundary）各自的強度目前是
+            在各自的 t 窗口內（`*_until_t`／`*_from_t`）套用固定常數。這個
+            參數讓有效強度改乘上 `alpha_bar_t ** power`（`alpha_bar_t` 是
+            這一步的信噪比，隨 t 從 999 降到 0 單調從接近 0 升到 1，代表
+            x0_pred 這時有多可信）：power=0 時 `alpha_bar_t**0=1`，等於
+            完全不變；power>0 時，每個力剛進入自己的窗口時強度接近 0，
+            隨著取樣越接近 t=0（x0_pred 越可信）平滑增強到接近原本設定的
+            滿強度，而不是一進窗口就是滿強度的瞬間跳變。窗口本身（何時
+            開始/結束）跟滿強度的數值都完全沿用 v5.0 已驗證的預設，這個
+            機制只改窗口「內部」怎麼分配強度。
+
+        resample_temperature (v5.13，預設 None = 關閉，跟改動前完全等價):
+            現有的 best-of-N 機制在 `n_renoise_steps`（預設 70%）那個
+            checkpoint，是把 N 個候選裡分數最好（`select_metric_fn` 最低，
+            目前用 overlap 近似）的「唯一一個」複製到全部 N 個 batch slot、
+            再各自加噪聲重跑剩下 30% 的步驟——等於把所有候選硬性收斂成同一
+            個贏家的變體，其餘 N-1 個候選（就算只比贏家差一點點）直接丟棄。
+            這是 SMC/Feynman-Kac 類文獻裡「resampling」步驟的一個退化特例
+            （全部權重收斂到單一 particle），文獻發現這種硬性 collapse 通常
+            不如「依分數做加權重新抽樣、保留多個較好候選（可以重複抽中同一
+            個，但不是全部都收斂成同一個）」有效。
+
+            `resample_temperature=None` 時完全維持舊行為（`argmin` 硬選
+            +複製）。給正浮點數時，改成：先把分數做 z-score 正規化
+            （`(scores - min) / (std + eps)`，讓 temperature 的意義不受
+            不同案例 overlap 絕對量級影響），再用
+            `softmax(-normalized_scores / temperature)` 當機率、
+            `torch.multinomial` 做「取後放回」的加權重抽樣決定新的 N 個
+            batch slot 各自複製哪個候選——temperature 越小，行為越接近舊的
+            `argmin` 硬選；越大，越接近均勻隨機（不看分數）。重抽後一樣
+            對每個 slot 各自加獨立噪聲重跑剩下的步驟，保持既有的「re-noise
+            以維持多樣性」機制不變。
+
+        repaint_resample_steps (v5.14，預設 1 = 關閉，跟改動前完全等價):
+            RePaint（Lugmayr et al., CVPR 2022）的 inpainting 技巧。現有的
+            hard inpainting（見下方「Hard inpainting」區塊）每一步都把
+            preplaced/fixed 的已知區域強制貼回它們各自的已知加噪版本，但
+            這個「貼回去」只在當前這一步發生一次——已知區域跟自由生成區域
+            之間的資訊只透過下一步的 attention 慢慢傳遞，容易在兩者交界處
+            留下不協調的痕跡（本專案裡 preplaced/fixed block 附近的
+            boundary 違規偏高，跟這個已知的 DDPM inpainting 缺陷方向一致）。
+
+            RePaint 的修法：在同一個 t，做完一次完整 reverse step 後，先不
+            急著往下一個 t 走，而是把結果「往回加噪聲跳回」同一個 t（用跟
+            DDPM 前向過程一致的邊際分布公式），再重跑一次同樣的 reverse
+            step——重複 `repaint_resample_steps` 次（最後一次的結果才真的
+            往下一步走）。每次重跑，已知區域都會被重新拉回它自己的已知值，
+            讓自由生成區域有更多機會在同一個雜訊量級上跟已知區域對齊，才
+            繼續往下個、雜訊更低的 t 前進。`repaint_resample_steps=1`
+            時完全跳過這個機制（跟改動前逐位元相同）；只有存在
+            preplaced/fixed 硬限制（`has_constraints=True`）時才會啟用，
+            沒有硬限制的樣本不受影響、也不用付出額外計算成本。代價：
+            model forward 次數約略乘上這個倍數（`repaint_resample_steps=2`
+            時 diffusion 部分的算力成本大約翻倍）。
         """
         device = block_features.device
         B = shape[0]
@@ -880,20 +942,26 @@ class GaussianDiffusion:
 
             # ---- 累積 forces ----
             mask_f = mask.float() if mask is not None else torch.ones(B, shape[1], device=device)
+            if force_confidence_power != 0.0:
+                conf_w = float(self.alphas_cumprod[t_cur]) ** force_confidence_power
+            else:
+                conf_w = 1.0
             deltas = []
             if t_cur >= pin_force_until_t and pin_targets is not None:
-                d = self._force_pin(x, pin_targets, pin_weights, mask_f, pin_force_strength)
+                d = self._force_pin(x, pin_targets, pin_weights, mask_f,
+                                    pin_force_strength * conf_w)
                 if d is not None: deltas.append(d)
             if t_cur >= grouping_until_t:
-                d = self._force_grouping(x, grouping_group, mask_f, grouping_force_strength)
+                d = self._force_grouping(x, grouping_group, mask_f,
+                                         grouping_force_strength * conf_w)
                 if d is not None: deltas.append(d)
             if t_cur <= repulsion_from_t and areas_norm is not None:
                 d = self._force_repulsion(x, areas_norm, mask_f,
-                                          strength=repulsion_strength)
+                                          strength=repulsion_strength * conf_w)
                 if d is not None: deltas.append(d)
             if t_cur <= boundary_from_t and areas_norm is not None:
                 d = self._force_boundary_nudge(x, boundary_code, mask_f, areas_norm,
-                                               boundary_nudge_strength)
+                                               boundary_nudge_strength * conf_w)
                 if d is not None: deltas.append(d)
 
             if deltas:
@@ -902,11 +970,34 @@ class GaussianDiffusion:
                                                clamp_bbox=clamp_bbox)
             return x
 
+        def _repaint_jump_back(x_prev, t_from_val, t_to_val):
+            """v5.14: 把 x_prev（在 t_from 這個雜訊量級）往回加噪聲跳到
+            雜訊更多的 t_to（t_to > t_from），公式跟既有 re-noise 檢查點
+            用的邊際分布一致（DDPM 前向過程 t_from -> t_to 的解析解）。"""
+            ab_from = self._extract(self.alphas_cumprod,
+                                    torch.full((B,), t_from_val, device=device, dtype=torch.long),
+                                    x_prev.shape)
+            ab_to = self._extract(self.alphas_cumprod,
+                                  torch.full((B,), t_to_val, device=device, dtype=torch.long),
+                                  x_prev.shape)
+            ratio = ab_to / ab_from
+            noise = torch.randn_like(x_prev)
+            return torch.sqrt(ratio) * x_prev + torch.sqrt(1 - ratio) * noise
+
         # ============= 主迴圈：兩段（含 Best-of-N） =============
         i = 0
         while i < len(timesteps):
             t_cur = timesteps[i]
-            x = _one_diffusion_step(x, i, t_cur)
+            if repaint_resample_steps > 1 and has_constraints:
+                for r in range(repaint_resample_steps):
+                    x_next = _one_diffusion_step(x, i, t_cur)
+                    is_last = (r == repaint_resample_steps - 1)
+                    if not is_last:
+                        x = _repaint_jump_back(x_next, timesteps[i + 1] if i + 1 < len(timesteps) else 0, t_cur)
+                    else:
+                        x = x_next
+            else:
+                x = _one_diffusion_step(x, i, t_cur)
 
             # Best-of-N + re-noise 檢查點
             # v3.9: 改成「短第二段」——re-noise 到 select 那個時間點，從 i+1 繼續，
@@ -915,9 +1006,16 @@ class GaussianDiffusion:
             if (renoise_idx is not None and i == renoise_idx - 1 and not renoise_done
                 and select_metric_fn is not None):
                 scores = select_metric_fn(x)              # (B,) 低 = 好
-                best_idx = int(scores.argmin().item())
-                # 複製 best 到所有 batch slot
-                x_best = x[best_idx:best_idx+1].expand_as(x).clone()
+                if resample_temperature is None:
+                    best_idx = int(scores.argmin().item())
+                    # 複製 best 到所有 batch slot
+                    x_best = x[best_idx:best_idx+1].expand_as(x).clone()
+                else:
+                    # v5.13: 加權重抽樣（取後放回），取代硬性收斂成單一贏家
+                    z = (scores - scores.min()) / (scores.std() + 1e-6)
+                    probs = torch.softmax(-z / resample_temperature, dim=0)
+                    resample_idx = torch.multinomial(probs, B, replacement=True)
+                    x_best = x[resample_idx].clone()
                 # Re-noise 到 select 時間點（不是 t=T），加少量噪聲
                 t_mid = timesteps[i]                       # 剛跑完 i 步，當前 t = timesteps[i]
                 alpha_mid = self._extract(self.alphas_cumprod,

@@ -603,6 +603,40 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.17 —— legalize `reinsert_sweeps`/`reinsert_grid_density`（採用，在 v5.15+v5.16 之上疊加）
+
+**背景**：延續同一套真實 median runtime 方法論，檢查 legalize
+`compact_reinsert`（對每個 block 做「拔出來、找 bbox 面積+緊密度最小的
+新位置」局部搜尋）的搜尋強度（`reinsert_sweeps` 掃幾輪、
+`reinsert_grid_density` 候選網格多細，原預設 3/12）。舊記錄（method.md
+§2.3）早就發現「搜尋強度加倍/三倍沒有幫助」，但從沒測過**降低**強度是否
+安全。
+
+**掃描結果**（34 樣本分層抽樣，`DDIM_STEPS=10`+`POST_REPEL_STEPS=10` 之上
+疊加）：`area_gap`／`hpwl_gap` 在所有測試組合下**完全沒有變化**
+（`compact_reinsert` 在真實資料上第一輪就幾乎收斂，多掃幾輪、網格切細都
+是白費），`grid_density` 降到 4 以下 real cost 打平（不再有額外好處、
+也沒有壞處，代表已經摸到 legalize 這部分計算量的地板）。最終選
+`reinsert_sweeps=1, reinsert_grid_density=4`。
+
+**完整 100 樣本官方 evaluate 確認**（兩次獨立跑）：
+
+| | run1 | run2 | 平均 |
+|---|---|---|---|
+| Total Score（中性） | 1.5350 | 1.5182 | 1.5266 |
+| Total Score（換算真實 median runtime） | 1.1381 | 1.1174 | **1.128** |
+| avg runtime | 1.47s | 1.45s | 1.46s |
+| n_infeasible | 0 | 0 | 0 |
+
+比 v5.16 的 1.1692 再進步約 **-3.5%**，兩次評估都個別優於 baseline。
+
+**決定**：**採用**。累計效果：v4 的真實分數從最初的 1.2322，經 v5.15→
+v5.16→v5.17 依序疊加，降到 **1.128**（累計 **-8.5%**），全程沒有犧牲
+任何品質（area/hpwl/V_relative 在雜訊範圍內、0/100 infeasible 從沒變過）
+——純粹是重新檢視「哪些推論端計算是真的冗餘」找到的。
+
+---
+
 ## v5.16 —— POST_REPEL_STEPS 30→10（採用，在 v5.15 之上疊加）
 
 **背景**：v5.15 確認「真實 median runtime 換算」這套方法論能挖出真實分數

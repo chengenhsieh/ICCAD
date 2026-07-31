@@ -422,6 +422,7 @@ constraint 被重新破壞的風險。
 | Mixed precision（fp16 autocast）推論 | 小模型下 dtype 轉換開銷蓋過算力節省，反而慢 20% | 不採用 |
 | 依 `ddim_steps` 等比例縮放 force-guidance 的 timestep 窗口 | 100 樣本測試前後幾乎沒有差異 | 不採用（已還原） |
 | `compact_reinsert` 搜尋強度加倍/三倍 | area gap 沒有改善（甚至略差），時間成本卻明顯增加 | 維持原設定 |
+| `reinsert_sweeps: 3→1`、`reinsert_grid_density: 12→4`（v5.17，改用真實 median runtime 換算，見 CHANGELOG.md）| 跟上一行方向一致——真實資料上第一輪就幾乎收斂，34 樣本分層抽樣下 area_gap/hpwl_gap 在所有測試組合完全不變，`grid_density` 降到 4 以下 real cost 打平（摸到這部分計算量的地板）。完整 100 樣本官方 evaluate 確認兩次，在 v5.15+v5.16 之上疊加，換算真實 median runtime 的 Total Score 再降 -3.5%（1.1692→1.128），0/100 infeasible | **採用** |
 | Legalize 用多種 tie-break 順序取最佳 bbox（legalize 版 best-of-N） | 單一輸入下不同順序确實能差到 ±10% bbox，但套用 `compact_reinsert` 後這個差異幾乎被磨平；時間成本卻是線性倍增 | 不採用（保留為可選功能） |
 | `compact_gravity`（每個 block 各自往全域重心走一小步）當額外壓縮 pass | area gap、hpwl gap、V_relative 都輕微變差，且不會處理「多個獨立衛星群共享同一條邊界鎖」這種情況 | 不採用（保留為可選功能） |
 | `compact_merge_clusters` 加入**家族協同移動**（多個衛星分量共享同一條邊界鎖時一起剛體平移）+ `rounds: 5 → 20` | 100 樣本 area gap 24.7% → **23.8%**（實質改善），legalize 最差情況時間反而下降（5.10s → 3.58s），V_relative 小幅上升（0.109 → 0.113），0/100 infeasible 不變 | **採用** |
@@ -514,27 +515,28 @@ v5.11。
 ## 最終結果（100 樣本官方 validation set）
 
 以下數字取自 `my_optimizer.py`（v4 checkpoint `model_epoch300_overlap_v4.pt`
-+ `DDIM_STEPS=10` + `POST_REPEL_STEPS=10`，v5.15／v5.16 採用後的目前
-production 設定）跑官方 `iccad2026_evaluate.py --evaluate` 的實測結果
-（兩次獨立評估平均），是目前已知最準確、最新的版本（`violations_relative`
-跟官方 100/100 精確吻合，見 §2.4／CHANGELOG.md v5.11；`DDIM_STEPS`／
-`POST_REPEL_STEPS` 調整見 CHANGELOG.md v5.15／v5.16）：
++ `DDIM_STEPS=10` + `POST_REPEL_STEPS=10` + `REINSERT_SWEEPS=1` +
+`REINSERT_GRID_DENSITY=4`，v5.15／v5.16／v5.17 採用後的目前 production
+設定）跑官方 `iccad2026_evaluate.py --evaluate` 的實測結果（兩次獨立評估
+平均），是目前已知最準確、最新的版本（`violations_relative` 跟官方
+100/100 精確吻合，見 §2.4／CHANGELOG.md v5.11；runtime 相關調整見
+CHANGELOG.md v5.15／v5.16／v5.17）：
 
 | 指標 | 數值 |
 |---|---|
 | Hard constraint 違規 | 0 / 100（zero overlap, exact preplaced/fixed shape, area ≤1% error, 皆保證滿足） |
-| Area gap（vs. optimal） | 23.06% |
-| HPWL gap（vs. optimal） | 28.64% |
-| Soft constraint 違規率（V_relative，官方精確定義） | 0.1090 |
-| 平均單樣本總時間 | 1.74s（`DDIM_STEPS=30`／`POST_REPEL_STEPS=30` 時為 2.485s，-30%） |
-| Total Score（`RuntimeFactor=1.0` 中性，官方 evaluate 直接輸出） | 1.5247 |
-| Total Score（換算 alpha-test 實際 median runtime） | **1.1692**（原始 v4 為 1.2322，累計 -5.1%） |
+| Area gap（vs. optimal） | 23.16% |
+| HPWL gap（vs. optimal） | 28.52% |
+| Soft constraint 違規率（V_relative，官方精確定義） | 0.1095 |
+| 平均單樣本總時間 | 1.46s（v5.15 之前為 2.485s，-41%） |
+| Total Score（`RuntimeFactor=1.0` 中性，官方 evaluate 直接輸出） | 1.5266 |
+| Total Score（換算 alpha-test 實際 median runtime） | **1.128**（原始 v4 為 1.2322，累計 -8.5%） |
 
 （diffusion sampling 未固定 random seed，同一組參數重跑 100 樣本時上述數字
 本身會有若干自然波動，屬於量測雜訊而非參數變化造成——這也是為何 v4.7 之後
 的驗證過程多半改用 paired 設計，見上一節。中性 runtime 版本的 Total Score
 沒有反映真實比賽的 RuntimeFactor 加成，換算 alpha-test 真實 median runtime
-的版本更接近實際競賽會拿到的分數；`DDIM_STEPS=30→10` 正是靠重新檢視這個
+的版本更接近實際競賽會拿到的分數；v5.15-v5.17 這一系列改動正是靠重新檢視這個
 換算方式才發現的改善空間，品質幾乎不受影響，純粹是 runtime 下降帶來的
 真實分數提升。）
 

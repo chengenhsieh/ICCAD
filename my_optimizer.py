@@ -80,6 +80,16 @@ class MyOptimizer(FloorplanOptimizer):
     # 1.1807 / 1.1577，平均 1.1692，比純 DDIM_STEPS=10 的 1.178 再進步
     # 約 -0.75%，0/100 infeasible。見 CHANGELOG.md v5.16。
     POST_REPEL_STEPS = 10
+    # v5.17（採用）：legalize 的 compact_reinsert 搜尋強度
+    # （reinsert_sweeps/reinsert_grid_density，原預設 3/12）。34 樣本
+    # 分層抽樣：真實資料上第一輪就幾乎收斂，area_gap/hpwl_gap 在所有測試
+    # 組合下完全不變，grid_density 降到 4 以下 real cost 打平（不再有額外
+    # 好處也沒有壞處）。選 sweeps=1/grid_density=4，完整 100 樣本官方
+    # evaluate 確認兩次（在 v5.15+v5.16 之上疊加）：real score 1.1381 /
+    # 1.1174，平均 1.128，比 v5.16 的 1.1692 再進步約 -3.5%，0/100
+    # infeasible。見 CHANGELOG.md v5.17。
+    REINSERT_SWEEPS = 1
+    REINSERT_GRID_DENSITY = 4
     # v5.0: 100-sample quasi-paired sweep found the hardcoded force-guidance
     # strengths in diffusion.py were too strong, overriding the model's own
     # learned signal. grouping_force_strength 0.015->0.030 (sweet spot; both
@@ -226,6 +236,8 @@ class MyOptimizer(FloorplanOptimizer):
             use_second_merge_pass=True,
             use_cluster_merge=True,
             hpwl_slack_ratio=5.0,
+            reinsert_sweeps=self.REINSERT_SWEEPS,
+            reinsert_grid_density=self.REINSERT_GRID_DENSITY,
             verbose=self.verbose,
         )
 

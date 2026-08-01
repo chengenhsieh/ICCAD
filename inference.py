@@ -97,6 +97,9 @@ def generate_floorplan(
     # ddim_sample_with_forces 的 repaint_resample_steps docstring。
     # 預設 1 = 關閉，跟改動前完全等價。
     repaint_resample_steps=1,
+    # v5.18: 只有用 use_self_cond=True 訓練出來的 checkpoint 才能開，
+    # 見 diffusion.py: ddim_sample_with_forces 的 use_self_cond docstring。
+    use_self_cond=False,
 ):
     """
     Args:
@@ -351,6 +354,7 @@ def generate_floorplan(
             force_confidence_power=force_confidence_power,
             resample_temperature=resample_temperature,
             repaint_resample_steps=repaint_resample_steps,
+            use_self_cond=use_self_cond,
         )
 
     preplaced_indices = [i for i in range(k) if preplaced_mask_np[i]]
@@ -924,7 +928,7 @@ def run_one_sample(sample_idx, official, model, config, device,
                    pin_force_strength=0.02, grouping_force_strength=0.030,
                    boundary_nudge_strength=0.025, repulsion_strength=0.0375,
                    force_confidence_power=0.0, resample_temperature=None,
-                   repaint_resample_steps=1,
+                   repaint_resample_steps=1, use_self_cond=False,
                    tie_break_modes=None, use_gravity=False, gravity_iters=40,
                    use_cluster_merge=True, hpwl_slack_ratio=5.0, use_snap_boundary=False,
                    boundary_hpwl_slack_ratio=0.0,
@@ -1080,6 +1084,7 @@ def run_one_sample(sample_idx, official, model, config, device,
         force_confidence_power=force_confidence_power,
         resample_temperature=resample_temperature,
         repaint_resample_steps=repaint_resample_steps,
+        use_self_cond=use_self_cond,
     )
 
     # v5.7（實驗用）：把額外 checkpoint 的候選池併進來，一起重新選最好的

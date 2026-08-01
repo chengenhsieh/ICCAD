@@ -603,6 +603,60 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.18 —— 訓練端 Self-Conditioning（不採用）
+
+**背景**：查文獻找訓練端改善方向，找到 Self-Conditioning（Chen, Zhang &
+Hinton, 2022, "Analog Bits: Generating Discrete Data using Diffusion
+Models with Self-Conditioning"）——讓模型在訓練時看到「自己上一步的
+x0_pred 估計」當額外輸入，訓練時以 50% 機率先做一次 no-grad forward（用
+零向量當自我調節輸入）算出估計、detach 後餵回真正的 forward；推論時把
+上一步真的算出的 x0_pred 接到下一步。概念上讓模型能「修正」估計而非每步
+從頭生成。
+
+**實作**：`model.py: Denoiser` 新增 `self_cond_proj`（2 層 MLP，
+`config.use_self_cond=True` 時才建立，+66,816 個參數），以加法方式疊加在
+`state_proj` 的輸出上——跟 v5.10 `coord_sincos` 同一種掛法，不改
+`state_proj` 本身形狀（維持跟舊 checkpoint 相容）。`diffusion.py:
+training_loss` 新增 `use_self_cond` 參數實作上述 50% 機率訓練方案；
+`ddim_sample_with_forces` 新增同名參數，把 x0_pred 跨步傳遞，在
+best-of-N re-noise checkpoint 重置（batch 身分跟雜訊量級都變了，沿用舊
+self_cond 會誤導模型）。單元測試驗證：`use_self_cond=False`（訓練與
+推論兩條路徑）逐位元跟改動前相同；`True` 時梯度正確流過新模組、無
+NaN/inf；用真實 dataloader 跑了幾步訓練＋backward＋optimizer step 全部
+正常。
+
+使用者要求跳過 30 epoch 短跑，直接投入完整 300 epoch 訓練（
+`model_epoch300_overlap_v8.pt`，QK-norm/Min-SNR/coord_sincos 全部維持
+`False` 避免混淆變因）。訓練完成後 val_loss **0.1425**，比 v4 的
+**0.1026** 明顯高——第一個警訊。
+
+**驗證**：
+
+- 100 樣本 paired inference 對比 v4（都用目前 production 推論設定
+  `DDIM_STEPS=10`／`POST_REPEL_STEPS=10`／`REINSERT_SWEEPS=1`／
+  `REINSERT_GRID_DENSITY=4`，v8 額外開 `use_self_cond=True`）：area_gap
+  小幅較好（0.2326→0.2266），hpwl_gap／V_relative 小幅較差，**raw
+  overlap 明顯較差**（1555.1→**1930.4，+24%**）——這是 legalize 前最
+  直接反映模型生成品質的指標。cost-proxy **+0.28%**（55/100 較好、
+  45/100 較差，接近打平），訊號強度遠不如 QK-norm（v5.9）或 repaint
+  （v5.14）當初的 paired 結果。
+- 訊號雖弱，使用者要求仍跑一次官方 evaluate 確認：real score（換算真實
+  median runtime）**1.1477**，比目前 production 的 **1.128** 差
+  **+1.75%**，avg runtime 也較高（1.66s vs 1.46s，+14%，`self_cond_proj`
+  每步都要多算一次，不是免費的）。方向跟 paired 測試、跟 val_loss 三個
+  獨立訊號完全一致。
+
+**決定**：**不採用**（`my_optimizer.py` 維持 `model_epoch300_overlap_
+v4.pt`，`USE_SELF_COND=False`）。三個獨立訊號（val_loss、100 樣本
+paired、官方 evaluate）方向一致指向沒有真實幫助，不需要更多確認。推測
+原因：self-conditioning 的訓練方案讓「沒有自我調節資訊」那 50% 的
+sub-task 變得更難（模型要學會在資訊更少時也表現好），這可能稀釋了
+300 epoch 裡花在核心去噪任務上的有效學習量，跟 v5.9 Min-SNR 被拒絕的
+機制不同，但都是「改變了梯度預算的分配方式，副作用大於預期效益」的
+同一類故事。機制與 `model_epoch300_overlap_v8.pt` checkpoint 保留備用。
+
+---
+
 ## v5.17 —— legalize `reinsert_sweeps`/`reinsert_grid_density`（採用，在 v5.15+v5.16 之上疊加）
 
 **背景**：延續同一套真實 median runtime 方法論，檢查 legalize

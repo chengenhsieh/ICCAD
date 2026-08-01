@@ -156,7 +156,7 @@ def train(config):
     use_amp = getattr(config, "use_amp", True) and device.type == "cuda"
 
     os.makedirs(config.output_dir, exist_ok=True)
-    loss_png_path = os.path.join(config.output_dir, "loss_curve_300epoch_overlap_v7.png")
+    loss_png_path = os.path.join(config.output_dir, "loss_curve_300epoch_overlap_v8.png")
 
     # In-memory history（取代 csv），畫 loss curve 用
     history = {k: [] for k in [
@@ -187,6 +187,7 @@ def train(config):
     print("v5.10: use_coord_sincos={} (n_freqs={})".format(
         getattr(config, "use_coord_sincos", False),
         getattr(config, "coord_n_freqs", None)))
+    print("v5.18: use_self_cond={}".format(getattr(config, "use_self_cond", False)))
 
     # -- 載入資料 --
     print("Loading FloorSet datasets...")
@@ -238,6 +239,7 @@ def train(config):
     # v5.9：跟 soft_weights 不同，Min-SNR 不受 soft_loss_warmup_epochs
     # 影響（作用在主要去噪 loss，從 epoch 1 就該套用），所以在迴圈外算一次。
     min_snr_gamma = config.min_snr_gamma if getattr(config, "use_min_snr_main_loss", False) else None
+    use_self_cond = getattr(config, "use_self_cond", False)
 
     for epoch in range(1, config.epochs + 1):
         model.train()
@@ -266,7 +268,8 @@ def train(config):
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=use_amp):
                 loss, info = diffusion.training_loss(model, batch, soft_weights=soft_w,
-                                                      min_snr_gamma=min_snr_gamma)
+                                                      min_snr_gamma=min_snr_gamma,
+                                                      use_self_cond=use_self_cond)
 
             if use_amp:
                 scaler.scale(loss).backward()
@@ -309,7 +312,7 @@ def train(config):
         epoch_overlap = (ovr_sum / nb).item()   # v4.0
         elapsed = time.time() - t_start
 
-        val_loss = validate(model, diffusion, val_loader, device, use_amp)
+        val_loss = validate(model, diffusion, val_loader, device, use_amp, use_self_cond)
         cur_lr = scheduler.get_last_lr()[0]
 
         print(
@@ -342,7 +345,7 @@ def train(config):
         if is_best or epoch % config.save_interval == 0 or epoch == config.epochs:
             ema.apply_shadow()
             tag = "best" if is_best else "epoch{}".format(epoch)
-            path = os.path.join(config.output_dir, "model_{}_overlap_v7.pt".format(tag))
+            path = os.path.join(config.output_dir, "model_{}_overlap_v8.pt".format(tag))
             torch.save({
                 "epoch": epoch,
                 "global_step": global_step,
@@ -365,14 +368,15 @@ def train(config):
 
 
 @torch.no_grad()
-def validate(model, diffusion, val_loader, device, use_amp=False):
+def validate(model, diffusion, val_loader, device, use_amp=False, use_self_cond=False):
     """validation 只看去噪 MSE（不加 soft loss）。"""
     model.eval()
     total_loss = torch.zeros((), device=device)
     n = 0
     for batch in val_loader:
         with torch.cuda.amp.autocast(enabled=use_amp):
-            loss, info = diffusion.training_loss(model, batch, soft_weights=None)
+            loss, info = diffusion.training_loss(model, batch, soft_weights=None,
+                                                  use_self_cond=use_self_cond)
         total_loss += info["mse"]
         n += 1
     model.train()
@@ -387,14 +391,16 @@ if __name__ == "__main__":
     # config.encoder_layers = 4
     # config.denoiser_layers = 6
     # config.epochs = 60
-    # 正式訓練（v7，300 epoch）：v5.10 30-epoch 短跑結論——raw overlap
-    # -5.1%、20/30 樣本較好（接近 2:1，量級接近 QK-norm 跑滿 300 epoch 才
-    # 達到的效果），area_gap/hpwl_gap 比較模糊（接近銅板），訊號沒有
-    # QK-norm 短跑那次乾淨，但這個改動只加約 2000 個參數（一個小 MLP），
-    # 不像 QK-norm 有量測到的真實 +21% 單步計算成本，效益/成本比可能更好，
-    # 值得投入完整訓練驗證。QK-norm/Min-SNR 維持 False，避免混淆變因。
+    # 正式訓練（v8，300 epoch）：v5.18 Self-Conditioning（Chen et al. 2022
+    # "Analog Bits"）。使用者要求直接跑完整 300 epoch，跳過 30 epoch 短跑
+    # 篩選這一步——理由：機制本身架構風險低（只加一個小 MLP、additive
+    # 疊加，跟 v5.10 coord_sincos 同一種掛法），且訓練時平均只多 ~50% 的
+    # forward 次數（不像 QK-norm 有結構性的每步固定開銷）。其餘 QK-norm/
+    # Min-SNR/coord_sincos 全部維持 False，避免混淆變因，讓 self-cond
+    # 的效果能被乾淨獨立驗證（v5.10 coord_sincos 最終沒有採用，不沿用）。
     # epochs/soft_loss_warmup_epochs 用 Config 預設值（300/10），不用再蓋。
     config.use_qk_norm = False
     config.use_min_snr_main_loss = False
-    config.use_coord_sincos = True            # v5.10：30 epoch 短跑驗證過，正式訓練沿用
+    config.use_coord_sincos = False
+    config.use_self_cond = True               # v5.18
     train(config)

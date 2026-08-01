@@ -260,7 +260,8 @@ class GaussianDiffusion:
     # ----------------------------------------------------------------
     # Training loss
     # ----------------------------------------------------------------
-    def training_loss(self, model, batch, soft_weights=None, min_snr_gamma=None):
+    def training_loss(self, model, batch, soft_weights=None, min_snr_gamma=None,
+                       use_self_cond=False):
         """
         Args:
             model: FloorplanDiffusionModel
@@ -304,6 +305,15 @@ class GaussianDiffusion:
                           gamma 用論文預設值 5，不當成需要另外掃的超參數
                           （見呼叫處 config.py:
                           min_snr_gamma）。
+            use_self_cond: False（預設）= 不做 self-conditioning，`model`
+                          forward 一次，`self_cond=None`（Denoiser 內部視為
+                          零向量），跟改動前完全等價。True 時每個 batch 以
+                          50% 機率額外做一次 no-grad forward（用零向量當
+                          self_cond）取得 x0_pred 估計、detach 後當這個
+                          batch 真正 forward 的 self_cond；另外 50% 機率
+                          維持零向量、省下那次多的 forward（訓練時平均
+                          1.5x forward 次數）。見 model.py: Denoiser 的
+                          self_cond_proj 說明。
         Returns:
             loss (scalar), info (dict)
 
@@ -333,7 +343,19 @@ class GaussianDiffusion:
         B = x0.shape[0]
         t = torch.randint(0, self.T, (B,), device=device)
         x_t, noise = self.q_sample(x0, t)
-        noise_pred = model(x_t, block_features, conn_weights, t, mask, group_bias)
+
+        self_cond = None
+        if use_self_cond and torch.rand(()).item() < 0.5:
+            with torch.no_grad():
+                noise_pred_sc = model(x_t, block_features, conn_weights, t, mask, group_bias,
+                                      self_cond=None)
+                alpha_bar_t = self._extract(self.alphas_cumprod, t, x_t.shape)
+                x0_pred_sc = (x_t - torch.sqrt(1 - alpha_bar_t) * noise_pred_sc) / \
+                             torch.sqrt(alpha_bar_t)
+            self_cond = x0_pred_sc.detach()
+
+        noise_pred = model(x_t, block_features, conn_weights, t, mask, group_bias,
+                           self_cond=self_cond)
 
         # 主要去噪 MSE loss（masked）
         mask_expanded = mask.unsqueeze(-1).float()
@@ -810,6 +832,9 @@ class GaussianDiffusion:
         resample_temperature=None,
         # v5.14: 純推論端實驗，見下方 docstring 說明
         repaint_resample_steps=1,
+        # v5.18: 只有 model 是用 use_self_cond=True 訓練出來的才能開，
+        # 見下方 docstring 說明
+        use_self_cond=False,
     ):
         """
         GNN-style force-guided diffusion sampler。
@@ -878,6 +903,15 @@ class GaussianDiffusion:
             沒有硬限制的樣本不受影響、也不用付出額外計算成本。代價：
             model forward 次數約略乘上這個倍數（`repaint_resample_steps=2`
             時 diffusion 部分的算力成本大約翻倍）。
+
+        use_self_cond (v5.18，預設 False = 關閉，跟改動前完全等價):
+            只有用 `config.use_self_cond=True` 訓練出來的 checkpoint 才能
+            開這個——把上一步算出的 x0_pred 當自我調節訊號傳給下一步的
+            model forward（第一步跟每次 re-noise checkpoint 之後視為零
+            向量，見 model.py: Denoiser 的 self_cond_proj 說明）。訓練/
+            推論的自我調節資訊來源不同（訓練是 50% 機率的額外 no-grad
+            forward 估計，推論是上一步真的算出的結果）符合 Chen et al.
+            2022 原始設計——訓練時只是在「近似」推論時真正會發生的情況。
         """
         device = block_features.device
         B = shape[0]
@@ -900,16 +934,21 @@ class GaussianDiffusion:
         x = torch.randn(shape, device=device)
         renoise_done = False
 
-        def _one_diffusion_step(x, i, t_cur):
-            """跑單一 reverse step + 套所有 mid-step 機制。"""
+        def _one_diffusion_step(x, i, t_cur, self_cond):
+            """跑單一 reverse step + 套所有 mid-step 機制。
+            回傳 (x, next_self_cond)——next_self_cond 是這步的 x0_pred
+            （use_self_cond=True 時給下一步當自我調節輸入，否則恆為
+            None）。"""
             t = torch.full((B,), t_cur, device=device, dtype=torch.long)
             if use_amp:
                 with torch.autocast(device_type=device.type, dtype=torch.float16,
                                     enabled=(device.type == "cuda")):
-                    noise_pred = model(x, block_features, conn_weights, t, mask, group_bias)
+                    noise_pred = model(x, block_features, conn_weights, t, mask, group_bias,
+                                       self_cond=self_cond)
                 noise_pred = noise_pred.float()
             else:
-                noise_pred = model(x, block_features, conn_weights, t, mask, group_bias)
+                noise_pred = model(x, block_features, conn_weights, t, mask, group_bias,
+                                   self_cond=self_cond)
             alpha_bar_t = self._extract(self.alphas_cumprod, t, x.shape)
             if i + 1 < len(timesteps):
                 t_prev_val = timesteps[i + 1]
@@ -968,7 +1007,8 @@ class GaussianDiffusion:
                 x = self._apply_forces_clipped(x, deltas, preplaced_mask, fixed_mask,
                                                max_step=max_step_per_iter,
                                                clamp_bbox=clamp_bbox)
-            return x
+            next_self_cond = x0_pred.detach() if use_self_cond else None
+            return x, next_self_cond
 
         def _repaint_jump_back(x_prev, t_from_val, t_to_val):
             """v5.14: 把 x_prev（在 t_from 這個雜訊量級）往回加噪聲跳到
@@ -985,19 +1025,23 @@ class GaussianDiffusion:
             return torch.sqrt(ratio) * x_prev + torch.sqrt(1 - ratio) * noise
 
         # ============= 主迴圈：兩段（含 Best-of-N） =============
+        # v5.18: self_cond 是「上一步」的 x0_pred，跨 step 累積傳遞，
+        # use_self_cond=False 時恆為 None（Denoiser 內部視為零向量，
+        # 跟改動前完全等價）。
+        self_cond = None
         i = 0
         while i < len(timesteps):
             t_cur = timesteps[i]
             if repaint_resample_steps > 1 and has_constraints:
                 for r in range(repaint_resample_steps):
-                    x_next = _one_diffusion_step(x, i, t_cur)
+                    x_next, self_cond = _one_diffusion_step(x, i, t_cur, self_cond)
                     is_last = (r == repaint_resample_steps - 1)
                     if not is_last:
                         x = _repaint_jump_back(x_next, timesteps[i + 1] if i + 1 < len(timesteps) else 0, t_cur)
                     else:
                         x = x_next
             else:
-                x = _one_diffusion_step(x, i, t_cur)
+                x, self_cond = _one_diffusion_step(x, i, t_cur, self_cond)
 
             # Best-of-N + re-noise 檢查點
             # v3.9: 改成「短第二段」——re-noise 到 select 那個時間點，從 i+1 繼續，
@@ -1024,6 +1068,10 @@ class GaussianDiffusion:
                 noise = torch.randn_like(x_best)
                 x = torch.sqrt(alpha_mid) * x_best + torch.sqrt(1 - alpha_mid) * noise
                 renoise_done = True
+                # v5.18: re-noise 換了 batch 內容（複製/重抽）也換了雜訊
+                # 量級，上一步的 self_cond 對應的是舊的 batch 身分，直接
+                # 沿用會誤導模型，重置成零向量（下一步視為「第一步」）
+                self_cond = None
                 # i 繼續往下走，不重置
             i += 1
 

@@ -116,6 +116,17 @@ class Config:
     use_coord_sincos: bool = False
     coord_n_freqs: int = 16
 
+    # v5.18（實驗用，尚未訓練驗證，預設關閉）：Self-Conditioning
+    # （Chen, Zhang & Hinton, 2022, "Analog Bits: Generating Discrete Data
+    # using Diffusion Models with Self-Conditioning"）。訓練時以 50% 機率
+    # 先用零向量做一次 no-grad forward 算出 x0_pred 估計，detach 後當
+    # 「自我調節」訊號餵回模型做真正的 forward（另外 50% 機率直接用零向量,
+    # 省掉那次多的 forward）；推論時把上一步真的算出的 x0_pred 接到下一步。
+    # 讓模型能「修正」上一步的估計而非每步從頭生成，見 model.py: Denoiser
+    # 的 self_cond_proj 說明。會新增可學習參數，且訓練時平均多 ~50% 的
+    # forward 次數，舊 checkpoint 不能直接載入這個設定，需要重新訓練。
+    use_self_cond: bool = False
+
     # -- Attention group bias（v3 新增）--
     use_group_attention_bias: bool = True
 

@@ -186,14 +186,29 @@ class BlockEncoder(nn.Module):
 class Denoiser(nn.Module):
     def __init__(self, d_model, n_heads, n_layers, dim_ff, dropout=0.1,
                  use_group_bias=True, use_qk_norm=False, use_coord_sincos=False,
-                 coord_n_freqs=16):
+                 coord_n_freqs=16, use_self_cond=False):
         super().__init__()
         self.use_coord_sincos = use_coord_sincos
+        self.use_self_cond = use_self_cond
         self.state_proj = nn.Sequential(
             nn.Linear(3, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
+        if use_self_cond:
+            # v5.18（Self-Conditioning, Chen et al. 2022 "Analog Bits"）：
+            # 把上一步（或訓練時以 50% 機率算出的）x0_pred 當額外輸入，用
+            # 獨立的小 MLP 投影後以加法疊加在 state_proj 的輸出上——跟
+            # v5.10 coord_sincos 同一種疊加方式，不改 state_proj 本身的
+            # input dim（維持跟舊 checkpoint 的 state_proj 權重形狀相容）。
+            # 沒有自我調節資訊時（訓練 50% 機率、推論第一步）传入零向量，
+            # 這個分支此時輸出等於 self_cond_proj(0)，是一個固定、可學習
+            # 的 bias，不是恆零。
+            self.self_cond_proj = nn.Sequential(
+                nn.Linear(3, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, d_model),
+            )
         if use_coord_sincos:
             # v5.10：x/y 各自算一份 Fourier 座標編碼，串起來投影回 d_model，
             #用加法疊加在 state_proj 的輸出上（跟 cond_emb/t_emb 同一種
@@ -221,9 +236,14 @@ class Denoiser(nn.Module):
             nn.Linear(d_model, 3),
         )
 
-    def forward(self, noisy_state, cond_emb, t, conn_weights, mask=None, group_bias=None):
+    def forward(self, noisy_state, cond_emb, t, conn_weights, mask=None, group_bias=None,
+                self_cond=None):
         h = self.state_proj(noisy_state)
         h = h + cond_emb
+        if self.use_self_cond:
+            if self_cond is None:
+                self_cond = torch.zeros_like(noisy_state)
+            h = h + self.self_cond_proj(self_cond)
         if self.use_coord_sincos:
             x_coord = noisy_state[..., 0]
             y_coord = noisy_state[..., 1]
@@ -263,12 +283,14 @@ class FloorplanDiffusionModel(nn.Module):
             use_qk_norm=use_qk_norm,
             use_coord_sincos=getattr(config, "use_coord_sincos", False),
             coord_n_freqs=getattr(config, "coord_n_freqs", 16),
+            use_self_cond=getattr(config, "use_self_cond", False),
         )
 
     def forward(self, noisy_state, block_features, conn_weights, t, mask=None,
-                group_bias=None):
+                group_bias=None, self_cond=None):
         cond_emb = self.encoder(block_features, conn_weights, mask, group_bias)
-        noise_pred = self.denoiser(noisy_state, cond_emb, t, conn_weights, mask, group_bias)
+        noise_pred = self.denoiser(noisy_state, cond_emb, t, conn_weights, mask, group_bias,
+                                   self_cond=self_cond)
         if mask is not None:
             noise_pred = noise_pred * mask.unsqueeze(-1).float()
         return noise_pred

@@ -60,6 +60,12 @@ class MyOptimizer(FloorplanOptimizer):
     # diffusion-side force-strength tuning). ~2.5s/sample avg, 0/100
     # infeasible; see the evaluate run for area/hpwl/V_rel.
     CHECKPOINT_NAME = "model_epoch300_overlap_v4.pt"
+    # v5.18（不採用，見 CHANGELOG.md）：Self-Conditioning。100 樣本 paired
+    # 測試接近打平甚至略負（cost-proxy +0.28%，raw overlap +24% 明顯變差），
+    # 訓練時 val_loss 也比 v4 高（0.1425 vs 0.1026），兩個獨立訊號方向
+    # 一致。官方 evaluate 確認：real score 1.1477，比目前 production 的
+    # 1.128 差 +1.75%，avg runtime 也較高（1.66s vs 1.46s）。維持關閉。
+    USE_SELF_COND = False
     # v5.15（採用）：v4 原本平均 RuntimeFactor^0.3 約 0.837，離公式下限 0.7
     # 還有 16% 空間沒被利用到——DDIM_STEPS=30 從沒被系統性掃過。34 樣本
     # 分層抽樣（真實 median runtime 換算）發現從 30 降到 4 real cost 持續
@@ -223,6 +229,7 @@ class MyOptimizer(FloorplanOptimizer):
             repulsion_strength=self.REPULSION_STRENGTH,
             force_confidence_power=self.FORCE_CONFIDENCE_POWER,
             repaint_resample_steps=self.REPAINT_RESAMPLE_STEPS,
+            use_self_cond=self.USE_SELF_COND,
         )
 
         legalized = legalize_result(

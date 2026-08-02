@@ -39,12 +39,74 @@ def _decode_boundary_bits(code):
     return left, right, top, bottom
 
 
+# ============================================================
+# v5.19: 幾何 D4 對稱資料增強（見 config.use_geo_augment）
+# ============================================================
+# Floorplan 本身沒有全域方向偏好（旋轉/翻轉整個佈局，所有幾何約束——
+# overlap、preplaced 相對位置、boundary 對齊、cluster 相鄰、MIB 同尺寸——
+# 都還是合法的同一個解），是幾乎零成本的資料增強：訓練時對每個樣本隨機挑
+# D4 群（4 個旋轉 x 2 個鏡射 = 8 個元素，含 identity）的其中一個，套用到
+# (x, y, w, h) bbox、pin 座標、boundary bitmask 上，讓有效訓練資料量乘 8
+# 倍。以下函式全部作用在增強之前的「原始」座標系（`__getitem__` 裡
+# canvas 歸一化之前），套用完後續的 canvas/normalize 邏輯完全不變、
+# 自動對新的（已旋轉/翻轉的）bounding box 重新算 canvas 範圍。
+#
+# 座標慣例：bbox 用 (x, y) = 左下角 + (w, h) 尺寸（見 __getitem__ 開頭
+# gt_x/gt_y 的定義——test path 明確取 polygon 的 min corner）。轉換公式
+# 是圍繞原點的標準仿射旋轉/鏡射，推導見 CHANGELOG.md v5.19：
+#   flip_h（左右鏡射）：x' = -x - w，y/w/h 不變，L<->R 互換
+#   rot_k 次「逆時針 90 度」點旋轉 (px,py)->(-py,px)：
+#     x',y',w',h' = -(y+h), x, h, w
+#     boundary bits 依 LEFT->BOTTOM->RIGHT->TOP->LEFT 循環置換（用點旋轉
+#     公式直接對 canvas 邊界逐一代入座標驗證過，不是憑直覺猜的方向——
+#     整個 canvas 的 x range 轉成新 canvas 的 y range，所以「touch 最小
+#     x（LEFT）」轉成「touch 最小 y（BOTTOM）」，而不是直覺上的 TOP，
+#     細節見 CHANGELOG.md v5.19 的推導與交叉驗證腳本）
+def _augment_bbox(x, y, w, h, flip_h, rot_k):
+    """對 bbox 陣列（bottom-left corner + size）套用 D4 變換。"""
+    if flip_h:
+        x = -x - w
+    for _ in range(rot_k % 4):
+        x, y, w, h = -(y + h), x, h, w
+    return x, y, w, h
+
+
+def _augment_point(px, py, flip_h, rot_k):
+    """對點座標（pin 位置，無 extent）套用同一個 D4 變換。"""
+    if flip_h:
+        px = -px
+    for _ in range(rot_k % 4):
+        px, py = -py, px
+    return px, py
+
+
+def _augment_boundary_code(codes, flip_h, rot_k):
+    """對 boundary bitmask 陣列（bit0=L,bit1=R,bit2=T,bit3=B）套用同一個
+    D4 變換：flip_h 讓 L<->R 互換；每次「逆時針 90 度」點旋轉讓
+    LEFT->BOTTOM->RIGHT->TOP->LEFT 循環置換（見上方模組說明的推導，跟
+    `_augment_bbox`／`_augment_point` 用同一個旋轉方向，數值交叉驗證過）。
+    """
+    codes = codes.astype(np.int64)
+    l = codes & 1
+    r = (codes >> 1) & 1
+    t = (codes >> 2) & 1
+    b = (codes >> 3) & 1
+    if flip_h:
+        l, r = r, l
+    for _ in range(rot_k % 4):
+        l, t, r, b = t, r, b, l
+    return (l | (r << 1) | (t << 2) | (b << 3)).astype(np.int64)
+
+
 class FloorplanDataset(Dataset):
 
-    def __init__(self, official_dataset, max_blocks=120, is_test=False):
+    def __init__(self, official_dataset, max_blocks=120, is_test=False, augment=False):
         self.official = official_dataset
         self.max_blocks = max_blocks
         self.is_test = is_test
+        # v5.19（預設關閉，跟改動前完全等價）：只在訓練（非 is_test）時對
+        # 每個樣本隨機套用一個 D4 幾何變換，見模組頂端 _augment_* 說明。
+        self.augment = augment
 
     def __len__(self):
         return len(self.official)
@@ -87,6 +149,21 @@ class FloorplanDataset(Dataset):
             gt_x = fp_sol[:k, 2].numpy().astype(np.float32)
             gt_y = fp_sol[:k, 3].numpy().astype(np.float32)
 
+        # v5.19: 幾何 D4 增強——在算 canvas 範圍之前套用，讓後續的
+        # canvas/normalize 邏輯自動對新的 bbox 重新算範圍。boundary_code
+        # 的對應變換在下面 constraints 解析區塊套用（同一組 flip_h/rot_k）。
+        boundary_aug = None
+        if self.augment and not self.is_test and k > 0:
+            flip_h = bool(np.random.randint(2))
+            rot_k = int(np.random.randint(4))
+            gt_x, gt_y, gt_w, gt_h = _augment_bbox(gt_x, gt_y, gt_w, gt_h, flip_h, rot_k)
+            if pins_pos is not None and len(pins_pos) > 0:
+                pins_np = pins_pos.numpy().astype(np.float32).copy()
+                pins_np[:, 0], pins_np[:, 1] = _augment_point(
+                    pins_np[:, 0], pins_np[:, 1], flip_h, rot_k)
+                pins_pos = torch.from_numpy(pins_np)
+            boundary_aug = (flip_h, rot_k)
+
         # -- Canvas & 歸一化 --
         if k == 0:
             canvas_w, canvas_h = 1.0, 1.0
@@ -124,6 +201,11 @@ class FloorplanDataset(Dataset):
             mib_group_arr[:k]     = cons_np[:, 2].astype(np.int64)   # 組別 ID（保留！）
             cluster_group_arr[:k] = cons_np[:, 3].astype(np.int64)   # 組別 ID（保留！）
             boundary_code_arr[:k] = cons_np[:, 4].astype(np.int64)   # bitmask（保留！）
+            if boundary_aug is not None:
+                # v5.19：跟上面 bbox/pin 用同一組 flip_h/rot_k，見模組頂端
+                # _augment_boundary_code 說明
+                boundary_code_arr[:k] = _augment_boundary_code(
+                    boundary_code_arr[:k], *boundary_aug)
 
             # 向量化 boundary bit 解碼：對 (N,) 的 bitmask 直接做 bitwise AND
             codes = boundary_code_arr   # (N,) int64
@@ -249,8 +331,9 @@ class FloorplanDataset(Dataset):
 
 
 def create_dataloader(official_dataset, batch_size=64, max_blocks=120,
-                      shuffle=True, num_workers=0, is_test=False):
-    dataset = FloorplanDataset(official_dataset, max_blocks=max_blocks, is_test=is_test)
+                      shuffle=True, num_workers=0, is_test=False, augment=False):
+    dataset = FloorplanDataset(official_dataset, max_blocks=max_blocks, is_test=is_test,
+                               augment=augment)
     kwargs = dict(
         batch_size=batch_size,
         shuffle=shuffle,

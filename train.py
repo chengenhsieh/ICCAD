@@ -156,7 +156,7 @@ def train(config):
     use_amp = getattr(config, "use_amp", True) and device.type == "cuda"
 
     os.makedirs(config.output_dir, exist_ok=True)
-    loss_png_path = os.path.join(config.output_dir, "loss_curve_300epoch_overlap_v8.png")
+    loss_png_path = os.path.join(config.output_dir, "loss_curve_300epoch_overlap_v9.png")
 
     # In-memory history（取代 csv），畫 loss curve 用
     history = {k: [] for k in [
@@ -188,6 +188,7 @@ def train(config):
         getattr(config, "use_coord_sincos", False),
         getattr(config, "coord_n_freqs", None)))
     print("v5.18: use_self_cond={}".format(getattr(config, "use_self_cond", False)))
+    print("v5.19: use_geo_augment={}".format(getattr(config, "use_geo_augment", False)))
 
     # -- 載入資料 --
     print("Loading FloorSet datasets...")
@@ -203,6 +204,7 @@ def train(config):
         train_official, batch_size=config.batch_size,
         max_blocks=config.max_blocks, shuffle=True,
         num_workers=num_workers, is_test=False,
+        augment=getattr(config, "use_geo_augment", False),
     )
     val_loader = create_dataloader(
         val_official, batch_size=config.batch_size,
@@ -345,7 +347,7 @@ def train(config):
         if is_best or epoch % config.save_interval == 0 or epoch == config.epochs:
             ema.apply_shadow()
             tag = "best" if is_best else "epoch{}".format(epoch)
-            path = os.path.join(config.output_dir, "model_{}_overlap_v8.pt".format(tag))
+            path = os.path.join(config.output_dir, "model_{}_overlap_v9.pt".format(tag))
             torch.save({
                 "epoch": epoch,
                 "global_step": global_step,
@@ -391,16 +393,17 @@ if __name__ == "__main__":
     # config.encoder_layers = 4
     # config.denoiser_layers = 6
     # config.epochs = 60
-    # 正式訓練（v8，300 epoch）：v5.18 Self-Conditioning（Chen et al. 2022
-    # "Analog Bits"）。使用者要求直接跑完整 300 epoch，跳過 30 epoch 短跑
-    # 篩選這一步——理由：機制本身架構風險低（只加一個小 MLP、additive
-    # 疊加，跟 v5.10 coord_sincos 同一種掛法），且訓練時平均只多 ~50% 的
-    # forward 次數（不像 QK-norm 有結構性的每步固定開銷）。其餘 QK-norm/
-    # Min-SNR/coord_sincos 全部維持 False，避免混淆變因，讓 self-cond
-    # 的效果能被乾淨獨立驗證（v5.10 coord_sincos 最終沒有採用，不沿用）。
-    # epochs/soft_loss_warmup_epochs 用 Config 預設值（300/10），不用再蓋。
+    # 正式訓練（v9，300 epoch）：v5.19 幾何 D4 對稱資料增強。30 epoch 短跑
+    # 結論——四項指標全部同向變好，raw overlap -12.8%（28/30 樣本較好，
+    # 是這個 session 目前 paired 測試最乾淨的一次），cost-proxy -5.56%
+    # （24/30 較好）。純訓練端技巧、不新增可學習參數、推論成本完全不變
+    # （不像 repaint 那樣有隱藏 runtime 代價），值得投入完整訓練驗證。
+    # 其餘 QK-norm/Min-SNR/coord_sincos/self-cond 全部維持 False，避免
+    # 混淆變因。epochs/soft_loss_warmup_epochs 用 Config 預設值
+    # （300/10），不用再蓋。
     config.use_qk_norm = False
     config.use_min_snr_main_loss = False
     config.use_coord_sincos = False
-    config.use_self_cond = True               # v5.18
+    config.use_self_cond = False
+    config.use_geo_augment = True             # v5.19
     train(config)

@@ -116,16 +116,20 @@ class Config:
     use_coord_sincos: bool = False
     coord_n_freqs: int = 16
 
-    # v5.18（實驗用，尚未訓練驗證，預設關閉）：Self-Conditioning
-    # （Chen, Zhang & Hinton, 2022, "Analog Bits: Generating Discrete Data
-    # using Diffusion Models with Self-Conditioning"）。訓練時以 50% 機率
-    # 先用零向量做一次 no-grad forward 算出 x0_pred 估計，detach 後當
-    # 「自我調節」訊號餵回模型做真正的 forward（另外 50% 機率直接用零向量,
-    # 省掉那次多的 forward）；推論時把上一步真的算出的 x0_pred 接到下一步。
-    # 讓模型能「修正」上一步的估計而非每步從頭生成，見 model.py: Denoiser
-    # 的 self_cond_proj 說明。會新增可學習參數，且訓練時平均多 ~50% 的
-    # forward 次數，舊 checkpoint 不能直接載入這個設定，需要重新訓練。
+    # v5.18（不採用，見 CHANGELOG.md）：Self-Conditioning（Chen, Zhang &
+    # Hinton, 2022, "Analog Bits"）。跑完整 300 epoch 驗證，val_loss 比 v4
+    # 高（0.1425 vs 0.1026）、100 樣本 paired raw overlap 明顯變差
+    # （+24%）、官方 evaluate 真實分數也比目前 production 差（+1.75%），
+    # 三個獨立訊號方向一致，確認不採用。機制與 checkpoint 保留備用。
     use_self_cond: bool = False
+
+    # v5.19（實驗用，尚未訓練驗證，預設關閉）：幾何 D4 對稱資料增強。
+    # Floorplan 本身沒有全域方向偏好，訓練時對每個樣本隨機套用 D4 群
+    # （4 旋轉 x 2 鏡射，含 identity）其中一個，把有效訓練資料量乘 8 倍，
+    # 幾乎零額外成本（on-the-fly，不拉長每 epoch 時間）。見 dataset.py:
+    # FloorplanDataset 的 augment 參數／_augment_* 函式說明。不新增任何
+    # 可學習參數，舊 checkpoint 架構相容，但要重新訓練才能驗證效果。
+    use_geo_augment: bool = False
 
     # -- Attention group bias（v3 新增）--
     use_group_attention_bias: bool = True

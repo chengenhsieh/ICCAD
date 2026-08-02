@@ -603,6 +603,67 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.19 —— 訓練端幾何 D4 對稱資料增強（不採用，方法論教訓：paired 測試會系統性高估效果）
+
+**背景**：Floorplan 本身沒有全域方向偏好，旋轉/翻轉整個佈局後，所有幾何
+約束（overlap、preplaced 相對位置、boundary 對齊、cluster 相鄰、MIB
+同尺寸）仍然是同一個合法解——訓練時對每個樣本隨機套用 D4 群（4 旋轉 x
+2 鏡射 = 8 個元素，含 identity）的其中一個，把有效訓練資料量乘 8 倍，
+純訓練端技巧、不新增可學習參數、推論成本完全不變。
+
+**實作**：`dataset.py` 新增 `_augment_bbox`／`_augment_point`／
+`_augment_boundary_code`，在 `FloorplanDataset.__getitem__` 算 canvas
+範圍**之前**套用到原始 (x,y,w,h)／pin 座標／boundary bitmask，讓後續
+normalize 邏輯自動對新的 bounding box 重新算範圍。`config.py` 新增
+`use_geo_augment`（預設 `False`）；`train.py` 只在 train_loader（非
+`is_test`）套用。
+
+實作過程抓到一個真的方向性 bug：boundary bit 的旋轉映射一開始寫反了
+（憑直覺推導「LEFT 轉 90 度變 TOP」，但用真實座標代入驗證後發現實際上是
+「LEFT 轉 90 度變 BOTTOM」——原因是我用了兩種不同方向的旋轉公式做交叉
+推導，其中一個其實是順時針、不是逆時針）。寫了整合測試（構造貼在特定
+邊界/角落的 block，套用變換後直接檢查座標是否落在程式碼宣稱的新邊界
+上，6 種邊界/角落案例 x 8 種變換）才抓出來並修正。其餘驗證：面積守恆、
+8 個變換兩兩互為反元素、拓樸/分組/面積在增強前後不變、真實 dataloader +
+完整 training_loss（含 boundary soft loss）+ backward 全部正常。
+
+**驗證（第一階段，訊號很強）**：
+
+- 30 epoch 短跑（`test_geoaug` vs `test_unweighted` baseline）：
+  area_gap／hpwl_gap／V_relative／raw overlap **四項全部同向變好**，
+  raw overlap -12.8%（**28/30 樣本較好**，這個 session 目前 paired
+  測試最一致的一次），cost-proxy **-5.56%**（24/30 較好）。
+- 投入完整 300 epoch（`model_epoch300_overlap_v9.pt`）。val_loss
+  0.1463，比 v4 的 0.1026 高——但跟 v5.18 self-conditioning 不同，這是
+  資料增強的預期模式（訓練任務變難但泛化變好，類似影像分類增強常見的
+  「train loss 上升、test 表現進步」現象），不當成負面訊號。
+- **100 樣本 paired** 對比 v4：四項指標同樣全部同向變好（raw overlap
+  -7.0%，**82/100 樣本較好**），cost-proxy **-1.17%**（61/100 較好）
+  ——訊號雖然比 30 樣本時弱一些，但依然一致、依然強。
+
+**驗證（第二階段，官方 evaluate 卻打平）**：
+
+兩次獨立官方 evaluate（跟 v4 用同一套 production 推論設定）：real score
+（換算真實 median runtime）**1.1286 / 1.1306**，平均 **1.1296**，跟 v4
+的 **1.128** 相比只差 **+0.14%**——在單次評估 ±2% 的雜訊範圍內，等於
+打平，完全沒有反映 paired 測試裡看到的一致優勢。
+
+**決定**：**不採用**（`my_optimizer.py` 維持
+`model_epoch300_overlap_v4.pt`）。**方法論教訓**：paired 測試（同一組
+diffusion 輸出/固定 seed 餵給不同設定比較）雖然能有效濾掉「取樣本身的
+隨機性」這個雜訊來源，但也可能因此系統性放大真實效果——當真實效果本身
+很小時，paired 設計的變異數縮減會讓小訊號顯得比獨立重跑時更一致、更
+可信，而官方 evaluate 的兩次獨立跑（各自完全重新取樣）才是更貼近實際
+比賽情境的驗證方式。這是繼 v5.14（runtime 代價被中性 evaluate 隱藏）之
+後，這個 session 第二次抓到「驗證方法論本身的選擇會影響結論」的案例，
+但性質不同：v5.14 是中性 evaluate 低估了 runtime 代價，這次是 paired
+測試低估了訊號的雜訊。機制與 `model_epoch300_overlap_v9.pt` checkpoint
+保留備用；如果之後想確認訊號是否只是差一點沒達到統計顯著（例如再跑
+第三、四次官方 evaluate 平均），基礎建設已經在，不需要重新走一次訓練
+過程。
+
+---
+
 ## v5.18 —— 訓練端 Self-Conditioning（不採用）
 
 **背景**：查文獻找訓練端改善方向，找到 Self-Conditioning（Chen, Zhang &

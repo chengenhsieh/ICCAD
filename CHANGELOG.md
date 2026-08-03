@@ -603,6 +603,40 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.21 —— 重新檢視 boundary_nudge_strength（不採用，34 樣本篩選再次高估效果）
+
+**背景**：v5.0 調 `boundary_nudge_strength`（跟 `grouping_force_strength`／
+`repulsion_strength`）時，`DDIM_STEPS=30`；v5.15 把它降到 10 之後，force
+guidance 能作用的步數少了 2/3，當初調好的強度理論上可能不再是最佳值——
+這是唯一一個「條件已經改變、舊結論可能過時」的推論端方向，動機上比其他
+選項更充分。
+
+**掃描結果**（34 樣本分層抽樣，真實 median runtime 換算，在目前 production
+設定之上）：
+
+- Phase 1（`boundary_nudge_strength` 單獨掃，`grouping_force_strength`
+  維持 0.030）：0.025→0.075 real cost 持續變好（V_relative
+  0.1092→0.1048，約 -4%），0.075→0.15 打平或略差。最佳點 0.075。
+- Phase 2（`grouping_force_strength` 在 `boundary_nudge_strength=0.075`
+  之上重掃）：目前的 0.030 仍是最佳，調高（0.05~0.15）反而讓
+  V_relative 變差（0.1091→0.1186）——這個參數沒有額外空間，維持不變。
+
+**完整 100 樣本官方 evaluate 確認**（`boundary_nudge_strength=0.075`，
+兩次獨立跑）：real score（換算真實 median runtime）**1.1395 / 1.1573**，
+平均 **1.1484**——明顯比 v4 baseline（近期落在 ~1.11-1.128 之間）**差**，
+34 樣本篩選預測的 -1% 效益完全沒有撐住，方向反過來。
+
+**決定**：**不採用**（`my_optimizer.py` 維持 `BOUNDARY_NUDGE_STRENGTH=
+0.025`）。這是這個 session 第三次遇到「34/100 樣本篩選訊號看起來正面，
+完整官方 evaluate 卻打平或惡化」的情況（前兩次是 v5.19 幾何增強、v5.20
+v-prediction），但方向更負面——不只是打平，是真的變差。累積的方法論
+教訓：**任何只在小樣本（34 或 100）篩選階段驗證過的改動，在正式採用前
+都必須跑完整官方 evaluate（至少 2 次獨立跑）確認，樣本數越小，越可能
+高估效果**，尤其是像 boundary_nudge_strength 這種同時牽動 area/hpwl/
+V_relative 三個互相拉扯的指標的參數，小樣本下的淨效應估計特別不穩定。
+
+---
+
 ## v5.20 —— 訓練端 v-prediction 參數化（不採用，但發現一個真實、被抵銷掉的效果）
 
 **背景**：v-prediction（Salimans & Ho, 2022, "Progressive Distillation for

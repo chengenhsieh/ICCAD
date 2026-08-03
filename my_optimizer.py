@@ -110,6 +110,13 @@ class MyOptimizer(FloorplanOptimizer):
     # 100-sample re-runs (different random seeds each time; ~-0.2%~-0.3% on
     # the cost formula, small but directionally consistent) -- adopted.
     GROUPING_FORCE_STRENGTH = 0.030
+    # v5.21（不採用，見 CHANGELOG.md）：重新檢視 boundary_nudge_strength
+    # 是否因為 DDIM_STEPS 30→10（v5.15）而不再是最佳值。34 樣本分層抽樣
+    # 顯示 0.075 real cost 較好（V_relative 0.1092→0.1048，約 -1%），但
+    # 完整 100 樣本官方 evaluate 兩次（1.1395 / 1.1573，平均 1.1484）
+    # 明顯比 v4 baseline（~1.11-1.128）差，34 樣本篩選再次高估了效果，
+    # 維持原值 0.025。grouping_force_strength 同時重掃過，目前 0.030 已是
+    # 最佳（調高讓 V_relative 變差），無變動。
     BOUNDARY_NUDGE_STRENGTH = 0.025
     REPULSION_STRENGTH = 0.0375
     # v5.12（不採用，見 CHANGELOG.md）：純推論端，force 強度乘上

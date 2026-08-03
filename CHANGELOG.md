@@ -603,6 +603,65 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.20 —— 訓練端 v-prediction 參數化（不採用，但發現一個真實、被抵銷掉的效果）
+
+**背景**：v-prediction（Salimans & Ho, 2022, "Progressive Distillation for
+Fast Sampling of Diffusion Models"）把訓練目標從預測 noise（epsilon）換成
+預測 v = sqrt(ᾱ_t)·eps − sqrt(1−ᾱ_t)·x0（eps 和 x0 的混合），文獻上在
+少步數取樣下通常比 epsilon-prediction 更穩定——本專案 `DDIM_STEPS=10`
+（v5.15 之後）屬於相當激進的跳步，理論上正好是 v-prediction 該有優勢的
+場景。
+
+**實作**：`diffusion.py` 新增 `GaussianDiffusion._recover_x0_and_eps`
+統一介面，把 model 的原始輸出（依 `prediction_type` 是 epsilon 或 v）
+轉成下游共用的 `(x0_pred, eps_pred)`——DDIM 更新公式、soft constraint
+loss 的 x0 重建、self-conditioning 的估計都只吃這組介面，只有這一個
+地方需要依 prediction_type 分支。不改架構、不新增可學習參數。**設計上
+刻意跟 `use_self_cond` 不同**：`prediction_type` 不是可以自由選的推論端
+行為開關，用錯了會讓整個 DDIM 更新公式解讀錯誤、生成結果變垃圾，所以
+讓 `inference.py: generate_floorplan` 直接從 model 自己的 config 自動
+帶入（`getattr(config, "prediction_type", "epsilon")`），呼叫方不需要
+（也不應該）手動指定，避免重演 v5.18 測試時忘記手動傳 `use_self_cond=True`
+的那種失誤模式。驗證：epsilon 路徑跟舊的 inline 公式逐位元完全相同；
+v-prediction 的還原公式用真實的前向擴散關係驗證過（給定真實 x0/noise
+算出 v-target，反推回去精確等於原本的 x0/noise）；soft loss／
+self-conditioning／min-SNR 各種組合都測過無 NaN；真實 dataloader +
+backward + optimizer step 也跑過。
+
+**驗證（30 epoch 短跑）**：area_gap／hpwl_gap／V_relative 全部同向變好，
+raw overlap -17.4%（28/30 樣本較好），cost-proxy -3.67%（20/30 較好）
+——強度接近 v5.19 幾何增強當初的短跑結果。
+
+**完整 300 epoch 訓練**（`model_epoch300_overlap_v10.pt`）：
+
+- **100 樣本 paired** 對比 v4：area_gap／hpwl_gap 同向小幅變好，
+  **V_relative 反而略差**（0.1070→0.1099），**raw overlap 大幅、極度
+  一致地變好**（1601.3→1268.6，-20.8%，**94/100 樣本較好**，是這個
+  session 目前 paired 測試最一致的一次，比 v5.19 的 82/100 還高）。但
+  cost 公式的 `exp(2·V_relative)` 是指數項，V_relative 的小幅退步抵銷掉
+  了 raw overlap 的巨幅改善，整體 cost-proxy 幾乎打平（**+0.40%**，
+  48/100 較好、52/100 較差）。
+- 三次獨立官方 evaluate（跟 v4 用同一套 production 推論設定）：real
+  score（換算真實 median runtime）**1.1203 / 1.1009 / 1.1576**，平均
+  **1.1263**——跟 v4 的 ~1.128 幾乎完全打平，方向跟 100 樣本 paired 的
+  cost-proxy（+0.40%，接近打平）一致。
+
+**決定**：**不採用**（`my_optimizer.py` 維持
+`model_epoch300_overlap_v4.pt`）。但這次的發現**不是**單純的「訊號太小、
+被雜訊蓋過」（跟 v5.19 不同）——raw overlap 94/100 樣本一致變好是一個
+真實、量級很大的效果，只是被另一個真實但方向相反的效果（V_relative 略
+變差）系統性抵銷掉了，兩者加總後淨值接近零。v-prediction 顯然改善了
+模型本身的生成精度（避免重疊的能力），但同時讓 boundary/grouping 這類
+soft constraint 的滿足度變差——機制上的原因還不清楚（可能是訓練目標的
+數值尺度變化，隱含地改變了不同 loss 分量之間的相對梯度大小，類似
+v5.9 QK-norm／v5.8 timestep 加權那類「改變梯度預算分配」的效應）。對
+之後想繼續深入的人：如果能找到方法同時穩住 V_relative（例如把
+v-prediction 跟某種 soft loss 加權方式結合），raw overlap 這塊真實的
+改善空間就有機會被完整兌現成淨分數提升。機制與
+`model_epoch300_overlap_v10.pt` checkpoint 保留備用。
+
+---
+
 ## v5.19 —— 訓練端幾何 D4 對稱資料增強（不採用，方法論教訓：paired 測試會系統性高估效果）
 
 **背景**：Floorplan 本身沒有全域方向偏好，旋轉/翻轉整個佈局後，所有幾何

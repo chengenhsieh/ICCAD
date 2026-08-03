@@ -156,7 +156,7 @@ def train(config):
     use_amp = getattr(config, "use_amp", True) and device.type == "cuda"
 
     os.makedirs(config.output_dir, exist_ok=True)
-    loss_png_path = os.path.join(config.output_dir, "loss_curve_300epoch_overlap_v9.png")
+    loss_png_path = os.path.join(config.output_dir, "loss_curve_300epoch_overlap_v10.png")
 
     # In-memory history（取代 csv），畫 loss curve 用
     history = {k: [] for k in [
@@ -189,6 +189,7 @@ def train(config):
         getattr(config, "coord_n_freqs", None)))
     print("v5.18: use_self_cond={}".format(getattr(config, "use_self_cond", False)))
     print("v5.19: use_geo_augment={}".format(getattr(config, "use_geo_augment", False)))
+    print("v5.20: prediction_type={}".format(getattr(config, "prediction_type", "epsilon")))
 
     # -- 載入資料 --
     print("Loading FloorSet datasets...")
@@ -242,6 +243,7 @@ def train(config):
     # 影響（作用在主要去噪 loss，從 epoch 1 就該套用），所以在迴圈外算一次。
     min_snr_gamma = config.min_snr_gamma if getattr(config, "use_min_snr_main_loss", False) else None
     use_self_cond = getattr(config, "use_self_cond", False)
+    prediction_type = getattr(config, "prediction_type", "epsilon")
 
     for epoch in range(1, config.epochs + 1):
         model.train()
@@ -271,7 +273,8 @@ def train(config):
             with torch.cuda.amp.autocast(enabled=use_amp):
                 loss, info = diffusion.training_loss(model, batch, soft_weights=soft_w,
                                                       min_snr_gamma=min_snr_gamma,
-                                                      use_self_cond=use_self_cond)
+                                                      use_self_cond=use_self_cond,
+                                                      prediction_type=prediction_type)
 
             if use_amp:
                 scaler.scale(loss).backward()
@@ -314,7 +317,8 @@ def train(config):
         epoch_overlap = (ovr_sum / nb).item()   # v4.0
         elapsed = time.time() - t_start
 
-        val_loss = validate(model, diffusion, val_loader, device, use_amp, use_self_cond)
+        val_loss = validate(model, diffusion, val_loader, device, use_amp, use_self_cond,
+                            prediction_type)
         cur_lr = scheduler.get_last_lr()[0]
 
         print(
@@ -347,7 +351,7 @@ def train(config):
         if is_best or epoch % config.save_interval == 0 or epoch == config.epochs:
             ema.apply_shadow()
             tag = "best" if is_best else "epoch{}".format(epoch)
-            path = os.path.join(config.output_dir, "model_{}_overlap_v9.pt".format(tag))
+            path = os.path.join(config.output_dir, "model_{}_overlap_v10.pt".format(tag))
             torch.save({
                 "epoch": epoch,
                 "global_step": global_step,
@@ -370,7 +374,8 @@ def train(config):
 
 
 @torch.no_grad()
-def validate(model, diffusion, val_loader, device, use_amp=False, use_self_cond=False):
+def validate(model, diffusion, val_loader, device, use_amp=False, use_self_cond=False,
+             prediction_type="epsilon"):
     """validation 只看去噪 MSE（不加 soft loss）。"""
     model.eval()
     total_loss = torch.zeros((), device=device)
@@ -378,7 +383,8 @@ def validate(model, diffusion, val_loader, device, use_amp=False, use_self_cond=
     for batch in val_loader:
         with torch.cuda.amp.autocast(enabled=use_amp):
             loss, info = diffusion.training_loss(model, batch, soft_weights=None,
-                                                  use_self_cond=use_self_cond)
+                                                  use_self_cond=use_self_cond,
+                                                  prediction_type=prediction_type)
         total_loss += info["mse"]
         n += 1
     model.train()
@@ -393,17 +399,20 @@ if __name__ == "__main__":
     # config.encoder_layers = 4
     # config.denoiser_layers = 6
     # config.epochs = 60
-    # 正式訓練（v9，300 epoch）：v5.19 幾何 D4 對稱資料增強。30 epoch 短跑
-    # 結論——四項指標全部同向變好，raw overlap -12.8%（28/30 樣本較好，
-    # 是這個 session 目前 paired 測試最乾淨的一次），cost-proxy -5.56%
-    # （24/30 較好）。純訓練端技巧、不新增可學習參數、推論成本完全不變
-    # （不像 repaint 那樣有隱藏 runtime 代價），值得投入完整訓練驗證。
-    # 其餘 QK-norm/Min-SNR/coord_sincos/self-cond 全部維持 False，避免
+    # 正式訓練（v10，300 epoch）：v5.20 v-prediction 參數化。30 epoch 短跑
+    # 結論——area/hpwl/V_relative 全部同向變好，raw overlap -17.4%
+    # （28/30 樣本較好），cost-proxy -3.67%（20/30 較好），強度接近
+    # v5.19 幾何增強那次的短跑結果。**但** v5.19 已經示範過 paired 短跑
+    # 訊號可能被變異數縮減放大、官方 evaluate 卻打平的情況，所以這次
+    # 投入完整訓練後一定要走完整驗證流程（100 樣本 paired + 至少 2-3 次
+    # 獨立官方 evaluate），不能只看 paired 結果就下結論。其餘 QK-norm/
+    # Min-SNR/coord_sincos/self-cond/geo_augment 全部維持 False，避免
     # 混淆變因。epochs/soft_loss_warmup_epochs 用 Config 預設值
     # （300/10），不用再蓋。
     config.use_qk_norm = False
     config.use_min_snr_main_loss = False
     config.use_coord_sincos = False
     config.use_self_cond = False
-    config.use_geo_augment = True             # v5.19
+    config.use_geo_augment = False
+    config.prediction_type = "v"              # v5.20
     train(config)

@@ -123,13 +123,25 @@ class Config:
     # 三個獨立訊號方向一致，確認不採用。機制與 checkpoint 保留備用。
     use_self_cond: bool = False
 
-    # v5.19（實驗用，尚未訓練驗證，預設關閉）：幾何 D4 對稱資料增強。
-    # Floorplan 本身沒有全域方向偏好，訓練時對每個樣本隨機套用 D4 群
-    # （4 旋轉 x 2 鏡射，含 identity）其中一個，把有效訓練資料量乘 8 倍，
-    # 幾乎零額外成本（on-the-fly，不拉長每 epoch 時間）。見 dataset.py:
-    # FloorplanDataset 的 augment 參數／_augment_* 函式說明。不新增任何
-    # 可學習參數，舊 checkpoint 架構相容，但要重新訓練才能驗證效果。
+    # v5.19（不採用，見 CHANGELOG.md）：幾何 D4 對稱資料增強。30 epoch
+    # 短跑跟 100 樣本 paired 都給出這個 session 最強的正面訊號（raw
+    # overlap -7%~-13%），但三次獨立官方 evaluate 平均後跟 v4 幾乎打平
+    # （1.1266 vs 1.128，+0.14%~-0.12% 之間）——paired 測試的變異數縮減
+    # 讓一個很小的真實效果顯得比獨立重跑時更一致，是這個 session 的方法論
+    # 教訓。機制與 checkpoint 保留備用。
     use_geo_augment: bool = False
+
+    # v5.20（實驗用，尚未訓練驗證，預設 "epsilon" = 關閉，跟改動前完全
+    # 等價）：v-prediction 參數化（Salimans & Ho, 2022, "Progressive
+    # Distillation for Fast Sampling of Diffusion Models"）。把訓練目標從
+    # 預測 noise（epsilon）換成預測 v = sqrt(ᾱ_t)·eps − sqrt(1−ᾱ_t)·x0
+    # （eps 和 x0 的混合），文獻上在少步數取樣（本專案 DDIM_STEPS=10 屬於
+    # 激進跳步）下通常比 epsilon-prediction 更穩定。不改架構、不新增
+    # 可學習參數（跟 epsilon-prediction 用同一個網路，只是輸出的意義不同、
+    # 訓練目標換了），但輸出的意義不同，舊 checkpoint 不能跟新
+    # prediction_type 混用。見 diffusion.py: GaussianDiffusion 的
+    # `_recover_x0_and_eps` 說明。可選值："epsilon"（預設）｜ "v"。
+    prediction_type: str = "epsilon"
 
     # -- Attention group bias（v3 新增）--
     use_group_attention_bias: bool = True

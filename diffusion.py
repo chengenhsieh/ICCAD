@@ -69,6 +69,29 @@ class GaussianDiffusion:
         x_t = sqrt_alpha * x0 + sqrt_one_minus_alpha * noise
         return x_t, noise
 
+    # v5.20: epsilon-prediction／v-prediction 共用的還原介面。model 的
+    # 原始輸出 `model_out` 依 `prediction_type` 有不同意義：
+    #   "epsilon"（預設）：model_out 就是 eps_pred，x0_pred 用標準公式反推
+    #                      （= 舊行為，逐位元不變）。
+    #   "v"：model_out 是 v = sqrt(ᾱ_t)·eps − sqrt(1−ᾱ_t)·x0（Salimans &
+    #        Ho, 2022），跟 x_t = sqrt(ᾱ_t)·x0 + sqrt(1−ᾱ_t)·eps 聯立解出
+    #        x0_pred = sqrt(ᾱ_t)·x_t − sqrt(1−ᾱ_t)·v，
+    #        eps_pred = sqrt(1−ᾱ_t)·x_t + sqrt(ᾱ_t)·v。
+    # 所有下游程式碼（DDIM 更新公式、soft constraint loss 的 x0 重建、
+    # self-conditioning 的 x0 估計）都只吃這組 (x0_pred, eps_pred) 標準
+    # 介面，不需要各自知道 model 實際在預測什麼——這是唯一需要依
+    # prediction_type 分支的地方。
+    def _recover_x0_and_eps(self, x_t, model_out, alpha_bar_t, prediction_type="epsilon"):
+        sqrt_ab = torch.sqrt(alpha_bar_t)
+        sqrt_1mab = torch.sqrt(1 - alpha_bar_t)
+        if prediction_type == "v":
+            x0_pred = sqrt_ab * x_t - sqrt_1mab * model_out
+            eps_pred = sqrt_1mab * x_t + sqrt_ab * model_out
+        else:
+            eps_pred = model_out
+            x0_pred = (x_t - sqrt_1mab * eps_pred) / sqrt_ab
+        return x0_pred, eps_pred
+
     # ----------------------------------------------------------------
     # Soft constraint 懲罰（可微，作用在預測的 x0 上）
     # x0_pred: (B, N, 3) = (x_norm, y_norm, log_r)
@@ -261,7 +284,7 @@ class GaussianDiffusion:
     # Training loss
     # ----------------------------------------------------------------
     def training_loss(self, model, batch, soft_weights=None, min_snr_gamma=None,
-                       use_self_cond=False):
+                       use_self_cond=False, prediction_type="epsilon"):
         """
         Args:
             model: FloorplanDiffusionModel
@@ -314,6 +337,16 @@ class GaussianDiffusion:
                           維持零向量、省下那次多的 forward（訓練時平均
                           1.5x forward 次數）。見 model.py: Denoiser 的
                           self_cond_proj 說明。
+            prediction_type: "epsilon"（預設）= model 預測 noise，跟改動前
+                          完全等價。"v" 時改預測
+                          v = sqrt(ᾱ_t)·eps − sqrt(1−ᾱ_t)·x0（Salimans &
+                          Ho, 2022），主要 MSE loss 的目標從 `noise` 換成
+                          這個 v-target；soft constraint loss／
+                          self-conditioning 用到的 x0_pred 重建也一併換成
+                          v-prediction 對應公式（見
+                          `GaussianDiffusion._recover_x0_and_eps`）。不改
+                          架構、不新增可學習參數，但輸出的意義不同，
+                          舊 checkpoint 不能跟新 prediction_type 混用。
         Returns:
             loss (scalar), info (dict)
 
@@ -343,33 +376,41 @@ class GaussianDiffusion:
         B = x0.shape[0]
         t = torch.randint(0, self.T, (B,), device=device)
         x_t, noise = self.q_sample(x0, t)
+        # 提前算：v-target（若 prediction_type=="v"）、soft loss 的 t_weight、
+        # self-conditioning 的 x0 重建都要用，只算一次
+        alpha_bar_t = self._extract(self.alphas_cumprod, t, x_t.shape)
+
+        if prediction_type == "v":
+            target = torch.sqrt(alpha_bar_t) * noise - torch.sqrt(1 - alpha_bar_t) * x0
+        else:
+            target = noise
 
         self_cond = None
         if use_self_cond and torch.rand(()).item() < 0.5:
             with torch.no_grad():
-                noise_pred_sc = model(x_t, block_features, conn_weights, t, mask, group_bias,
-                                      self_cond=None)
-                alpha_bar_t = self._extract(self.alphas_cumprod, t, x_t.shape)
-                x0_pred_sc = (x_t - torch.sqrt(1 - alpha_bar_t) * noise_pred_sc) / \
-                             torch.sqrt(alpha_bar_t)
+                model_out_sc = model(x_t, block_features, conn_weights, t, mask, group_bias,
+                                     self_cond=None)
+                x0_pred_sc, _ = self._recover_x0_and_eps(x_t, model_out_sc, alpha_bar_t,
+                                                          prediction_type)
             self_cond = x0_pred_sc.detach()
 
         noise_pred = model(x_t, block_features, conn_weights, t, mask, group_bias,
                            self_cond=self_cond)
 
-        # 主要去噪 MSE loss（masked）
+        # 主要去噪 MSE loss（masked）——`noise_pred` 是 model 的原始輸出，
+        # `target` 已經依 prediction_type 換成正確的訓練目標
         mask_expanded = mask.unsqueeze(-1).float()
         if min_snr_gamma is None:
             # 跟 Min-SNR 加入之前完全一樣：整個 batch 攤平一起算
-            mse = F.mse_loss(noise_pred * mask_expanded, noise * mask_expanded, reduction="sum")
+            mse = F.mse_loss(noise_pred * mask_expanded, target * mask_expanded, reduction="sum")
             mse = mse / mask_expanded.sum().clamp(min=1)
         else:
-            sq_err = (noise_pred - noise) ** 2 * mask_expanded              # (B, N, 3)
+            sq_err = (noise_pred - target) ** 2 * mask_expanded             # (B, N, 3)
             per_sample_num = sq_err.sum(dim=(1, 2))                         # (B,)
             per_sample_cnt = mask_expanded.sum(dim=(1, 2)).clamp(min=1)     # (B,)
             per_sample_mse = per_sample_num / per_sample_cnt                # (B,)
 
-            alpha_bar_flat = self._extract(self.alphas_cumprod, t, x_t.shape).view(B)
+            alpha_bar_flat = alpha_bar_t.view(B)
             snr = alpha_bar_flat / (1.0 - alpha_bar_flat).clamp(min=1e-8)
             min_snr_w = torch.clamp(snr, max=min_snr_gamma) / snr.clamp(min=1e-8)
             mse = (per_sample_mse * min_snr_w).mean()
@@ -379,8 +420,7 @@ class GaussianDiffusion:
 
         # soft constraint loss（從預測 x0 算）
         if soft_weights is not None:
-            alpha_bar_t = self._extract(self.alphas_cumprod, t, x_t.shape)
-            x0_pred = (x_t - torch.sqrt(1 - alpha_bar_t) * noise_pred) / torch.sqrt(alpha_bar_t)
+            x0_pred, _ = self._recover_x0_and_eps(x_t, noise_pred, alpha_bar_t, prediction_type)
 
             t_weight = None
             if soft_weights.get("weight_soft_loss_by_alpha_bar", False):
@@ -835,6 +875,10 @@ class GaussianDiffusion:
         # v5.18: 只有 model 是用 use_self_cond=True 訓練出來的才能開，
         # 見下方 docstring 說明
         use_self_cond=False,
+        # v5.20: 必須跟 model 訓練時的 config.prediction_type 一致，見下方
+        # docstring 說明——不是可以自由選的推論端選項，通常由呼叫方
+        # （inference.py: generate_floorplan）從 model 的 config 自動帶入
+        prediction_type="epsilon",
     ):
         """
         GNN-style force-guided diffusion sampler。
@@ -912,6 +956,15 @@ class GaussianDiffusion:
             推論的自我調節資訊來源不同（訓練是 50% 機率的額外 no-grad
             forward 估計，推論是上一步真的算出的結果）符合 Chen et al.
             2022 原始設計——訓練時只是在「近似」推論時真正會發生的情況。
+
+        prediction_type (v5.20，預設 "epsilon" = 關閉，跟改動前完全等價):
+            model 的原始輸出要當 epsilon 還是 v 解讀（見
+            `GaussianDiffusion._recover_x0_and_eps`）。**必須**跟 checkpoint
+            訓練時的 `config.prediction_type` 一致，否則整個 DDIM 更新
+            公式會用錯誤的 x0_pred/eps_pred，生成結果會是垃圾——不是可以
+            自由調的推論端超參數，一般由 `inference.py: generate_floorplan`
+            從 model 自己的 config 自動帶入，不需要呼叫方手動記得設定
+            （不像 `use_self_cond` 是獨立於 config 的推論端行為開關）。
         """
         device = block_features.device
         B = shape[0]
@@ -957,11 +1010,15 @@ class GaussianDiffusion:
             else:
                 alpha_bar_prev = torch.ones_like(alpha_bar_t)
 
-            x0_pred = (x - torch.sqrt(1 - alpha_bar_t) * noise_pred) / torch.sqrt(alpha_bar_t)
+            # v5.20: 把 model 的原始輸出（epsilon 或 v，取決於
+            # prediction_type）統一還原成 (x0_pred, eps_pred)，下面的 DDIM
+            # 更新公式維持不變、只吃這組標準介面
+            x0_pred, eps_pred = self._recover_x0_and_eps(x, noise_pred, alpha_bar_t,
+                                                          prediction_type)
             sigma = eta * torch.sqrt(
                 (1 - alpha_bar_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_prev)
             )
-            dir_xt = torch.sqrt(1 - alpha_bar_prev - sigma ** 2) * noise_pred
+            dir_xt = torch.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps_pred
             noise = torch.randn_like(x) if t_cur > 0 else 0
             x = torch.sqrt(alpha_bar_prev) * x0_pred + dir_xt + sigma * noise
 

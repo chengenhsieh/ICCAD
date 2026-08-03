@@ -326,6 +326,10 @@ def generate_floorplan(
         # 驗證後維持不縮放（scale_t_windows 預設 False），避免留下沒有實際
         # 效果的複雜度。
         _t_scale = (100.0 / max(ddim_steps, 1)) if scale_t_windows else 1.0
+        # v5.20: prediction_type 是 model 訓練時的屬性（見 config.py），
+        # 不是推論端可以自由選的參數，一律從 model 自己的 config 帶入，
+        # 呼叫方不需要（也不應該）手動指定
+        _prediction_type = getattr(config, "prediction_type", "epsilon")
         generated = diffusion.ddim_sample_with_forces(
             model, shape, feats_t, conn_t, mask_t,
             ddim_steps=ddim_steps, eta=0.0,
@@ -355,6 +359,7 @@ def generate_floorplan(
             resample_temperature=resample_temperature,
             repaint_resample_steps=repaint_resample_steps,
             use_self_cond=use_self_cond,
+            prediction_type=_prediction_type,
         )
 
     preplaced_indices = [i for i in range(k) if preplaced_mask_np[i]]

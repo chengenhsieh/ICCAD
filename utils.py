@@ -2409,6 +2409,110 @@ def compact_swap(x, y, w, h, preplaced_mask=None, boundary_code=None,
     return x, y
 
 
+# v5.23（實驗用）：pairwise swap + 模擬退火
+def compact_anneal(x, y, w, h, preplaced_mask=None, boundary_code=None,
+                    cluster_group=None, iters=500, seed=0,
+                    t_start_frac=0.3, t_end_frac=0.01):
+    """
+    在 compact_swap（v5.22，純貪婪、只接受嚴格變好的 swap）基礎上加模擬
+    退火接受準則。v5.22 在真實資料上發現純貪婪 swap 一次改善都找不到
+    （20 樣本 area_gap 完全不變）——這個函式驗證的假說是：貪婪法可能卡在
+    「單步都不划算、但連續兩三步組合起來划算」的局部最優（每一步都要嚴格
+    變好，就永遠踏不出第一步），退火允許暫時接受讓 bbox 稍微變差的 swap，
+    才有機會跨過這種局部最優的「谷」。
+
+    每次迭代：隨機挑一對「自由」block（跟 compact_swap 用同一個排除規則
+    ——非 preplaced、無 boundary 鎖定、無 cluster 分組）試著互換；不合法
+    （會重疊）直接跳過，不計入這次迭代；合法的話用退火機率決定是否接受
+    ——變好一定接受，變差以 `exp(-Δarea / T)` 機率接受，T 隨迭代次數線性
+    從 `t_start_frac * cur_area` 降到 `t_end_frac * cur_area`（用目前 bbox
+    面積的比例當溫度尺度，不同大小的案例才會有可比的「相對接受寬鬆度」）。
+    全程記錄「看過的最佳解」，最後回傳最佳解而不是退火終點——退火終點常常
+    還沒完全冷卻，可能比中途看過的最佳解差。
+
+    決定性：給定 `seed` 後全程可重現（用獨立的 `np.random.default_rng`，
+    不動全域亂數狀態、不影響 diffusion 端的 torch 隨機性），維持跟目前
+    paired 測試方法論相容——這點刻意跟傳統「SA 本質上是隨機演算法」的
+    刻板印象不同：這裡的隨機性只用來探索，同一個 seed 永遠得到同一個
+    結果，方便用既有的 quasi-paired 方法論驗證效果。
+    """
+    x = np.array(x, dtype=np.float64).copy()
+    y = np.array(y, dtype=np.float64).copy()
+    w = np.asarray(w, dtype=np.float64)
+    h = np.asarray(h, dtype=np.float64)
+    k = len(x)
+    if k < 2:
+        return x, y
+
+    if preplaced_mask is None:
+        preplaced_mask = np.zeros(k, dtype=bool)
+    else:
+        preplaced_mask = np.asarray(preplaced_mask, dtype=bool)
+    if boundary_code is None:
+        boundary_code = np.zeros(k, dtype=np.int64)
+    else:
+        boundary_code = np.asarray(boundary_code, dtype=np.int64)
+    if cluster_group is None:
+        cluster_group = np.zeros(k, dtype=np.int64)
+    else:
+        cluster_group = np.asarray(cluster_group, dtype=np.int64)
+
+    movable = (~preplaced_mask) & (boundary_code == 0) & (cluster_group == 0)
+    movable_idx = np.nonzero(movable)[0]
+    if len(movable_idx) < 2:
+        return x, y
+
+    def bbox_area(xa, ya):
+        return (np.max(xa + w) - np.min(xa)) * (np.max(ya + h) - np.min(ya))
+
+    def overlaps_any(idx, xa, ya):
+        xi1, yi1 = xa[idx] + w[idx], ya[idx] + h[idx]
+        ox = np.minimum(xi1, xa + w) - np.maximum(xa[idx], xa)
+        oy = np.minimum(yi1, ya + h) - np.maximum(ya[idx], ya)
+        m = (ox > 1e-9) & (oy > 1e-9)
+        m[idx] = False
+        return bool(m.any())
+
+    rng = np.random.default_rng(seed)
+    cur_area = bbox_area(x, y)
+    best_area = cur_area
+    best_x, best_y = x.copy(), y.copy()
+    t_start = t_start_frac * cur_area
+    t_end = t_end_frac * cur_area
+
+    for it in range(iters):
+        frac = it / max(iters - 1, 1)
+        temp = t_start + (t_end - t_start) * frac
+
+        a, b = rng.choice(len(movable_idx), size=2, replace=False)
+        i, j = int(movable_idx[a]), int(movable_idx[b])
+        xi0, yi0 = x[i], y[i]
+        xj0, yj0 = x[j], y[j]
+        if xi0 == xj0 and yi0 == yj0:
+            continue
+        x[i], y[i] = xj0, yj0
+        x[j], y[j] = xi0, yi0
+
+        if overlaps_any(i, x, y) or overlaps_any(j, x, y):
+            x[i], y[i] = xi0, yi0
+            x[j], y[j] = xj0, yj0
+            continue
+
+        new_area = bbox_area(x, y)
+        delta = new_area - cur_area
+        accept = delta < 0 or rng.random() < np.exp(-delta / max(temp, 1e-9))
+        if accept:
+            cur_area = new_area
+            if new_area < best_area - 1e-9:
+                best_area = new_area
+                best_x, best_y = x.copy(), y.copy()
+        else:
+            x[i], y[i] = xi0, yi0
+            x[j], y[j] = xj0, yj0
+
+    return best_x, best_y
+
+
 # ============================================================
 # Legalization v3: LFF 風格的自由矩形（MAXRECTS）決定性單趟排布
 # ============================================================
@@ -2596,6 +2700,10 @@ def legalize_lff(
     # v5.22（實驗用，預設關閉）：見 compact_swap docstring 與呼叫處說明
     use_swap=False,
     swap_sweeps=3,
+    # v5.23（實驗用，預設關閉）：見 compact_anneal docstring 與呼叫處說明
+    use_anneal=False,
+    anneal_iters=500,
+    anneal_seed=0,
     verbose=False,
 ):
     """
@@ -3036,6 +3144,16 @@ def legalize_lff(
         x, y = compact_swap(x, y, w, h, preplaced_mask=preplaced_mask,
                             boundary_code=boundary_code, cluster_group=cluster_group,
                             sweeps=swap_sweeps)
+
+    # ---- Pairwise swap + 模擬退火（v5.23，實驗用）----
+    # v5.22 的純貪婪 swap 在真實資料上一次改善都找不到，這裡驗證「允許
+    # 暫時變差才能跨過局部最優」這個假說，見 compact_anneal docstring。
+    # 跟 use_swap 是兩個獨立的 opt-in 開關（可以同時開，anneal 接在
+    # swap 之後從它的結果繼續搜）。
+    if use_anneal:
+        x, y = compact_anneal(x, y, w, h, preplaced_mask=preplaced_mask,
+                              boundary_code=boundary_code, cluster_group=cluster_group,
+                              iters=anneal_iters, seed=anneal_seed)
 
     # ---- 補一個「往鄰居貼齊」的軸對齊壓縮 ----
     # 縮外框那招只對「外框本身還有margin」的情況有用；實測發現 outline 通常

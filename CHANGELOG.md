@@ -603,6 +603,49 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.22 —— `compact_swap`：pairwise swap 局部搜尋（不採用，跟 v4.9 同一種結論）
+
+**背景**：使用者想把 packing density（block 面積 / bbox 面積）從目前的
+~79% 拉高到 85-90%+。先確認了 GT optimal 本身的 packing density 高達
+~96.9%，代表理論上有真實空間。原本提議兩個方向（outline 迭代收縮、
+constraint-graph 式壓縮）追查後發現**都已經在現有程式碼裡實作並在跑**
+（`legalize_lff` 內建的 outline 自適應收縮、`compact_positions` 本身就是
+constraint-graph 壓縮的等價實作），且程式碼裡的註解明確記錄過「outline
+通常已經被 boundary block 撐到最緊，真正的留白是 block 之間的內部碎片」
+——於是改試一個真正還沒做過的 move 類型：pairwise swap（直接互換兩個
+block 的位置），跟 `compact_reinsert`（只搬單一 block 到目前空著的位置）
+不同，swap 能找到「兩個位置都被佔用、但換過來雙方都更省」的改善，這是
+reinsert 結構上搆不到的。
+
+**實作**：`utils.py` 新增 `compact_swap`——對所有「自由」block（非
+preplaced、無 boundary 鎖定、無 cluster 分組）窮舉兩兩配對，決定性逐對
+嘗試互換位置，兩邊都嚴格不重疊且讓 bbox 面積變小才採用（跟
+`legalize_lff`「不用 SA」的一貫精神一致，不用隨機取樣，維持
+paired 測試方法論相容）。放在 `compact_reinsert` 之後、`compact_positions`
+之前。單元測試驗證：合成隨機網格佈局上真的能找到改善（1778→1540）、
+不會產生重疊、preplaced/boundary/cluster block 完全不動、決定性（同輸入
+同輸出）。
+
+**驗證**：20 樣本真實資料快篩（`use_swap=False` vs `swap_sweeps=1` vs
+`swap_sweeps=3`，其餘用目前 production 設定）：**area_gap 三組完全一模
+一樣（0.2017，沒有任何差異）**，legalize 時間卻隨 sweep 數增加而變慢
+（0.881s→0.891s→0.932s，純額外成本）。合成測試能找到改善，但那是刻意
+構造、脫離現有 pipeline 脈絡的場景；在 `compact_reinsert`／
+`compact_merge_clusters`／`compact_positions` 這整套既有機制跑完之後，
+真實資料上找不到任何「換位置」能省面積的組合。
+
+**決定**：**不採用**（`use_swap` 維持預設 `False`）。這跟 v4.9
+`compact_pair_reinsert`（也是嘗試不同的 move 類型，也是 0/100 樣本有變化）
+是同一種結論，進一步印證：**79% vs GT optimal 96.9% 的 packing density
+落差，看起來是 LFF 決定性單趟排布在下決定當下就定型的拓樸限制，不是任何
+形式的事後局部搜尋（不管搬一個 block 還是換兩個 block）能修補的**。要
+真正縮小這個落差，很可能需要一個能探索不同拓樸的更強力排布搜尋（例如
+sequence-pair 表示法上的輕量 local search/SA），而不是在現有 move 類型
+家族裡再加一種——這是比目前 session 做過的任何調整都大的工程量，且有
+真實 runtime 風險（多次迭代搜尋通常比單趟 LFF 慢很多）。機制保留備用。
+
+---
+
 ## v5.21 —— 重新檢視 boundary_nudge_strength（不採用，34 樣本篩選再次高估效果）
 
 **背景**：v5.0 調 `boundary_nudge_strength`（跟 `grouping_force_strength`／

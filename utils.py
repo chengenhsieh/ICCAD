@@ -2319,6 +2319,96 @@ def compact_positions(x, y, w, h, preplaced_mask=None, boundary_code=None,
     return x, y
 
 
+# v5.22（實驗用）：pairwise swap 局部搜尋
+def compact_swap(x, y, w, h, preplaced_mask=None, boundary_code=None,
+                  cluster_group=None, sweeps=3):
+    """
+    Pairwise swap 局部搜尋：對每一對「自由」block（非 preplaced、無
+    boundary 鎖定、無 cluster 分組）系統性嘗試互換位置，兩邊都嚴格不
+    重疊且讓 bbox 面積變小才採用——決定性、逐對窮舉，不用隨機取樣或
+    SA，跟 legalize_lff「不用 SA」的一貫精神一致，也保持跟現有 paired
+    測試方法論相容（同一組輸入永遠得到同一組輸出）。
+
+    跟 compact_reinsert（單一 block 搬進目前空著的 free rectangle）
+    不同：compact_reinsert 只看「目前空著」的縫隙，永遠不會把一個
+    block 換到「目前被另一個 movable block 佔用、但換過來後兩邊都更省」
+    的位置——這是 swap 專門要抓的改善，reinsert 結構上搆不到。
+
+    排除 cluster_group 非 0 的 block（避免弄壞 cluster 相鄰，這類 block
+    的位置留給專門的 compact_merge_clusters 系列處理）。每次嘗試都先
+    驗證合法性（不重疊才算），不合法直接跳過、不修復，函式本身保證
+    單調不會讓 bbox 變大或破壞 hard constraint。
+
+    複雜度 O(sweeps * k^2)（每輪窮舉所有自由 block 兩兩配對，每對驗證
+    O(k)）——k 較大時有真實時間成本，見呼叫處 sweeps 預設值的說明。
+    """
+    x = np.array(x, dtype=np.float64).copy()
+    y = np.array(y, dtype=np.float64).copy()
+    w = np.asarray(w, dtype=np.float64)
+    h = np.asarray(h, dtype=np.float64)
+    k = len(x)
+    if k < 2:
+        return x, y
+
+    if preplaced_mask is None:
+        preplaced_mask = np.zeros(k, dtype=bool)
+    else:
+        preplaced_mask = np.asarray(preplaced_mask, dtype=bool)
+    if boundary_code is None:
+        boundary_code = np.zeros(k, dtype=np.int64)
+    else:
+        boundary_code = np.asarray(boundary_code, dtype=np.int64)
+    if cluster_group is None:
+        cluster_group = np.zeros(k, dtype=np.int64)
+    else:
+        cluster_group = np.asarray(cluster_group, dtype=np.int64)
+
+    movable = (~preplaced_mask) & (boundary_code == 0) & (cluster_group == 0)
+    movable_idx = np.nonzero(movable)[0]
+    if len(movable_idx) < 2:
+        return x, y
+
+    def bbox_area(xa, ya):
+        return (np.max(xa + w) - np.min(xa)) * (np.max(ya + h) - np.min(ya))
+
+    def overlaps_any(idx, xa, ya):
+        xi1, yi1 = xa[idx] + w[idx], ya[idx] + h[idx]
+        ox = np.minimum(xi1, xa + w) - np.maximum(xa[idx], xa)
+        oy = np.minimum(yi1, ya + h) - np.maximum(ya[idx], ya)
+        m = (ox > 1e-9) & (oy > 1e-9)
+        m[idx] = False
+        return bool(m.any())
+
+    cur_area = bbox_area(x, y)
+    n_mv = len(movable_idx)
+    for _sweep in range(sweeps):
+        moved_any = False
+        for a in range(n_mv):
+            for b in range(a + 1, n_mv):
+                i, j = int(movable_idx[a]), int(movable_idx[b])
+                xi0, yi0 = x[i], y[i]
+                xj0, yj0 = x[j], y[j]
+                if xi0 == xj0 and yi0 == yj0:
+                    continue
+                x[i], y[i] = xj0, yj0
+                x[j], y[j] = xi0, yi0
+                if overlaps_any(i, x, y) or overlaps_any(j, x, y):
+                    x[i], y[i] = xi0, yi0
+                    x[j], y[j] = xj0, yj0
+                    continue
+                new_area = bbox_area(x, y)
+                if new_area < cur_area - 1e-9:
+                    cur_area = new_area
+                    moved_any = True
+                else:
+                    x[i], y[i] = xi0, yi0
+                    x[j], y[j] = xj0, yj0
+        if not moved_any:
+            break
+
+    return x, y
+
+
 # ============================================================
 # Legalization v3: LFF 風格的自由矩形（MAXRECTS）決定性單趟排布
 # ============================================================
@@ -2503,6 +2593,9 @@ def legalize_lff(
     # 改善（0.112→0.106），且幾乎沒有時間成本（compact_merge_clusters 本身
     # 在沒有東西可移動時第一輪就會立刻收斂）。見下方呼叫處說明。
     use_second_merge_pass=True,
+    # v5.22（實驗用，預設關閉）：見 compact_swap docstring 與呼叫處說明
+    use_swap=False,
+    swap_sweeps=3,
     verbose=False,
 ):
     """
@@ -2932,6 +3025,17 @@ def legalize_lff(
         x, y = compact_reinsert(x, y, w, h, preplaced_mask=preplaced_mask,
                                 boundary_code=boundary_code, sweeps=reinsert_sweeps,
                                 grid_density=reinsert_grid_density)
+
+    # ---- Pairwise swap 局部搜尋（v5.22，實驗用）----
+    # compact_reinsert 只看「目前空著」的縫隙，結構上搆不到「把一個 block
+    # 換到另一個 movable block 目前佔用、但換過來後兩邊都更省」的改善——
+    # compact_swap 專門補這塊，見該函式 docstring。放在 compact_reinsert
+    # 之後、compact_positions 之前：先讓 swap 找拓樸層級的改善，再讓
+    # compact_positions 把新拓樸下的縫隙壓緊。
+    if use_swap:
+        x, y = compact_swap(x, y, w, h, preplaced_mask=preplaced_mask,
+                            boundary_code=boundary_code, cluster_group=cluster_group,
+                            sweeps=swap_sweeps)
 
     # ---- 補一個「往鄰居貼齊」的軸對齊壓縮 ----
     # 縮外框那招只對「外框本身還有margin」的情況有用；實測發現 outline 通常

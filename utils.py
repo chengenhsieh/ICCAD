@@ -2513,6 +2513,177 @@ def compact_anneal(x, y, w, h, preplaced_mask=None, boundary_code=None,
     return best_x, best_y
 
 
+# v5.24（實驗用）：sequence-pair 表示法 + 模擬退火
+#
+# v5.22/v5.23 的結論：swap（互換兩個 block 位置）這個 move 類型本身在
+# 現有 pipeline 產出的佈局上找不到任何改善，不管包裝成貪婪窮舉還是退火
+# 都一樣——問題不在搜尋策略，在 move 類型能觸及的解空間太窄。swap 頂多
+# 同時牽動兩個 block；真正可能有效的是「單一 block 搬遷、連帶重新定義
+# 它跟一整排其他 block 的相對順序」，這正是 sequence-pair 表示法
+# （Murata et al., 1996）的拿手好戲：兩條 block 排列（Γ+, Γ-）決定一組
+# pairwise 的「誰在誰的左邊/下面」拓樸關係，從任何一組 (Γ+, Γ-) 都能
+# 用 longest-path 決定性地算出「給定這個拓樸下最緊的合法擺法」（見
+# `_seqpair_decode`）。搜尋時只要「移動一個 block 在 Γ+/Γ- 裡的排列
+# 位置」，就能一次改變它跟中間所有 block 的相對順序——這是 swap（一次
+# 只牽動兩個）跟 compact_reinsert（只找目前空著的位置）結構上都做不到的
+# 表達能力。
+def _seqpair_decode(seq_p, seq_n, w, h, fixed_mask, fixed_x, fixed_y):
+    """
+    給定一組 sequence pair（seq_p, seq_n：兩個都是 block index 的
+    permutation，表示 Γ+/Γ- 的排列順序），用 longest-path 決定性算出
+    每個 block 的 (x, y)：
+
+      - a 在 Γ+、Γ- 都排在 b 前面 -> a 在 b 左邊（x[a]+w[a] <= x[b]）
+      - a 在 Γ+ 排在 b 前面、Γ- 排在 b 後面 -> a 在 b 下面
+        （y[a]+h[a] <= y[b]）
+
+    對每個 fixed_mask=True 的 block（preplaced／boundary 鎖定／cluster
+    分組——沿用 compact_swap／compact_anneal 的同一組排除規則），直接
+    用 fixed_x／fixed_y 給定的已知座標，不參與 longest-path 計算；只有
+    fixed_mask=False 的「自由」block 的座標是被算出來的。
+
+    注意：這個函式只保證「跟 fixed block 以外的座標關係」在數學上一致；
+    如果自由 block 被移動到一個「跟某個 fixed block 實際位置矛盾」的
+    拓樸位置（例如 sequence 裡排在 fixed block 左邊，但算出來的 x 卻
+    大到會跟它重疊），算出來的座標就會真的重疊——這是刻意的設計選擇：
+    正確性由呼叫方（`compact_seqpair`）事後用 `total_overlap` 顯式驗證、
+    不合法就整個丟棄，而不是在這裡用更複雜的雙向約束硬把它修對，避免
+    引入更難驗證的邏輯。
+    """
+    k = len(w)
+    pos_n = np.empty(k, dtype=np.int64)
+    pos_n[seq_n] = np.arange(k)
+
+    x = np.zeros(k, dtype=np.float64)
+    y = np.zeros(k, dtype=np.float64)
+    for rank, b in enumerate(seq_p):
+        if fixed_mask[b]:
+            x[b] = fixed_x[b]
+            y[b] = fixed_y[b]
+            continue
+        preds = seq_p[:rank]
+        if len(preds) == 0:
+            continue
+        preds = np.asarray(preds)
+        pb = pos_n[b]
+        left_preds = preds[pos_n[preds] < pb]
+        below_preds = preds[pos_n[preds] > pb]
+        if len(left_preds) > 0:
+            x[b] = np.max(x[left_preds] + w[left_preds])
+        if len(below_preds) > 0:
+            y[b] = np.max(y[below_preds] + h[below_preds])
+    return x, y
+
+
+def compact_seqpair(x, y, w, h, preplaced_mask=None, boundary_code=None,
+                     cluster_group=None, iters=500, seed=0,
+                     t_start_frac=0.3, t_end_frac=0.01):
+    """
+    Sequence-pair 表示法 + 模擬退火局部搜尋，見上方模組說明。
+
+    初始 sequence pair 從目前的 (x, y) 用對角線排序建構（Γ+ 依
+    x+y 遞增排、Γ- 依 x−y 遞增排——常見的「從現有佈局反推一組合理
+    sequence pair」手法），近似還原目前的拓樸。
+
+    每次迭代：隨機挑一個「自由」block（跟 compact_swap／compact_anneal
+    同一套排除規則——非 preplaced、無 boundary 鎖定、無 cluster 分組），
+    把它從 Γ+ 和/或 Γ- 中移除、插回一個隨機新位置（模擬「這個 block
+    搬到佈局中完全不同的地方」，連帶重新定義它跟中間所有 block 的相對
+    順序）。用 `_seqpair_decode` 解出候選座標，**顯式檢查是否真的沒有
+    重疊**（不信任 decode 對 fixed block 的處理一定自洽，見
+    `_seqpair_decode` docstring 的說明）——不合法直接丟棄這次迭代，不
+    計入 sequence pair 的狀態變化。合法的話，用跟 `compact_anneal` 一樣
+    的退火接受準則（變好必接受、變差以 `exp(-Δarea/T)` 機率接受，溫度
+    隨迭代線性冷卻）決定要不要接受這次搬遷，全程記錄看過的最佳解。
+
+    決定性：給定 `seed` 後全程可重現。
+    """
+    x = np.array(x, dtype=np.float64).copy()
+    y = np.array(y, dtype=np.float64).copy()
+    w = np.asarray(w, dtype=np.float64)
+    h = np.asarray(h, dtype=np.float64)
+    k = len(x)
+    if k < 2:
+        return x, y
+
+    if preplaced_mask is None:
+        preplaced_mask = np.zeros(k, dtype=bool)
+    else:
+        preplaced_mask = np.asarray(preplaced_mask, dtype=bool)
+    if boundary_code is None:
+        boundary_code = np.zeros(k, dtype=np.int64)
+    else:
+        boundary_code = np.asarray(boundary_code, dtype=np.int64)
+    if cluster_group is None:
+        cluster_group = np.zeros(k, dtype=np.int64)
+    else:
+        cluster_group = np.asarray(cluster_group, dtype=np.int64)
+
+    fixed_mask = preplaced_mask | (boundary_code != 0) | (cluster_group != 0)
+    free_idx = np.nonzero(~fixed_mask)[0]
+    if len(free_idx) < 2:
+        return x, y
+
+    def bbox_area(xa, ya):
+        return (np.max(xa + w) - np.min(xa)) * (np.max(ya + h) - np.min(ya))
+
+    def overlaps(xa, ya):
+        for i in range(k):
+            xi1, yi1 = xa[i] + w[i], ya[i] + h[i]
+            ox = np.minimum(xi1, xa + w) - np.maximum(xa[i], xa)
+            oy = np.minimum(yi1, ya + h) - np.maximum(ya[i], ya)
+            m = (ox > 1e-6) & (oy > 1e-6)
+            m[i] = False
+            if m.any():
+                return True
+        return False
+
+    order_diag_p = np.argsort(x + y, kind="stable")
+    order_diag_n = np.argsort(x - y, kind="stable")
+    seq_p = list(order_diag_p)
+    seq_n = list(order_diag_n)
+
+    cur_area = bbox_area(x, y)
+    best_area = cur_area
+    best_x, best_y = x.copy(), y.copy()
+    fx, fy = x.copy(), y.copy()   # fixed block 的已知座標（不變）
+
+    rng = np.random.default_rng(seed)
+    t_start = t_start_frac * cur_area
+    t_end = t_end_frac * cur_area
+
+    for it in range(iters):
+        frac = it / max(iters - 1, 1)
+        temp = t_start + (t_end - t_start) * frac
+
+        b = int(free_idx[rng.integers(len(free_idx))])
+        new_seq_p = seq_p.copy()
+        new_seq_p.remove(b)
+        new_seq_p.insert(int(rng.integers(len(new_seq_p) + 1)), b)
+        new_seq_n = seq_n.copy()
+        new_seq_n.remove(b)
+        new_seq_n.insert(int(rng.integers(len(new_seq_n) + 1)), b)
+
+        cand_x, cand_y = _seqpair_decode(
+            np.asarray(new_seq_p), np.asarray(new_seq_n), w, h, fixed_mask, fx, fy)
+
+        if overlaps(cand_x, cand_y):
+            continue
+
+        new_area = bbox_area(cand_x, cand_y)
+        delta = new_area - cur_area
+        accept = delta < 0 or rng.random() < np.exp(-delta / max(temp, 1e-9))
+        if accept:
+            seq_p, seq_n = new_seq_p, new_seq_n
+            x, y = cand_x, cand_y
+            cur_area = new_area
+            if new_area < best_area - 1e-9:
+                best_area = new_area
+                best_x, best_y = cand_x.copy(), cand_y.copy()
+
+    return best_x, best_y
+
+
 # ============================================================
 # Legalization v3: LFF 風格的自由矩形（MAXRECTS）決定性單趟排布
 # ============================================================
@@ -2704,6 +2875,10 @@ def legalize_lff(
     use_anneal=False,
     anneal_iters=500,
     anneal_seed=0,
+    # v5.24（實驗用，預設關閉）：見 compact_seqpair docstring 與呼叫處說明
+    use_seqpair=False,
+    seqpair_iters=500,
+    seqpair_seed=0,
     verbose=False,
 ):
     """
@@ -3154,6 +3329,17 @@ def legalize_lff(
         x, y = compact_anneal(x, y, w, h, preplaced_mask=preplaced_mask,
                               boundary_code=boundary_code, cluster_group=cluster_group,
                               iters=anneal_iters, seed=anneal_seed)
+
+    # ---- Sequence-pair + 模擬退火（v5.24，實驗用）----
+    # v5.22/v5.23 證實 swap 這個 move 類型本身在真實資料上找不到任何
+    # 改善——sequence-pair 表示法能表達「單一 block 搬遷、連帶重新定義
+    # 它跟一整排其他 block 的相對順序」，是 swap 結構上做不到的能力，
+    # 見 compact_seqpair docstring。獨立於 use_swap/use_anneal 的開關，
+    # 接在它們之後從目前的結果繼續搜。
+    if use_seqpair:
+        x, y = compact_seqpair(x, y, w, h, preplaced_mask=preplaced_mask,
+                               boundary_code=boundary_code, cluster_group=cluster_group,
+                               iters=seqpair_iters, seed=seqpair_seed)
 
     # ---- 補一個「往鄰居貼齊」的軸對齊壓縮 ----
     # 縮外框那招只對「外框本身還有margin」的情況有用；實測發現 outline 通常

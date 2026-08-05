@@ -603,6 +603,69 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.24 —— `compact_seqpair`：sequence-pair 表示法 + 模擬退火（不採用，找到真正的根因）
+
+**背景**：v5.22/v5.23 證實 swap（互換兩個 block 位置）這個 move 類型
+本身在真實資料上找不到任何改善——問題可能不在「牽動幾個 block」，而在
+swap 沒有「單一 block 搬遷、連帶重新定義它跟一整排其他 block 相對順序」
+的表達能力。Sequence-pair 表示法（Murata et al., 1996）正是為了這個能力
+設計的：兩條 block 排列（Γ+、Γ-）決定一組 pairwise 拓樸關係，任何一組
+排列都能用 longest-path 決定性地解出「給定這個拓樸下最緊的合法擺法」。
+這是使用者原本就想試的「換掉 LFF」的一個折衷版本——不是重寫整個排布
+邏輯，而是在 LFF+既有壓縮跑完之後，用 sequence-pair 的搜尋能力補一輪
+更強力的後處理。
+
+**實作**：`utils.py` 新增 `_seqpair_decode`（sequence-pair -> 座標的
+longest-path 解碼器）與 `compact_seqpair`（局部搜尋主體）。跟
+`compact_anneal` 用同一套退火接受準則跟排除規則（非 preplaced、無
+boundary 鎖定、無 cluster 分組的「自由」block 才會被移動）；被排除的
+block 直接把它們目前的座標當已知常數餵給 decode（不參與 longest-path
+計算）。**正確性用兩層保護**：(1) decode 本身的 longest-path 公式在
+數學上保證同一拓樸下的最緊合法擺法；(2) 但因為排除的 block 只是被
+「當常數處理」，沒有嚴格證明對它們一定自洽，所以每次搜尋出候選解都會
+額外呼叫 `total_overlap` 顯式驗證，不合法直接丟棄，不信任理論保證。
+
+驗證得非常徹底（這是這個 session 目前寫過最複雜的一個函式）：
+- decode 正確性：對一個已知合法佈局，反推它自己的 sequence pair 再解碼
+  回去，確實得到不重疊、面積更小或相等的結果（實測 1345.8→562.6，
+  找到原佈局自己都沒發現的內部縫隙）。
+- 30 組隨機合成案例 fuzz test（不同 k、不同自由/固定比例）：100% 不重疊、
+  100% 面積不變差、固定 block 100% 不動。
+- edge case（k=0/1/2、全部 block 都固定）：正常運作、不 crash。
+- 決定性：給定 seed 後可重現；不同 seed 給不同結果（隨機性確實在探索）。
+- 合成測試效果非常好：15 個 block 的隨機網格佈局，1345.8→360.8
+  （無限制）／441.0（3 個固定 block），比 compact_swap／compact_anneal
+  在類似合成案例上的效果都好上一截。
+
+**真實資料驗證**（20 樣本，`seqpair_iters ∈ {500, 2000}` vs 關閉）：
+**area_gap 三組完全一模一樣（0/20 較好、0/20 較差、20/20 打平）**，
+legalize 時間卻大幅增加（1.29s→2.77s，2000 次迭代時整體 runtime 增加
+超過 70%）——即使是驗證過遠比 swap 更強力的搜尋機制，在真實資料上依然
+一次改善都找不到。
+
+**真正的根因**：檢查真實資料的「自由 block」比例才發現關鍵——**平均只
+有 ~39% 的 block 完全沒有 boundary/cluster/preplaced 限制**，小案例
+（k=21-36）甚至只有 19-26%。合成測試幾乎全部 block 都自由（12-15/15），
+真實資料卻只有兩三成，這就是為什麼合成測試效果好、真實資料完全找不到
+改善的根本原因：**這三個機制（swap/anneal/seqpair）能碰的解空間，
+在真實資料上本來就只佔整個問題的一小塊**，真正決定 packing 效率的是
+那 60-80% 有限制的 block，而它們的位置由專門的機制（`compact_merge_
+clusters`／`compact_merge_cluster_groups`／boundary 相關邏輯）決定，
+這些機制在 session 更早期（v4.5-v4.9）已經被大量調校過。
+
+**決定**：**不採用**（`use_seqpair` 維持預設 `False`）。這次的調查（連同
+v5.22、v5.23）把「LFF 造成的 packing 天花板」這個假說徹底釐清了：不是
+「排布演算法本身太弱、需要換掉」，而是「絕大多數 block 的位置從一開始
+就被 boundary/cluster/preplaced 這些 hard/soft constraint 決定了，跟
+排布演算法選 LFF 還是別的沒有太大關係」——79% 這個數字，主要反映的是
+「這個問題本身有多少 block 是真正自由可排的」，而不是某個特定排布演算法
+的品質上限。要再往下挖，方向會是「怎麼讓 constrained block 也排得更緊」
+（例如 cluster group 整體當一個 sequence-pair 節點搬遷），但那已經不是
+「換掉 LFF」，而是要動既有的、已經調校過的 constraint-handling 機制，
+風險層級不一樣。機制（`_seqpair_decode`／`compact_seqpair`）保留備用。
+
+---
+
 ## v5.23 —— `compact_anneal`：swap + 模擬退火（不採用，證實問題不在搜尋策略）
 
 **背景**：v5.22 的純貪婪 `compact_swap` 在真實資料上一次改善都找不到。

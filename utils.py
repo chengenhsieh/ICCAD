@@ -2838,6 +2838,188 @@ def compact_seqpair(x, y, w, h, preplaced_mask=None, boundary_code=None,
     return best_x, best_y
 
 
+def compact_seqpair_grouped(x, y, w, h, preplaced_mask=None, boundary_code=None,
+                            cluster_group=None, iters=500, seed=0,
+                            t_start_frac=0.3, t_end_frac=0.01,
+                            relax_boundary=False):
+    """
+    v5.27（實驗用，預設關閉）：跟 `compact_seqpair` 同一套 sequence-pair +
+    模擬退火局部搜尋，差別只在「節點」的定義——這裡把每個 cluster group
+    當成**一個剛體超節點**一起參與拓樸搜尋，而不是像 `compact_seqpair`
+    （含 v5.25 的 `relax_boundary`）那樣把所有 cluster 分組的 block 永遠
+    排除在搜尋之外、當成不能動的常數。
+
+    背景：v5.26 用視覺化診斷比對 legalized vs. GT optimal 發現，boundary
+    鎖定的 block 卡在離內部主體很遠的地方，但它們旁邊「看起來空著」的
+    空間，其實通常已經被附近的 cluster 分組 block 佔走大半，只是沒有精確
+    貼齊——`compact_swap`／`compact_anneal`／`compact_seqpair`／
+    `compact_boundary_shelf` 全部都把 cluster 分組的 block 排除在搜尋之外，
+    結構上就碰不到「boundary block 移動、連帶把擋路的 cluster group 也
+    一起挪開」這種聯合式改善。這個函式直接補上這個能力：因為 sequence-pair
+    的 longest-path 解碼在拓樸改變時，本來就會重新計算所有非固定節點的
+    位置，讓一整個 cluster group 變成一個節點，就代表單一次被接受的搬遷
+    可能連帶讓它自動避開（或讓路給）其他節點，不需要另外寫「同時搬兩個
+    東西」的邏輯——這是純粹「一次一個 block」的局部搜尋在結構上做不到的。
+
+    節點建構：
+      - 每個 cluster group（`cluster_group` 相同且 >0 的所有 block）合併成
+        **一個節點**，節點的 (w, h) 是這個 group 目前的 bounding box，每個
+        成員相對 group 錨點（bbox 的 xmin, ymin）的偏移量在整個搜尋過程中
+        **凍結不變**——group 永遠只整體平移，內部佈局（已經被
+        `compact_merge_cluster_groups` 等機制調校過）完全不會被動到。
+      - 沒有分組的 block：一個 block 一個節點，跟 `compact_seqpair` 一樣。
+      - 「固定」的判斷比照 `compact_seqpair`：節點裡只要有任何一個成員是
+        preplaced，整個節點就固定不動（preplaced 位置是不能談判的硬限制，
+        跟 `compact_merge_clusters` 的既有規則一致：
+        `if preplaced_mask[comp_mask].any(): continue`）。`relax_boundary`
+        （語意跟 v5.25 相同）額外決定：節點裡只要有任何一個成員被 boundary
+        鎖定，這個節點是否也要當固定常數——`False`（預設）時鎖定，`True`
+        時放行（該節點也能搬，靠 `compute_boundary_violations` 事後把關）。
+
+    正確性（跟 `compact_seqpair` 同一套「不信任解碼本身的正確性推論」
+    原則，一律事後在**完整逐 block 陣列**上顯式驗證，不只在節點層級）：
+      - `overlaps`：候選解展開回全部 block 後兩兩不重疊。
+      - `relax_boundary=True` 時額外用 `compute_boundary_violations`
+        確認總違規數不超過移動前，貼邊定義相對候選解自己的 bounding box。
+      - **不需要呼叫 `compute_cluster_violations`**：因為每個 group 節點
+        的成員偏移量全程凍結、只整體平移，group 內部的貼合/連通關係在
+        數學上保證不變——V_grouping 相對 baseline 不可能因為這個函式而
+        改變，這是可證明的不變量，不是假設。
+
+    SA 接受準則、溫度排程跟 `compact_seqpair` 完全相同（看 bbox 面積變化，
+    變好必接受、變差以 `exp(-Δarea/T)` 機率接受，溫度隨迭代線性冷卻）。
+    決定性：給定 `seed` 後全程可重現。
+    """
+    x = np.array(x, dtype=np.float64).copy()
+    y = np.array(y, dtype=np.float64).copy()
+    w = np.asarray(w, dtype=np.float64)
+    h = np.asarray(h, dtype=np.float64)
+    k = len(x)
+    if k < 2:
+        return x, y
+
+    if preplaced_mask is None:
+        preplaced_mask = np.zeros(k, dtype=bool)
+    else:
+        preplaced_mask = np.asarray(preplaced_mask, dtype=bool)
+    if boundary_code is None:
+        boundary_code = np.zeros(k, dtype=np.int64)
+    else:
+        boundary_code = np.asarray(boundary_code, dtype=np.int64)
+    if cluster_group is None:
+        cluster_group = np.zeros(k, dtype=np.int64)
+    else:
+        cluster_group = np.asarray(cluster_group, dtype=np.int64)
+
+    # ---- 建節點：沒分組的 block 各自一個節點；每個 cluster group 一個節點 ----
+    group_ids = sorted(int(g) for g in np.unique(cluster_group) if g > 0)
+    solo_idx = np.nonzero(cluster_group == 0)[0]
+
+    node_members = [[int(i)] for i in solo_idx]
+    for gid in group_ids:
+        node_members.append(np.nonzero(cluster_group == gid)[0].tolist())
+    n_nodes = len(node_members)
+
+    node_w = np.zeros(n_nodes, dtype=np.float64)
+    node_h = np.zeros(n_nodes, dtype=np.float64)
+    node_x0 = np.zeros(n_nodes, dtype=np.float64)   # 目前的錨點（bbox xmin,ymin）
+    node_y0 = np.zeros(n_nodes, dtype=np.float64)
+    node_preplaced_like = np.zeros(n_nodes, dtype=bool)
+    node_has_boundary_member = np.zeros(n_nodes, dtype=bool)
+
+    member_ox = np.zeros(k, dtype=np.float64)   # 每個 block 相對所屬節點錨點的偏移量
+    member_oy = np.zeros(k, dtype=np.float64)
+    block_node = np.zeros(k, dtype=np.int64)    # 每個 block 屬於哪個節點
+
+    for ni, members in enumerate(node_members):
+        members_arr = np.asarray(members, dtype=np.int64)
+        block_node[members_arr] = ni
+        gxmin = float(x[members_arr].min())
+        gymin = float(y[members_arr].min())
+        gxmax = float((x[members_arr] + w[members_arr]).max())
+        gymax = float((y[members_arr] + h[members_arr]).max())
+        node_x0[ni] = gxmin; node_y0[ni] = gymin
+        node_w[ni] = gxmax - gxmin; node_h[ni] = gymax - gymin
+        member_ox[members_arr] = x[members_arr] - gxmin
+        member_oy[members_arr] = y[members_arr] - gymin
+        node_preplaced_like[ni] = bool(preplaced_mask[members_arr].any())
+        node_has_boundary_member[ni] = bool((boundary_code[members_arr] > 0).any())
+
+    if relax_boundary:
+        node_fixed = node_preplaced_like.copy()
+    else:
+        node_fixed = node_preplaced_like | node_has_boundary_member
+    free_nodes = np.nonzero(~node_fixed)[0]
+    if len(free_nodes) < 2:
+        return x, y
+
+    def bbox_area(xa, ya):
+        return (np.max(xa + w) - np.min(xa)) * (np.max(ya + h) - np.min(ya))
+
+    def overlaps(xa, ya):
+        for i in range(k):
+            xi1, yi1 = xa[i] + w[i], ya[i] + h[i]
+            ox = np.minimum(xi1, xa + w) - np.maximum(xa[i], xa)
+            oy = np.minimum(yi1, ya + h) - np.maximum(ya[i], ya)
+            m = (ox > 1e-6) & (oy > 1e-6)
+            m[i] = False
+            if m.any():
+                return True
+        return False
+
+    order_diag_p = np.argsort(node_x0 + node_y0, kind="stable")
+    order_diag_n = np.argsort(node_x0 - node_y0, kind="stable")
+    seq_p = list(order_diag_p)
+    seq_n = list(order_diag_n)
+
+    cur_area = bbox_area(x, y)
+    best_area = cur_area
+    best_x, best_y = x.copy(), y.copy()
+    node_fx, node_fy = node_x0.copy(), node_y0.copy()   # 固定節點的已知錨點（不變）
+
+    rng = np.random.default_rng(seed)
+    t_start = t_start_frac * cur_area
+    t_end = t_end_frac * cur_area
+
+    for it in range(iters):
+        frac = it / max(iters - 1, 1)
+        temp = t_start + (t_end - t_start) * frac
+
+        b = int(free_nodes[rng.integers(len(free_nodes))])
+        new_seq_p = seq_p.copy()
+        new_seq_p.remove(b)
+        new_seq_p.insert(int(rng.integers(len(new_seq_p) + 1)), b)
+        new_seq_n = seq_n.copy()
+        new_seq_n.remove(b)
+        new_seq_n.insert(int(rng.integers(len(new_seq_n) + 1)), b)
+
+        node_cand_x, node_cand_y = _seqpair_decode(
+            np.asarray(new_seq_p), np.asarray(new_seq_n), node_w, node_h,
+            node_fixed, node_fx, node_fy)
+
+        cand_x = node_cand_x[block_node] + member_ox
+        cand_y = node_cand_y[block_node] + member_oy
+
+        if overlaps(cand_x, cand_y):
+            continue
+        if relax_boundary and compute_boundary_violations(
+                cand_x, cand_y, w, h, boundary_code) != 0:
+            continue
+
+        new_area = bbox_area(cand_x, cand_y)
+        delta = new_area - cur_area
+        accept = delta < 0 or rng.random() < np.exp(-delta / max(temp, 1e-9))
+        if accept:
+            seq_p, seq_n = new_seq_p, new_seq_n
+            x, y = cand_x, cand_y
+            cur_area = new_area
+            if new_area < best_area - 1e-9:
+                best_area = new_area
+                best_x, best_y = cand_x.copy(), cand_y.copy()
+
+    return best_x, best_y
+
+
 # ============================================================
 # Legalization v3: LFF 風格的自由矩形（MAXRECTS）決定性單趟排布
 # ============================================================
@@ -3040,6 +3222,14 @@ def legalize_lff(
     # 呼叫處說明。
     use_boundary_shelf=False,
     boundary_shelf_rounds=10,
+    # v5.27（實驗用，預設關閉）：見 compact_seqpair_grouped docstring。兩個
+    #獨立開關對應兩個候選 pipeline 位置（見呼叫處說明），共用同一組
+    # iters/seed/relax_boundary 參數。
+    use_seqpair_grouped=False,
+    use_seqpair_grouped_end=False,
+    seqpair_grouped_iters=500,
+    seqpair_grouped_seed=0,
+    seqpair_grouped_relax_boundary=False,
     verbose=False,
 ):
     """
@@ -3503,6 +3693,20 @@ def legalize_lff(
                                iters=seqpair_iters, seed=seqpair_seed,
                                relax_boundary=seqpair_relax_boundary)
 
+    # ---- Sequence-pair，cluster group 當剛體超節點（v5.27，實驗用，位置 A）----
+    # v5.24/v5.25 的 compact_seqpair 把所有 cluster 分組的 block 永遠排除在
+    # 搜尋外、當固定障礙物——v5.26 的視覺化診斷發現真實資料上的縫隙，很多時候
+    # 正是被這些排除掉的 cluster group 擋住。compact_seqpair_grouped 把每個
+    # cluster group 當一個剛體節點一起加入搜尋，見該函式 docstring。這裡放在
+    # 跟其餘 seqpair 家族一樣的位置（用壓縮前的 group 幾何）；另外在 pipeline
+    # 尾端（use_seqpair_grouped_end）也放了一份，比照 v5.26 的教訓兩個位置都
+    # 測過再下結論。
+    if use_seqpair_grouped:
+        x, y = compact_seqpair_grouped(x, y, w, h, preplaced_mask=preplaced_mask,
+                                       boundary_code=boundary_code, cluster_group=cluster_group,
+                                       iters=seqpair_grouped_iters, seed=seqpair_grouped_seed,
+                                       relax_boundary=seqpair_grouped_relax_boundary)
+
     # ---- 補一個「往鄰居貼齊」的軸對齊壓縮 ----
     # 縮外框那招只對「外框本身還有margin」的情況有用；實測發現 outline 通常
     # 已經被 boundary-priority block 撐到最緊（四邊 slack 幾乎是 0），真正的
@@ -3651,6 +3855,19 @@ def legalize_lff(
                                       boundary_code=boundary_code,
                                       cluster_group=cluster_group,
                                       rounds=boundary_shelf_rounds, verbose=verbose)
+
+    # ---- Sequence-pair，cluster group 當剛體超節點（v5.27，實驗用，位置 B）----
+    # 跟上方 use_seqpair_grouped 是同一個函式，這裡放在 pipeline 最尾端、
+    # compact_merge_cluster_groups 已經把每個 group 內部盡量壓緊之後——這樣
+    # 被凍結當剛體的 group bbox 有最好的機會是真的緊的，也比照 v5.26 學到的
+    # 教訓，避免改變後續貪婪 pass 的起點（此時後面只剩防禦性驗證，不會再被
+    # 任何 pass 撤銷或改道）。兩個位置各自獨立測試比較，見呼叫處的真實資料
+    # 驗證結果。
+    if use_seqpair_grouped_end:
+        x, y = compact_seqpair_grouped(x, y, w, h, preplaced_mask=preplaced_mask,
+                                       boundary_code=boundary_code, cluster_group=cluster_group,
+                                       iters=seqpair_grouped_iters, seed=seqpair_grouped_seed,
+                                       relax_boundary=seqpair_grouped_relax_boundary)
 
     # ---- 保底驗證：理論上此時已經零重疊，這裡只是零成本的防禦性再確認 ----
     preplaced_idx_list = [i for i in range(k) if preplaced_mask[i]]

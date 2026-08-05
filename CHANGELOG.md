@@ -603,6 +603,74 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.27 —— `compact_seqpair_grouped`：cluster group 當剛體超節點（不採用，八個機制收斂到同一個結論）
+
+**背景**：v5.26 診斷出真實資料上的縫隙，很多時候是被 cluster 分組的 block
+擋住——但 `compact_swap`/`compact_anneal`/`compact_seqpair`（含 v5.25
+`relax_boundary`）/`compact_boundary_shelf` 全部都把 cluster 分組的 block
+永遠排除在搜尋外，結構上就碰不到「boundary block 移動、連帶把擋路的
+cluster group 也一起挪開」這種聯合式改善。使用者同意進行一次有明確範圍的
+「重寫」，針對這個具體瓶頸。
+
+**設計**：把每個 cluster group 當成 sequence-pair 拓樸裡的**一個剛體超
+節點**（節點形狀 = group 目前的 bounding box，成員相對 group 錨點的偏移量
+全程凍結，group 只整體平移、內部佈局完全不動），跟個別的 free/boundary
+block 一起參與 `compact_seqpair`（v5.24）同一套 SA 搜尋。核心優勢：
+sequence-pair 的 longest-path 解碼在拓樸改變時本來就會重新計算所有非固定
+節點的位置，讓 group 變成一個節點，代表單一次被接受的搬遷就可能連帶讓它
+自動避開其他節點——不需要另外寫「同時搬兩個東西」的邏輯，這是「一次一個
+block」的局部搜尋在結構上做不到的。實作直接複用 `_seqpair_decode`（它本來
+就不在乎一個節點是一個真實 block 還是合成的聚合體，完全不用改）。
+
+正確性沿用 `compact_seqpair` 同一套「不信任解碼本身」的驗證模式：完整逐
+block 陣列上做 `overlaps` 檢查、`relax_boundary=True` 時額外檢查
+`compute_boundary_violations`；**不需要**呼叫 `compute_cluster_violations`
+——因為 group 成員偏移量凍結、只整體平移，V_grouping 在數學上保證不變，
+這點在 docstring 裡以證明而非假設的方式寫清楚。
+
+**驗證**：
+- 40 組隨機合成案例 fuzz test（含隨機 cluster 分組 + boundary code）：
+  100% 不重疊、100% boundary 違規不變差、100% bbox 面積不變差，**新增的
+  不變量**——每個 group 成員相對自己 group 錨點的偏移量前後逐位元相同
+  ——100% 通過，證明「內部佈局凍結」這個保證在實作裡真的成立。
+- 刻意構造的驗證案例（LEFT-locked boundary block 貼著 x=0、3 人 cluster
+  group 隔著一段距離、2 個無關 free block）：純 `compact_seqpair`（cluster
+  被排除）只能靠 free block 把面積從 703 壓到 444；`compact_seqpair_
+  grouped` 額外把整個 cluster group 當剛體滑過去貼齊 boundary block，
+  面積進一步壓到 **221**，不重疊、boundary 限制依然滿足、group 內部偏移量
+  完全保留——證實機制本身正確運作，而且確實能找到純 `compact_seqpair`
+  找不到的改善。
+
+**真實資料驗證**（20 樣本，`seqpair_grouped_iters=1000`，
+`relax_boundary=True`，在兩個候選 pipeline 位置各測一次——比照 v5.26 的
+教訓，一個放在跟其餘 seqpair 家族一樣的中段位置，一個放在
+`compact_boundary_shelf` 旁邊的尾端位置）：**area_gap 兩個位置都是
+20/20 完全打平**（0 個變好、0 個變差），legalize 時間卻明顯增加（0.86s→
+1.71-1.75s，將近兩倍）；V_relative 中段位置打平，尾端位置 1/20 略為變差
+（0.031→0.047）。即使是驗證過在合成案例上確實比純 `compact_seqpair` 更
+強力的機制，在真實資料上依然一次改善都找不到。
+
+**決定**：**不採用**（`use_seqpair_grouped`／`use_seqpair_grouped_end`
+維持預設 `False`）。這是這個 session 針對「怎麼提升 packing density」這個
+問題測試的第八個機制（v5.22 swap、v5.23 anneal、v5.24 seqpair、v5.25
+relax_boundary、v5.26 boundary_shelf ×2 個位置、v5.27 seqpair_grouped ×2
+個位置），全部收斂到同一個結論：**每一個「事後在 legalize 階段做局部/聯合
+搜尋」的機制，不論多強力、不論驗證過在合成案例上多有效，在真實資料上都是
+零改善**。這已經不是單一機制不夠強的問題——`compact_seqpair_grouped`
+明確補上了前七個機制都沒有的「聯合搬遷 cluster group」能力，依然找不到
+任何真實改善，代表真實資料上的縫隙結構，跟這個 session 診斷出來、也在合成
+案例上成功重現的「boundary block 被孤立的 cluster group 卡住」這個模式，
+即使存在，也不是真實資料 area_gap 的主要成因——真正的落差更可能來自：
+初始 diffusion 預測本身的品質、preplaced block 位置這種完全不能談判的
+硬限制、或者 block 形狀（aspect ratio）選擇在最初 LFF 放置階段就已經
+定型、後面任何幾何搬遷都補不回來。要再往下挖，方向必須離開「legalize 階段
+的局部搜尋」這整個家族，改成從 diffusion 模型本身（例如訓練時直接把
+packing density 當成一個 loss 項）或者從根本重新設計 LFF 的初始放置策略
+下手——這兩者的風險與工作量都遠高於這個 session 目前為止試過的任何一個
+機制，需要使用者另外決定要不要投入。機制與診斷方法論全部保留備用。
+
+---
+
 ## v5.26 —— `compact_boundary_shelf`：視覺化診斷 + 同邊 boundary block 貼齊（不採用，找到比 v5.24 更精確的根因）
 
 **背景**：使用者問「想盡力解決空間使用率問題，可以怎麼做」。v5.22-v5.25

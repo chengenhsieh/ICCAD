@@ -603,6 +603,82 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.26 —— `compact_boundary_shelf`：視覺化診斷 + 同邊 boundary block 貼齊（不採用，找到比 v5.24 更精確的根因）
+
+**背景**：使用者問「想盡力解決空間使用率問題，可以怎麼做」。v5.22-v5.25
+已經證實三種局部搜尋機制（swap/anneal/seqpair/relax_boundary）在真實
+資料上全部找不到改善，但那些實驗都是「先假設一種自由度、再測試」——這次
+改成先診斷：把 legalized 解跟官方 GT optimal 解逐 block 畫出來比對
+（`x,y,w,h` 都從 `run_one_sample` 回傳，新增 `constraints_pb` 欄位帶出
+每個 block 的 preplaced/boundary/cluster 分類），對真實資料 20 樣本篩選
+中 area_gap 最差的 4 個樣本（tid=75/40/15/30）視覺化。
+
+**發現**：三個樣本都是同一個模式——GT 的 boundary block 沿著同一條鎖定邊
+緊密相連、直接貼齊內部的 cluster/free block；我們的解在同一條邊上的
+boundary block 之間有明顯縫隙，boundary 那排跟內部主體之間也空一大塊
+沒人填。**先排除搜尋解析度問題**：把 `compact_reinsert` 的
+`grid_density` 4→40、`sweeps` 1→8 重新跑同樣 4 個樣本，legalized 座標
+逐 block 完全相同（不是差距縮小，是連一個 block 都沒有移動）——證實
+`compact_reinsert` 的「單一 block cost 必須嚴格變小」貪婪準則結構上碰
+不到這種「移動這個 block 本身不會讓 bbox 變小、純粹是幫另一個 block
+讓路」的改善。追查 `compact_merge_clusters`（v4.5-v4.9，目前預設開啟）
+發現它雖然設計動機正是「主要群聚跟衛星群中間空一塊」，但只對「已經彼此
+貼合的連通分量」做整群剛體平移、且只沿鎖定軸方向處理——同一條邊上互不
+相鄰的 boundary block（各自是獨立的連通分量）之間，沿著自由軸的縫隙
+完全沒有任何現有機制處理過。
+
+**實作**：`compact_boundary_shelf`（見 docstring）：對 LEFT/RIGHT/TOP/
+BOTTOM 四個 bit 各自收集「有這個 bit、非 preplaced、非 cluster 分組」的
+block（cluster 分組排除比照 `compact_swap`/`compact_anneal` 既有慣例），
+依自由軸座標排序後由低到高逐一嘗試滑向前一個 block 的邊緣。安全性：
+每步都用二分法找最大安全距離，顯式檢查跟其餘所有 block 不重疊、且用
+官方對齊的 `compute_boundary_violations` 確認總違規數不超過移動前，
+兩者任一不通過就退回不動。
+
+**驗證**：
+- 40 組隨機合成案例 fuzz test（含隨機 cluster 分組）：100% 不重疊、
+  100% boundary 違規不變差、100% cluster block 完全不動、100% bbox
+  面積不變差。
+- 刻意設計的驗證案例（3 個 LEFT-locked block 沿 y 軸有縫隙、2 個內部
+  free block）：縫隙完全消除（y 座標從 [0,15,40] 收斂到 [0,5,10]），
+  面積 1344.0→980.0（-27%），不重疊、boundary 限制依然滿足——證實機制
+  本身正確運作。
+
+**真實資料驗證，第一次（放在第一次 compact_merge_clusters 之後、其餘
+壓縮 pass 之前）**：20 樣本中 area_gap **0 個變好、1 個明顯變差**
+（tid=75：+36.5%→+40.4%）、V_relative 同一樣本也變差；avg_real_cost
+1.1149→1.1157，退步。追查發現**不是 compact_boundary_shelf 自己的移動
+讓面積變大**（它有自己的安全閘門，數學上不可能）——而是它改變了後續
+`compact_gravity`/`compact_reinsert`/`compact_positions`/第二次
+`compact_merge_clusters` 這些貪婪 pass 的起點，讓它們收斂到不同、更差的
+最終解。這正是 v4.9（`compact_pair_reinsert`）踩過的同一個坑：任何
+「局部保證不變差」的 pass，只要放在後面還有其他貪婪 pass 會重新處理同一批
+block 的位置之前，就不能保證對「最終」結果也是單調不變差。
+
+**真實資料驗證，第二次（改放到 pipeline 最尾端，比照 v4.9/v5.1 的
+慣例）**：同樣 20 樣本，area_gap **20/20 完全打平**（0 個變好、0 個變
+差）、V_relative 1 個變好／1 個變差／18 個打平（大致抵銷）、
+avg_real_cost 幾乎無變化（1.0940→1.0930，雜訊範圍內）。放對位置後不再
+退步，但也完全沒有找到任何淨改善——**到 pipeline 尾端時，其他壓縮 pass
+早就把可用的自由空間用掉了，沒有剩餘空間留給這個機制去關閉縫隙**。
+
+**這次診斷比 v5.24 更精確地定位了根因**：視覺上看到的縫隙是真的、GT 也
+證實它是可以被壓縮掉的，但真實資料上「看起來空著」的地方，幾乎都已經被
+附近某個 block 占走大半（只是沒有精確貼齊）——單一 block 沿自由軸滑動、
+撞到第一個障礙物就停的搜尋，能碰到的空間非常有限。要真正關掉這種縫隙，
+需要的是「boundary block 滑動的同時，連帶把擋路的內部 block 也一起挪開」
+這種真正的聯合/2D 重新排位，不是任何「一次一個 block、保證不變差」的
+局部搜尋能達到的——這跟 v5.24 的結論一致（真正決定 packing 效率的是
+constrained block 的整體佈局結構），但這次多了具體的視覺化證據跟兩個
+不同 pipeline 位置的對照實驗，把「為什麼碰不到」講得更清楚。
+
+**決定**：**不採用**（`use_boundary_shelf` 維持預設 `False`）。機制、
+視覺化診斷腳本方法論保留備用——如果之後要挖「boundary block 聯合內部
+obstacle 一起重新排位」這個方向，這裡的診斷工具跟安全驗證機制可以直接
+複用。
+
+---
+
 ## v5.25 —— `compact_seqpair` 的 `relax_boundary` 選項（不採用，驗證了 v5.24 根因的另一面）
 
 **背景**：v5.24 找到真正的根因後，結尾提到往下挖的方向是「怎麼讓

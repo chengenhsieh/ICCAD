@@ -673,6 +673,137 @@ def compact_reinsert(x, y, w, h, preplaced_mask=None, boundary_code=None,
     return x, y
 
 
+def compact_boundary_shelf(x, y, w, h, preplaced_mask=None, boundary_code=None,
+                           cluster_group=None, rounds=10, verbose=False):
+    """
+    v5.26（實驗用，預設關閉）：把同一條鎖定邊上的 boundary block 沿著它們
+    的「自由軸」互相滑動貼齊，消掉彼此之間的縫隙。
+
+    動機：對一批真實案例逐 block 比對 legalized vs. GT optimal 後發現，
+    我們的解在視覺上有兩種一直沒被任何現有機制處理過的留白：(1) 同一條
+    邊上、彼此沒有相鄰的 boundary block 之間，沿著「自由軸」（例如
+    LEFT-locked block 之間的 y 方向、TOP-locked block 之間的 x 方向）留下
+    縫隙；(2) 這連帶讓 boundary 那一排的輪廓比它「理論上能達到」的還鬆散，
+    後面的 compact_merge_clusters／compact_reinsert 才會構不到、貼不緊。
+    現有機制都沒有直接處理 (1)：`compact_reinsert`（grid search，經 fine-
+    grid/more-sweeps 診斷測試證實在真實資料上對這批 block 一次都沒找到
+    改善——貪婪的「單一 block cost 必須嚴格變小」準則結構上碰不到這種
+    「移動這個 block 本身不會讓 bbox 變小，純粹是幫另一個 block 讓路」的
+    改善）；`compact_merge_clusters`（v4.5-v4.9）只對「已經彼此貼合的連通
+    分量」做整群剛體平移、且只沿鎖定軸方向處理——同一條邊上互不相鄰的
+    boundary block 各自是獨立的連通分量，這個機制根本碰不到它們彼此間的
+    自由軸縫隙；`compact_snap_boundary`（v4.8）處理的是「還沒真正貼到鎖定
+    那條邊」，也是鎖定軸方向，同樣不處理自由軸。
+
+    作法：對 LEFT/RIGHT/TOP/BOTTOM 四個 bit 各自收集「有這個 bit、非
+    preplaced、非 cluster 分組」的 block（cluster 分組的排除比照
+    `compact_swap`/`compact_anneal` 的既有慣例——避免跟 V_grouping 的
+    connectivity 檢查搶動同一批 block、也避免昂貴的 shapely 連通性檢查
+    進到這裡的內層迴圈），依它們目前在「自由軸」上的座標排序，然後由低到
+    高逐一嘗試把每個 block 沿自由軸滑向前一個 block 的邊緣（貼齊、消除
+    縫隙）；鎖定軸座標完全不動，維持原本的貼邊關係。
+
+    正確性：每一步滑動都用二分法找最大安全距離——顯式檢查 (a) 跟其餘所有
+    block（不只是同一條邊上的）不重疊、(b) 用官方對齊的
+    `compute_boundary_violations` 確認總違規數不超過移動前。兩者都不通過
+    就退回到不動；只要有一絲不安全就整個放棄這一步，不影響其他 block。
+
+    preplaced_mask: 完全不動（當固定障礙物）。
+    cluster_group:  有分組的 boundary block 完全不參與（見上方動機說明）。
+    boundary_code:  決定哪些 block 參與、鎖定軸/自由軸怎麼分。
+    rounds:         外層重複次數（跨邊界的移動可能連帶開出新機會，見
+                    compact_merge_clusters 的相同設計）；沒有東西可動就
+                    提前結束。
+    """
+    x = np.array(x, dtype=np.float64).copy()
+    y = np.array(y, dtype=np.float64).copy()
+    w = np.asarray(w, dtype=np.float64)
+    h = np.asarray(h, dtype=np.float64)
+    k = len(x)
+    if k < 2:
+        return x, y
+    if preplaced_mask is None:
+        preplaced_mask = np.zeros(k, dtype=bool)
+    else:
+        preplaced_mask = np.asarray(preplaced_mask, dtype=bool)
+    if boundary_code is None:
+        boundary_code = np.zeros(k, dtype=np.int64)
+    else:
+        boundary_code = np.asarray(boundary_code, dtype=np.int64)
+    if not (boundary_code > 0).any():
+        return x, y
+    if cluster_group is None:
+        cluster_group = np.zeros(k, dtype=np.int64)
+    else:
+        cluster_group = np.asarray(cluster_group, dtype=np.int64)
+
+    eligible = (~preplaced_mask) & (cluster_group == 0)
+
+    def _slide(i, target, axis_free):
+        cur = float(y[i]) if axis_free == 'y' else float(x[i])
+        if abs(target - cur) < 1e-9:
+            return False
+        baseline_v = compute_boundary_violations(x, y, w, h, boundary_code)
+        others = np.ones(k, dtype=bool)
+        others[i] = False
+
+        def feasible(val):
+            if axis_free == 'y':
+                yt = y.copy(); yt[i] = val; xt = x
+            else:
+                xt = x.copy(); xt[i] = val; yt = y
+            ox = np.minimum(xt[i] + w[i], xt[others] + w[others]) - np.maximum(xt[i], xt[others])
+            oy = np.minimum(yt[i] + h[i], yt[others] + h[others]) - np.maximum(yt[i], yt[others])
+            if np.any((ox > 1e-9) & (oy > 1e-9)):
+                return False
+            return compute_boundary_violations(xt, yt, w, h, boundary_code) <= baseline_v
+
+        if feasible(target):
+            best = target
+        else:
+            lo, hi = cur, target
+            for _ in range(30):
+                mid = (lo + hi) / 2.0
+                if feasible(mid):
+                    lo = mid
+                else:
+                    hi = mid
+            best = lo
+        if abs(best - cur) < 1e-9:
+            return False
+        if axis_free == 'y':
+            y[i] = best
+        else:
+            x[i] = best
+        return True
+
+    EDGES = ((1, 'y'), (2, 'y'), (4, 'x'), (8, 'x'))   # bit -> 自由軸
+
+    for _round in range(rounds):
+        moved_any = False
+        for bit, axis_free in EDGES:
+            idx = [i for i in range(k) if eligible[i] and (int(boundary_code[i]) & bit)]
+            if len(idx) < 2:
+                continue
+            if axis_free == 'y':
+                idx.sort(key=lambda i: y[i])
+            else:
+                idx.sort(key=lambda i: x[i])
+            for pos in range(1, len(idx)):
+                i, prev = idx[pos], idx[pos - 1]
+                target = (y[prev] + h[prev]) if axis_free == 'y' else (x[prev] + w[prev])
+                cur = y[i] if axis_free == 'y' else x[i]
+                if cur > target + 1e-9 and _slide(i, target, axis_free):
+                    moved_any = True
+        if not moved_any:
+            break
+
+    if verbose:
+        print("compact_boundary_shelf: done after rounds (early-exit when no move found)")
+
+    return x, y
+
+
 def compact_reinsert_reshape(x, y, w, h, preplaced_mask=None, fixed_mask=None,
                              mib_group=None, boundary_code=None,
                              sweeps=3, grid_density=12, gap_weight=0.6,
@@ -2905,6 +3036,10 @@ def legalize_lff(
     # v5.25（實驗用，預設 False）：見 compact_seqpair docstring 的
     # relax_boundary 說明。只在 use_seqpair=True 時有意義。
     seqpair_relax_boundary=False,
+    # v5.26（實驗用，預設關閉）：見 compact_boundary_shelf docstring 與
+    # 呼叫處說明。
+    use_boundary_shelf=False,
+    boundary_shelf_rounds=10,
     verbose=False,
 ):
     """
@@ -3494,6 +3629,28 @@ def legalize_lff(
                                          patience=gradient_finetune_patience,
                                          hpwl_slack_ratio=gradient_finetune_hpwl_slack_ratio,
                                          verbose=verbose)
+
+    # ---- 同一條鎖定邊上的 boundary block 互相滑動貼齊（v5.26，實驗用）----
+    # compact_merge_clusters 只處理「已經彼此貼合」的連通分量之間的巨集
+    # 移動、且只沿鎖定軸方向——同一條邊上互不相鄰的 boundary block（各自
+    # 是獨立的連通分量）之間，沿著自由軸的縫隙完全沒有機制處理，見
+    # compact_boundary_shelf docstring。刻意放在 pipeline 最尾端（所有其他
+    # 幾何調整都完成之後）：v4.9/v5.1 都學到同一個教訓——任何「局部保證不
+    # 變差」的 pass，只要放在還有其他貪婪 pass 會重新處理同一批 block 的
+    # 位置之前，就可能改變那些後續 pass 的起點、讓它們收斂到不同（甚至更差）
+    # 的局部最佳解，即使這個 pass 自己絕對不會讓事情變差。20 樣本真實資料
+    # 驗證證實了這一點：放在 compact_merge_clusters 之後、其餘壓縮 pass
+    # 之前時，19/20 打平、1/20 area_gap 明顯變差（+36.5%→+40.4%）——不是
+    # compact_boundary_shelf 自己的移動讓面積變大（它有自己的安全閘門，
+    # 不可能發生），而是它改變了後續 compact_gravity/compact_reinsert/
+    # compact_positions/第二次 compact_merge_clusters 的起點，讓這些貪婪
+    # pass 走到更差的最終解。放在尾端可以避免這個問題（後面只剩防禦性的
+    # hard_zero_overlap，不會再被任何貪婪 pass 撤銷或改道）。
+    if use_boundary_shelf:
+        x, y = compact_boundary_shelf(x, y, w, h, preplaced_mask=preplaced_mask,
+                                      boundary_code=boundary_code,
+                                      cluster_group=cluster_group,
+                                      rounds=boundary_shelf_rounds, verbose=verbose)
 
     # ---- 保底驗證：理論上此時已經零重疊，這裡只是零成本的防禦性再確認 ----
     preplaced_idx_list = [i for i in range(k) if preplaced_mask[i]]

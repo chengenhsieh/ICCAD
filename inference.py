@@ -550,6 +550,9 @@ def legalize_result(
     seqpair_seed=0,
     # v5.25（實驗用）：見 utils.py: compact_seqpair docstring 的 relax_boundary 說明
     seqpair_relax_boundary=False,
+    # v5.26（實驗用）：見 utils.py: compact_boundary_shelf docstring
+    use_boundary_shelf=False,
+    boundary_shelf_rounds=10,
     verbose=True,
 ):
     """
@@ -619,6 +622,8 @@ def legalize_result(
             seqpair_iters=seqpair_iters,
             seqpair_seed=seqpair_seed,
             seqpair_relax_boundary=seqpair_relax_boundary,
+            use_boundary_shelf=use_boundary_shelf,
+            boundary_shelf_rounds=boundary_shelf_rounds,
             weight_dist=weight_dist,
             weight_boundary=weight_boundary,
             weight_cluster=weight_cluster,
@@ -969,6 +974,7 @@ def run_one_sample(sample_idx, official, model, config, device,
                    use_anneal=False, anneal_iters=500, anneal_seed=0,
                    use_seqpair=False, seqpair_iters=500, seqpair_seed=0,
                    seqpair_relax_boundary=False,
+                   use_boundary_shelf=False, boundary_shelf_rounds=10,
                    weight_dist=1.0, weight_boundary=3.0, weight_cluster=1.0,
                    weight_b2b=0.5, weight_p2b=0.15, weight_shape=3.0,
                    use_cluster_adjacency=False, cluster_adjacency_bonus=5.0,
@@ -1239,6 +1245,8 @@ def run_one_sample(sample_idx, official, model, config, device,
         seqpair_iters=seqpair_iters,
         seqpair_seed=seqpair_seed,
         seqpair_relax_boundary=seqpair_relax_boundary,
+        use_boundary_shelf=use_boundary_shelf,
+        boundary_shelf_rounds=boundary_shelf_rounds,
         weight_dist=weight_dist,
         weight_boundary=weight_boundary,
         weight_cluster=weight_cluster,
@@ -1303,6 +1311,15 @@ def run_one_sample(sample_idx, official, model, config, device,
             "diffusion": t_diffusion,
             "legalize": t_legalize,
             "total": elapsed_total,
+        },
+        # 診斷用（不影響任何 legalize/評分邏輯）：把每個 block 的 constraint
+        # 分類一起帶出來，方便事後逐 block 比對 legalized vs optimal。
+        "constraints_pb": {
+            "preplaced_mask": preplaced_mask_pb,
+            "fixed_mask": fixed_mask_pb,
+            "mib_group": mib_group_arr,
+            "cluster_group": cluster_group_arr,
+            "boundary_code": boundary_code_arr,
         },
     }
 

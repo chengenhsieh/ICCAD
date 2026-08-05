@@ -603,6 +603,69 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.25 —— `compact_seqpair` 的 `relax_boundary` 選項（不採用，驗證了 v5.24 根因的另一面）
+
+**背景**：v5.24 找到真正的根因後，結尾提到往下挖的方向是「怎麼讓
+constrained block 也排得更緊」。使用者接著具體問了其中一種：目前
+boundary 鎖定的 block（貼著佈局邊界的那些）在 `compact_seqpair`／
+`compact_swap`／`compact_anneal` 裡都被當「不自由」排除在搜尋外，
+座標維持原樣不動——但它們同時又常常在佈局最外圍，是不是反而在撐大
+整個 bbox？如果放寬讓它們也能被搬遷（但搬完之後仍然貼齊同一條邊界，
+不違反 boundary 這個 hard constraint），會不會找到「整體更緊」的解？
+
+**實作**：`compact_seqpair` 新增 `relax_boundary` 參數（預設 `False`，
+跟改動前完全等價）。`False` 時「自由」的定義沿用 `compact_swap`／
+`compact_anneal` 那套（非 preplaced、無 boundary 鎖定、無 cluster
+分組）；`True` 時放寬成「非 preplaced、無 cluster 分組」——boundary
+鎖定的 block 也加入搜尋、也會被 `_seqpair_decode` 的 longest-path
+重新算座標，不再當常數處理。**正確性用兩層驗證**：除了原本就有的
+`overlaps`（不重疊）顯式檢查，`relax_boundary=True` 時每個候選解
+**額外**呼叫 `compute_boundary_violations`（v5.11 修正、跟官方判定
+逐位元對齊的版本——貼邊定義是相對候選解自己的 bounding box，不是絕對
+座標）確認所有 boundary 限制依然滿足；只要有任何一個 boundary block
+沒貼齊，候選解直接丟棄。`legalize_lff` 新增對應的 `seqpair_relax_
+boundary` 開關，`inference.py` 的 `legalize_result`／`run_one_sample`
+比照 `use_seqpair` 同一套模式接上（4 個接線點）。
+
+**驗證**：
+- 25 組隨機合成案例 fuzz test（不同 k、隨機分配 1-2 個 boundary code）：
+  `relax_boundary=True` 100% 不重疊、100% boundary 限制依然滿足、
+  100% 面積不變差。
+- 刻意設計的驗證案例（5 個自由 block 聚在原點附近，1 個 RIGHT 鎖定的
+  boundary block 被孤立放在遠處 x=50）：`relax_boundary=False` 時
+  bbox 面積 495.0（搬遷聚集 free block 後）→136.0，`relax_boundary=
+  True` 進一步搬動那個孤立的 boundary block（x=50→x=8，貼著同一條
+  右邊界，只是位置換了）把面積再壓到 117.0，全程不重疊、boundary
+  限制依然滿足——證實這個機制在「boundary block 真的被孤立、拖累整體
+  bbox」的情境下確實能運作、確實能找到改善。
+
+**真實資料驗證**（20 樣本，`seqpair_iters=2000`，`relax_boundary=
+False` vs `True`，都疊在 `use_seqpair=True` 之上跟基準 `off` 比較）：
+**area_gap 三組完全一模一樣（20/20 打平，`relax_boundary` 沒有在任何
+一個樣本額外找到改善）**，`legalize` 時間反而因為搜尋空間變大而增加
+（2.35s→2.76s）。跟 v5.24 的 `compact_seqpair` 本身一樣，這一層額外的
+搜尋在真實資料上一次改善都沒找到。
+
+**這次的落差說明了什麼**：合成驗證案例證實了機制本身沒問題、確實能在
+「boundary block 被孤立」的情境下工作，但真實資料上這個情境幾乎不
+發生——推測是因為真實佈局裡的 boundary block 本來就不是孤立的：它們
+要嘛已經很自然地貼著佈局其他部分（不像刻意構造的案例被硬放在遠處），
+要嘛移動它會立刻在原地製造新的縫隙、抵銷掉貼齊後省下的空間。換句話說，
+使用者一開始的假設（boundary block 卡在外圍、增加了 area 或造成
+grouping 失敗）在合成案例上是成立的，但不是真實資料 79% packing
+efficiency 落差的主要成因——這進一步印證 v5.24 的結論：真正決定 packing
+效率的是 60-80% 有限制 block 的整體佈局結構（哪些 block 被分到哪個
+cluster、boundary 分配本身怎麼決定），而不是「搜尋不夠力、找不到更好的
+擺法」。
+
+**決定**：**不採用**（`seqpair_relax_boundary` 維持預設 `False`，
+且父開關 `use_seqpair` 本身也還是 `False`）。機制保留備用，`relax_
+boundary` 的正確性驗證（fuzz test + 官方對齊的 boundary 檢查）以後
+如果要再往這個方向挖（例如把整個 cluster group 當一個節點一起搬遷）
+可以直接複用。
+
+---
+
 ## v5.24 —— `compact_seqpair`：sequence-pair 表示法 + 模擬退火（不採用，找到真正的根因）
 
 **背景**：v5.22/v5.23 證實 swap（互換兩個 block 位置）這個 move 類型

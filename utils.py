@@ -2577,7 +2577,8 @@ def _seqpair_decode(seq_p, seq_n, w, h, fixed_mask, fixed_x, fixed_y):
 
 def compact_seqpair(x, y, w, h, preplaced_mask=None, boundary_code=None,
                      cluster_group=None, iters=500, seed=0,
-                     t_start_frac=0.3, t_end_frac=0.01):
+                     t_start_frac=0.3, t_end_frac=0.01,
+                     relax_boundary=False):
     """
     Sequence-pair 表示法 + 模擬退火局部搜尋，見上方模組說明。
 
@@ -2585,16 +2586,32 @@ def compact_seqpair(x, y, w, h, preplaced_mask=None, boundary_code=None,
     x+y 遞增排、Γ- 依 x−y 遞增排——常見的「從現有佈局反推一組合理
     sequence pair」手法），近似還原目前的拓樸。
 
-    每次迭代：隨機挑一個「自由」block（跟 compact_swap／compact_anneal
-    同一套排除規則——非 preplaced、無 boundary 鎖定、無 cluster 分組），
-    把它從 Γ+ 和/或 Γ- 中移除、插回一個隨機新位置（模擬「這個 block
-    搬到佈局中完全不同的地方」，連帶重新定義它跟中間所有 block 的相對
-    順序）。用 `_seqpair_decode` 解出候選座標，**顯式檢查是否真的沒有
-    重疊**（不信任 decode 對 fixed block 的處理一定自洽，見
-    `_seqpair_decode` docstring 的說明）——不合法直接丟棄這次迭代，不
-    計入 sequence pair 的狀態變化。合法的話，用跟 `compact_anneal` 一樣
-    的退火接受準則（變好必接受、變差以 `exp(-Δarea/T)` 機率接受，溫度
-    隨迭代線性冷卻）決定要不要接受這次搬遷，全程記錄看過的最佳解。
+    每次迭代：隨機挑一個「自由」block，把它從 Γ+ 和/或 Γ- 中移除、插回
+    一個隨機新位置（模擬「這個 block 搬到佈局中完全不同的地方」，連帶
+    重新定義它跟中間所有 block 的相對順序）。用 `_seqpair_decode` 解出
+    候選座標，**顯式檢查是否真的沒有重疊**（不信任 decode 對 fixed
+    block 的處理一定自洽，見 `_seqpair_decode` docstring 的說明）——不
+    合法直接丟棄這次迭代，不計入 sequence pair 的狀態變化。合法的話，
+    用跟 `compact_anneal` 一樣的退火接受準則（變好必接受、變差以
+    `exp(-Δarea/T)` 機率接受，溫度隨迭代線性冷卻）決定要不要接受這次
+    搬遷，全程記錄看過的最佳解。
+
+    relax_boundary（v5.25，預設 False = 關閉，跟改動前完全等價）：
+    False 時「自由」定義沿用 compact_swap／compact_anneal 那套（非
+    preplaced、無 boundary 鎖定、無 cluster 分組）。True 時放寬成「非
+    preplaced、無 cluster 分組」——boundary 鎖定的 block 也加入搜尋、
+    也會被 `_seqpair_decode` 重新算座標，不再當常數處理。動機：boundary
+    block 常常被推到佈局最外圍，這個位置本身可能撐大了 bbox、也可能讓它
+    跟同一個 cluster group 的其他成員拉開距離——放寬讓它也能參與搬遷，
+    也許能找到「還是貼著邊界、但整體佈局更緊」的位置。
+
+    正確性一樣用顯式驗證保護，不信任 decode 本身的正確性推論：除了不
+    重疊檢查，`relax_boundary=True` 時每個候選解**額外**呼叫
+    `compute_boundary_violations`（v5.11 修正、跟官方判定逐位元對齊的
+    版本，見該函式 docstring）確認所有 boundary 限制依然滿足（貼邊的
+    定義是相對於候選解自己的 bounding box，不是絕對座標）——只要有任何
+    一個 boundary block 沒貼齊，整個候選解直接丟棄，不會讓 V_relative
+    變差。
 
     決定性：給定 `seed` 後全程可重現。
     """
@@ -2619,7 +2636,10 @@ def compact_seqpair(x, y, w, h, preplaced_mask=None, boundary_code=None,
     else:
         cluster_group = np.asarray(cluster_group, dtype=np.int64)
 
-    fixed_mask = preplaced_mask | (boundary_code != 0) | (cluster_group != 0)
+    if relax_boundary:
+        fixed_mask = preplaced_mask | (cluster_group != 0)
+    else:
+        fixed_mask = preplaced_mask | (boundary_code != 0) | (cluster_group != 0)
     free_idx = np.nonzero(~fixed_mask)[0]
     if len(free_idx) < 2:
         return x, y
@@ -2668,6 +2688,9 @@ def compact_seqpair(x, y, w, h, preplaced_mask=None, boundary_code=None,
             np.asarray(new_seq_p), np.asarray(new_seq_n), w, h, fixed_mask, fx, fy)
 
         if overlaps(cand_x, cand_y):
+            continue
+        if relax_boundary and compute_boundary_violations(
+                cand_x, cand_y, w, h, boundary_code) != 0:
             continue
 
         new_area = bbox_area(cand_x, cand_y)
@@ -2879,6 +2902,9 @@ def legalize_lff(
     use_seqpair=False,
     seqpair_iters=500,
     seqpair_seed=0,
+    # v5.25（實驗用，預設 False）：見 compact_seqpair docstring 的
+    # relax_boundary 說明。只在 use_seqpair=True 時有意義。
+    seqpair_relax_boundary=False,
     verbose=False,
 ):
     """
@@ -3339,7 +3365,8 @@ def legalize_lff(
     if use_seqpair:
         x, y = compact_seqpair(x, y, w, h, preplaced_mask=preplaced_mask,
                                boundary_code=boundary_code, cluster_group=cluster_group,
-                               iters=seqpair_iters, seed=seqpair_seed)
+                               iters=seqpair_iters, seed=seqpair_seed,
+                               relax_boundary=seqpair_relax_boundary)
 
     # ---- 補一個「往鄰居貼齊」的軸對齊壓縮 ----
     # 縮外框那招只對「外框本身還有margin」的情況有用；實測發現 outline 通常

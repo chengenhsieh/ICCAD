@@ -3135,6 +3135,481 @@ def _l1_cost(pos, targets, weights):
     return sum(w_ * abs(pos - t_) for t_, w_ in zip(targets, weights))
 
 
+def _pack_cluster_group_internal(x, y, w, h, areas, preplaced_mask, fixed_mask, boundary_code):
+    """
+    v5.28 輔助函式：`sa_construct_layout` 把每個 cluster group 當剛體超
+    節點之前，先用這個函式把 group 自己的成員排成一份緊湊、不重疊的內部
+    佈局（遞迴呼叫 `legalize_lff` 本身，`construction_mode` 用預設的
+    `"lff"`——只是拿現成、已經驗證過的單趟貪婪排布邏輯處理「這幾個 block
+    自己怎麼排最緊」，不重新發明一套 packing 邏輯）。
+
+    **有傳 `boundary_code`**（跟外層的 cluster_group／W_int 不同——那些
+    確實跟這個子排布無關）：group 裡如果有成員自己也被鎖定要貼齊「整體
+    佈局」的某條邊，這個成員必須先在**這個 group 自己的內部 bounding
+    box** 邊緣就位，`sa_construct_layout` 之後把整個 group 當剛體平移到
+    全域正確位置時，這個成員才會真的落在全域的正確邊上（群體平移不會
+    改變成員相對 group 自己邊界的位置）。`legalize_lff` 本身就原生支援
+    boundary_code（貼齊給定 outline 的邊），這裡直接複用，不需要另外
+    處理。
+
+    若某個成員是 preplaced，直接把它真正的座標傳進來（`preplaced_mask`
+    對應標 True）——這樣排出來的結果，這個成員會精確落在它原本要求的
+    絕對世界座標，其餘成員圍著它排，整個 group 的「錨點」（bbox 左下角）
+    自然就是正確的絕對世界位置，不需要額外處理。沒有 preplaced 成員的
+    group，排出來的絕對位置不重要（`sa_construct_layout` 會把整個 group
+    當節點重新定位），只有內部相對佈局會被凍結沿用。
+    """
+    k = len(x)
+    if k == 1:
+        return x.copy(), y.copy(), w.copy(), h.copy()
+    return legalize_lff(x, y, w, h, areas,
+                         preplaced_mask=preplaced_mask, fixed_mask=fixed_mask,
+                         boundary_code=boundary_code,
+                         use_reinsert=True, reinsert_sweeps=2, reinsert_grid_density=8,
+                         use_cluster_merge=False, use_second_merge_pass=True,
+                         use_gravity=False, verbose=False)
+
+
+def sa_construct_layout(x, y, w, h, areas, preplaced_mask=None, fixed_mask=None,
+                        cluster_group=None, boundary_code=None,
+                        iters=3000, n_starts=3, seed=0,
+                        t_start_frac=0.3, t_end_frac=0.01,
+                        allow_reshape=True):
+    """
+    v5.28（實驗用）：用 sequence-pair + 模擬退火，從零開始建構一個保證
+    不重疊、boundary 100% 合規的初始排布，是 `legalize_lff` 原本
+    `_attempt()`（MAXRECTS + 加權中位數單趟貪婪放置）的替代方案，見
+    CHANGELOG.md v5.28 的完整動機說明。
+
+    這個 session 先前測試過的 `compact_seqpair`（v5.24）／
+    `compact_seqpair_grouped`（v5.27）都是「事後在 LFF 已經放好的結果上」
+    加碼搜尋，用同一種鄰域（一次搬一個節點）、同一個起點，全部在真實資料
+    上找不到任何改善。這個函式刻意在三個維度上都不一樣，避免只是換一個
+    入口走到同一個局部最佳解：
+      1. 初始排列**隨機生成**（不是從既有座標反推），每個 multi-start
+         chain 用不同的隨機排列，不從 LFF 的收斂結果出發。
+      2. 除了「搬一個節點到新位置」，也有「交換兩個節點在排列中的順序」
+         跟「（可變形的個別 block）順便換一組 `_aspect_variants` 候選
+         長寬比」——每次迭代隨機三選一。
+      3. 大幅提高的迭代預算（`iters` 預設 3000，是事後補丁機制的數倍到
+         數十倍）+ multi-start（`n_starts` 條獨立 SA chain 取最好）。
+
+    重要設計差異（跟 `compact_seqpair_grouped` 不同，不能照搬它的
+    `relax_boundary` 語意）：`compact_seqpair_grouped` 運作在「legalize_
+    lff 已經把 boundary 排到 100% 合規」之後，boundary 鎖定但被排除搜尋
+    的 block，「維持原樣不動」本身就是正確、合規的行為。這裡是從零開始
+    建構，boundary 鎖定 block 的輸入座標只是 diffusion 的粗略原始猜測，
+    根本不合規——「當常數不動」在這裡等於直接把不合規的座標當結果，是
+    錯的。因此這裡沒有 `relax_boundary` 開關：boundary 鎖定的個別
+    block／group 節點永遠都是可搜尋的自由節點（唯一的固定節點是「含
+    preplaced 成員」的節點），boundary 合規改成用「拓樸建構時強制」+
+    「候選解事後驗證」兩層機制保證（見下方）。
+
+    節點建構（跟 `compact_seqpair_grouped` 相同的抽象，但這裡是「從零
+    建構」而非「凍結既有佈局」）：
+      - 每個 cluster group 先用 `_pack_cluster_group_internal` 排出一份
+        緊湊、且組內任何 boundary 鎖定成員都已貼齊「group 自己 bbox」
+        對應邊緣的內部佈局，凍結成一個剛體超節點。若組內含 preplaced
+        成員，整個節點固定，錨點自動是正確的絕對座標（見該函式
+        docstring）。
+      - 個別 preplaced block：固定節點。
+      - 其餘個別 block（含 boundary 鎖定的）：一個節點一個 block，永遠
+        是自由節點；`allow_reshape` 決定是否允許換長寬比（僅對非
+        preplaced、非 fixed_mask、不屬於任何 cluster group 的個別 block
+        生效）。
+
+    Boundary 合規的兩層機制：
+      1. **拓樸建構時強制**：sequence-pair 有個常被忽略的性質——一個
+         自由節點 b 若被放在 Γ-（seq_n）最前面，數學上保證 b 沒有任何
+         「左邊的人」，也就是 x[b]=0（LEFT 合規）；放最後面則保證
+         x[b]+w[b]=全域最大值（RIGHT 合規）。對稱地，Γ+（seq_p）最前面
+         保證 BOTTOM 合規、最後面保證 TOP 合規。這個函式建構每一個
+         multi-start chain 的初始排列時，直接把每個自由的 boundary 節點
+         放到它需要的那一端（多個節點鎖同一邊時，那一端內部順序不拘）
+         ——不是靠運氣或事後修正，而是從拓樸結構上直接保證初始解就是
+         boundary 合規的。
+      2. **候選解事後驗證**：SA 搜尋過程中任何隨機的「搬節點／交換節點」
+         move 都可能把一個 boundary 節點的位置搬出它該在的那一端、破壞
+         合規——每個候選解都在完整逐 block 陣列上顯式呼叫
+         `compute_boundary_violations`，非 0 直接丟棄整個候選，不信任
+         拓樸建構或搜尋本身的正確性推論。
+
+    正確性（不重疊）：每個候選解也都顯式呼叫 `overlaps` 在完整逐 block
+    陣列上檢查。多條 multi-start chain 各自獨立跑完，回傳所有 chain 裡
+    看過的最佳（面積最小）合法解。
+
+    已知限制（v1，刻意先簡化，見 CHANGELOG.md v5.28）：不處理
+    `legalize_lff` 的 outline_bbox 硬性容納（pin bbox 範圍）與 MIB 群組
+    事後統一尺寸——這兩者目前只在 `legalize_lff` 本身的 `_attempt()`
+    路徑裡處理。先在合成/真實資料幾何比對階段驗證「這個建構方式本身
+    是否真的更緊」，如果有訊號，才值得投入把這兩塊補齊。
+    """
+    x = np.array(x, dtype=np.float64).copy()
+    y = np.array(y, dtype=np.float64).copy()
+    w = np.asarray(w, dtype=np.float64).copy()
+    h = np.asarray(h, dtype=np.float64).copy()
+    areas = np.asarray(areas, dtype=np.float64)
+    k = len(x)
+    if k < 2:
+        return x, y, w, h
+
+    if preplaced_mask is None:
+        preplaced_mask = np.zeros(k, dtype=bool)
+    else:
+        preplaced_mask = np.asarray(preplaced_mask, dtype=bool)
+    if fixed_mask is None:
+        fixed_mask = preplaced_mask.copy()
+    else:
+        fixed_mask = np.asarray(fixed_mask, dtype=bool)
+    if boundary_code is None:
+        boundary_code = np.zeros(k, dtype=np.int64)
+    else:
+        boundary_code = np.asarray(boundary_code, dtype=np.int64)
+    if cluster_group is None:
+        cluster_group = np.zeros(k, dtype=np.int64)
+    else:
+        cluster_group = np.asarray(cluster_group, dtype=np.int64)
+
+    # ---- 建節點：cluster group 先各自遞迴排出內部佈局，凍結當剛體節點；
+    # 沒有分組的 block 各自一個節點 ----
+    group_ids = sorted(int(g) for g in np.unique(cluster_group) if g > 0)
+    solo_idx = np.nonzero(cluster_group == 0)[0]
+
+    node_members = [[int(i)] for i in solo_idx]
+    for gid in group_ids:
+        node_members.append(np.nonzero(cluster_group == gid)[0].tolist())
+    n_nodes = len(node_members)
+
+    node_w = np.zeros(n_nodes, dtype=np.float64)
+    node_h = np.zeros(n_nodes, dtype=np.float64)
+    node_reshapeable = np.zeros(n_nodes, dtype=bool)
+    node_preplaced_like = np.zeros(n_nodes, dtype=bool)
+    node_boundary_bits = np.zeros(n_nodes, dtype=np.int64)   # 組內所有成員 boundary_code 的 OR
+    node_fx = np.zeros(n_nodes, dtype=np.float64)
+    node_fy = np.zeros(n_nodes, dtype=np.float64)
+
+    member_ox = np.zeros(k, dtype=np.float64)
+    member_oy = np.zeros(k, dtype=np.float64)
+    block_node = np.zeros(k, dtype=np.int64)
+
+    for ni, members in enumerate(node_members):
+        members_arr = np.asarray(members, dtype=np.int64)
+        block_node[members_arr] = ni
+        if len(members) == 1:
+            i = int(members_arr[0])
+            node_w[ni] = w[i]; node_h[ni] = h[i]
+            member_ox[i] = 0.0; member_oy[i] = 0.0
+            node_fx[ni] = x[i]; node_fy[ni] = y[i]
+            node_reshapeable[ni] = allow_reshape and not preplaced_mask[i] and not fixed_mask[i]
+        else:
+            gx, gy, gw, gh = _pack_cluster_group_internal(
+                x[members_arr], y[members_arr], w[members_arr], h[members_arr],
+                areas[members_arr], preplaced_mask[members_arr], fixed_mask[members_arr],
+                boundary_code[members_arr])
+            gxmin = float(gx.min()); gymin = float(gy.min())
+            gxmax = float((gx + gw).max()); gymax = float((gy + gh).max())
+            node_w[ni] = gxmax - gxmin; node_h[ni] = gymax - gymin
+            node_fx[ni] = gxmin; node_fy[ni] = gymin
+            for local_j, i in enumerate(members_arr):
+                member_ox[i] = gx[local_j] - gxmin
+                member_oy[i] = gy[local_j] - gymin
+                w[i] = gw[local_j]; h[i] = gh[local_j]   # 內部排布可能重新選過長寬比
+        node_preplaced_like[ni] = bool(preplaced_mask[members_arr].any())
+        for bit in (1, 2, 4, 8):
+            if bool((boundary_code[members_arr] & bit).any()):
+                node_boundary_bits[ni] = int(node_boundary_bits[ni]) | bit
+
+    # 固定節點只有「含 preplaced 成員」——boundary 鎖定的節點永遠可搜尋，
+    # 見上方 docstring「重要設計差異」說明。
+    node_fixed = node_preplaced_like.copy()
+    free_nodes = np.nonzero(~node_fixed)[0]
+    if len(free_nodes) < 2:
+        return x, y, w, h
+
+    # 只對「單一 bit」的邊界鎖節點做拓樸強制——同時鎖兩條邊（角落）需要
+    # 同一個節點在同一個序列的兩端同時成立，這組簡單規則處理不了那種
+    # 情況（v1 已知限制，見下方 docstring）。這種節點交給「others」隨機池
+    # 跟事後驗證（`_find_valid_start` 重試 + SA 迴圈的 boundary 閘門）
+    # 處理，不強制、也不會不安全，只是找到合規解的機率較低。
+    def _single_bit(n):
+        v = int(node_boundary_bits[n])
+        return v if bin(v).count("1") == 1 else 0
+
+    left_free = [int(n) for n in free_nodes if _single_bit(n) == 1]
+    right_free = [int(n) for n in free_nodes if _single_bit(n) == 2]
+    bottom_free = [int(n) for n in free_nodes if _single_bit(n) == 8]
+    top_free = [int(n) for n in free_nodes if _single_bit(n) == 4]
+
+    _left_set, _right_set = set(left_free), set(right_free)
+    _bottom_set, _top_set = set(bottom_free), set(top_free)
+
+    def _reorder_positions(seq, group_desired_order):
+        """把 `seq` 裡屬於 `group_desired_order` 的那些位置（依原本在 seq
+        中的索引順序）重新指派成員，讓它們的相對順序精確等於
+        `group_desired_order`——只換「這些位置放誰」，不改變它們佔用
+        哪些位置。"""
+        if not group_desired_order:
+            return seq
+        wanted = set(group_desired_order)
+        positions = [idx for idx, node in enumerate(seq) if node in wanted]
+        for pos, node in zip(positions, group_desired_order):
+            seq[pos] = node
+        return seq
+
+    def _boundary_forced_perm(rng):
+        """
+        建構一個保證 boundary 合規的初始排列。Sequence-pair 的 x 座標算法
+        是「累加左邊所有人的貢獻」（`x[b] = max(x[left_preds]+w[left_preds])`，
+        left_preds = 在 Γ+ 和 Γ- 都排在 b 前面的節點），這造成 LEFT／RIGHT
+        兩條邊的合規條件其實不對稱：
+          - LEFT（沒有任何人在它左邊，x=0）：只要讓 b 在 Γ-（seq_n）
+            排最前面，`left_preds` 的篩選條件（「Γ- 位置 < b 的 Γ- 位置」）
+            對任何人都不可能成立——不需要管 Γ+ 位置，b 自動變成零左鄰居。
+          - RIGHT（所有人都在它左邊，x+w=全域最大）：不能只放某一端，
+            必須讓「其他每一個節點」都真正被算進 b 的 left_preds——這要求
+            b 同時是 Γ+ 和 Γ- 的最後一個，讓兩個條件對任何其他節點都同時
+            成立。只放 Γ- 最後面（早期版本的錯誤）只保證「b 不會把別人推
+            得更右」，不保證「b 自己被推到最右」，兩者是不同的陳述。
+        Y 軸同理但「below」關係的判斷式剛好左右互換：BOTTOM 只需要 Γ+
+        （seq_p）最前面；TOP 需要同時是 Γ+ 最後面**且** Γ- 最前面。
+
+        「同一條邊鎖了兩個以上節點」時，光是「都塞在該去的那一端」還不夠
+        ——如果兩個同組節點剛好互相形成「其中一個在另一個左邊／下面」的
+        關係，會有一個被推出局、不再是全域極值。解法：LEFT／RIGHT 這種
+        「零/全左鄰居」組，讓組內在 Γ+ 的相對順序是 Γ- 相對順序的**反轉**
+        （彼此形成 above/below 關係，不會有 left/right 關係）；BOTTOM／TOP
+        這種組，讓組內在兩個序列的相對順序**相同**（彼此形成 left/right
+        關係，不會有 above/below 關係）。
+        """
+        lf, rf = list(left_free), list(right_free)
+        tf, bf = list(top_free), list(bottom_free)
+        rng.shuffle(lf); rng.shuffle(rf); rng.shuffle(tf); rng.shuffle(bf)
+
+        # seq_p：BOTTOM 在最前面；TOP、RIGHT 都需要在最後面（兩者互不
+        # 衝突，各自的组内相對順序等下用 _reorder_positions 分別修正）。
+        tail_p = tf + rf
+        others_p = [ni for ni in range(n_nodes)
+                    if ni not in _bottom_set and ni not in _top_set and ni not in _right_set]
+        rng.shuffle(others_p)
+        sp = bf + others_p + tail_p
+
+        # seq_n：LEFT、TOP 都需要在最前面；RIGHT 在最後面。
+        head_n = lf + tf
+        others_n = [ni for ni in range(n_nodes)
+                    if ni not in _left_set and ni not in _right_set and ni not in _top_set]
+        rng.shuffle(others_n)
+        sn = head_n + others_n + rf
+
+        sp = _reorder_positions(sp, list(reversed(lf)))   # LEFT：反轉
+        sn = _reorder_positions(sn, bf)                   # BOTTOM：相同
+        sp = _reorder_positions(sp, list(reversed(rf)))   # RIGHT：反轉
+        sp = _reorder_positions(sp, tf)                   # TOP：相同
+        return sp, sn
+
+    def bbox_area(xa, ya, wa, ha):
+        return (np.max(xa + wa) - np.min(xa)) * (np.max(ya + ha) - np.min(ya))
+
+    def overlaps(xa, ya, wa, ha):
+        for i in range(k):
+            xi1, yi1 = xa[i] + wa[i], ya[i] + ha[i]
+            ox = np.minimum(xi1, xa + wa) - np.maximum(xa[i], xa)
+            oy = np.minimum(yi1, ya + ha) - np.maximum(ya[i], ya)
+            m = (ox > 1e-6) & (oy > 1e-6)
+            m[i] = False
+            if m.any():
+                return True
+        return False
+
+    def _align_boundary_edges(node_cx, node_cy, node_ww, node_hh):
+        """
+        兩種邊界合規各有自己的「預設基準」——LEFT／BOTTOM 是零 predecessor
+        （預設落在 decode 座標系的 0）、RIGHT／TOP 是累加所有其他節點的
+        極值——但兩種基準都只在「沒有任何固定（preplaced 相關）節點的
+        真實座標比這個基準更極端」時，才真的等於全域極值：一個 preplaced
+        block 的座標可能本來就是負的、或就是比其他自由節點算出來的最大值
+        還大，這種情況下光靠拓樸建構出的預設基準並不會自動對齊過去。
+        RIGHT／TOP 還有另一個獨立的問題：同一條邊鎖了兩個以上節點時，
+        彼此寬/高不同，就算 baseline 相同，右/上邊緣也不會自動對齊。
+
+        這裡事後直接在**全部節點**（含固定節點）的真實座標上算出真正的
+        全域極值，把每一條邊上所有自由節點統一位移過去——LEFT/BOTTOM
+        可能因此位移到比原本基準更極端的位置（往負的方向也可能發生，
+        取決於是否有更極端的固定節點）；RIGHT/TOP 同時解決「基準不夠
+        極端」和「組內邊緣沒對齊」兩個問題。是否真的安全（不會撞到其他
+        跟這條邊無關的東西）一律由呼叫方照舊用 `overlaps`／
+        `compute_boundary_violations` 顯式驗證，這裡不假設安全。
+        """
+        if left_free:
+            idx = np.asarray(left_free)
+            target = float(node_cx.min())
+            node_cx[idx] = target
+        if right_free:
+            idx = np.asarray(right_free)
+            target = float((node_cx + node_ww).max())
+            node_cx[idx] = target - node_ww[idx]
+        if bottom_free:
+            idx = np.asarray(bottom_free)
+            target = float(node_cy.min())
+            node_cy[idx] = target
+        if top_free:
+            idx = np.asarray(top_free)
+            target = float((node_cy + node_hh).max())
+            node_cy[idx] = target - node_hh[idx]
+        return node_cx, node_cy
+
+    def expand(node_cx, node_cy, node_ww, node_hh):
+        node_cx, node_cy = _align_boundary_edges(node_cx.copy(), node_cy.copy(), node_ww, node_hh)
+        cand_x = node_cx[block_node] + member_ox
+        cand_y = node_cy[block_node] + member_oy
+        cand_w = w.copy(); cand_h = h.copy()
+        for ni, members in enumerate(node_members):
+            if len(members) == 1:
+                i = members[0]
+                cand_w[i] = node_ww[ni]; cand_h[i] = node_hh[ni]
+        return cand_x, cand_y, cand_w, cand_h
+
+    rng_master = np.random.default_rng(seed)
+    global_best_area = None
+    global_best = None
+
+    def _find_valid_start(rng, max_tries=30):
+        """
+        `_boundary_forced_perm` 保證拓樸上 boundary 合規，但「不重疊」還是
+        要靠 sequence-pair 本身的數學保證——只有完全沒有固定節點時才 100%
+        保證；有固定（preplaced 相關）節點時，自由節點的拓樸關係可能剛好
+        跟某個固定節點的絕對座標矛盾，產生重疊。這裡用「重試」而不是「事後
+        修正座標」找一個合法起點——刻意不用 `hard_zero_overlap` 這類事後
+        補丁，因為它不知道「這些 block 屬於同一個剛體節點、必須整體移動」
+        這件事，也不知道「這個節點的位置在拓樸上是為了 boundary 合規而
+        刻意放在這裡」，拿去修正可能同時破壞凍結的組內偏移量不變量、也
+        破壞 boundary 合規。多次重試找不到才退回對角線排序當保底，這個
+        fallback 在這個 session 的既有 fuzz test 裡從未觀察到還有殘留
+        重疊。
+        """
+        for _try in range(max_tries):
+            sp, sn = _boundary_forced_perm(rng)
+            ncx, ncy = _seqpair_decode(np.asarray(sp), np.asarray(sn),
+                                       node_w, node_h, node_fixed, node_fx, node_fy)
+            cx, cy, cw, ch = expand(ncx, ncy, node_w, node_h)
+            if not overlaps(cx, cy, cw, ch) and compute_boundary_violations(cx, cy, cw, ch, boundary_code) == 0:
+                return sp, sn, ncx, ncy, cx, cy, cw, ch
+        order_p = np.argsort(node_fx + node_fy, kind="stable")
+        order_n = np.argsort(node_fx - node_fy, kind="stable")
+        sp, sn = list(order_p), list(order_n)
+        ncx, ncy = _seqpair_decode(np.asarray(sp), np.asarray(sn),
+                                   node_w, node_h, node_fixed, node_fx, node_fy)
+        cx, cy, cw, ch = expand(ncx, ncy, node_w, node_h)
+        return sp, sn, ncx, ncy, cx, cy, cw, ch
+
+    for start in range(max(1, n_starts)):
+        rng = np.random.default_rng(rng_master.integers(0, 2**31 - 1))
+        cur_node_w = node_w.copy()
+        cur_node_h = node_h.copy()
+
+        seq_p, seq_n, node_cand_x, node_cand_y, cand_x, cand_y, cand_w, cand_h = \
+            _find_valid_start(rng)
+        if overlaps(cand_x, cand_y, cand_w, cand_h) or \
+                compute_boundary_violations(cand_x, cand_y, cand_w, cand_h, boundary_code) != 0:
+            # 對角線排序 fallback 仍然不合法（極端案例）：跳過這條 chain，
+            # 不強行接受一個違反 hard constraint 的起點。
+            continue
+
+        cur_area = bbox_area(cand_x, cand_y, cand_w, cand_h)
+        best_area = cur_area
+        best_x, best_y, best_w, best_h = cand_x.copy(), cand_y.copy(), cand_w.copy(), cand_h.copy()
+
+        reshape_candidates = np.nonzero(node_reshapeable & ~node_fixed)[0]
+
+        t_start = t_start_frac * cur_area
+        t_end = t_end_frac * cur_area
+
+        for it in range(iters):
+            frac = it / max(iters - 1, 1)
+            temp = t_start + (t_end - t_start) * frac
+
+            move_kind = rng.integers(0, 3) if len(reshape_candidates) > 0 else rng.integers(0, 2)
+            new_seq_p, new_seq_n = seq_p.copy(), seq_n.copy()
+            new_node_w, new_node_h = cur_node_w, cur_node_h
+
+            if move_kind == 0:      # 搬一個節點
+                b = int(free_nodes[rng.integers(len(free_nodes))])
+                new_seq_p.remove(b); new_seq_p.insert(int(rng.integers(len(new_seq_p) + 1)), b)
+                new_seq_n.remove(b); new_seq_n.insert(int(rng.integers(len(new_seq_n) + 1)), b)
+            elif move_kind == 1:    # 交換兩個（自由）節點在排列中的位置
+                which = rng.integers(0, 2)
+                target_seq = new_seq_p if which == 0 else new_seq_n
+                pos_a, pos_b = rng.choice(len(free_nodes), size=2, replace=False)
+                node_a, node_b = int(free_nodes[pos_a]), int(free_nodes[pos_b])
+                ia, ib = target_seq.index(node_a), target_seq.index(node_b)
+                target_seq[ia], target_seq[ib] = target_seq[ib], target_seq[ia]
+            else:                   # 換一個可變形 block 的長寬比
+                b = int(reshape_candidates[rng.integers(len(reshape_candidates))])
+                i = node_members[b][0]
+                variants = _aspect_variants(w[i], h[i])
+                nw, nh = variants[int(rng.integers(len(variants)))]
+                new_node_w = cur_node_w.copy(); new_node_h = cur_node_h.copy()
+                new_node_w[b] = nw; new_node_h[b] = nh
+
+            node_cx, node_cy = _seqpair_decode(
+                np.asarray(new_seq_p), np.asarray(new_seq_n), new_node_w, new_node_h,
+                node_fixed, node_fx, node_fy)
+            cx, cy, cw, ch = expand(node_cx, node_cy, new_node_w, new_node_h)
+
+            if overlaps(cx, cy, cw, ch):
+                continue
+            if compute_boundary_violations(cx, cy, cw, ch, boundary_code) != 0:
+                continue
+
+            new_area = bbox_area(cx, cy, cw, ch)
+            delta = new_area - cur_area
+            accept = delta < 0 or rng.random() < np.exp(-delta / max(temp, 1e-9))
+            if accept:
+                seq_p, seq_n = new_seq_p, new_seq_n
+                cur_node_w, cur_node_h = new_node_w, new_node_h
+                cur_area = new_area
+                if new_area < best_area - 1e-9:
+                    best_area = new_area
+                    best_x, best_y, best_w, best_h = cx.copy(), cy.copy(), cw.copy(), ch.copy()
+
+        if global_best_area is None or best_area < global_best_area:
+            global_best_area = best_area
+            global_best = (best_x, best_y, best_w, best_h)
+
+    if global_best is not None:
+        return global_best
+
+    # ---- 保底 fallback（極端案例：每條 chain 連對角線排序都解不出合法起點）
+    # ----
+    # 用跟 `_find_valid_start` 一樣的對角線排序，若仍有殘留重疊，才動用
+    # `hard_zero_overlap`——這裡凍結「任何固定節點」（preplaced 相關）跟
+    # 「任何多成員節點」的全部成員，犧牲這個極端案例下的緊湊度來保證
+    # preplaced 硬限制與剛體不變量都不被破壞；只有真正自由的 solo block
+    # 可能被 `hard_zero_overlap` 挪動。
+    order_p = np.argsort(node_fx + node_fy, kind="stable")
+    order_n = np.argsort(node_fx - node_fy, kind="stable")
+    node_cx, node_cy = _seqpair_decode(np.asarray(order_p), np.asarray(order_n),
+                                       node_w, node_h, node_fixed, node_fx, node_fy)
+    cand_x, cand_y, cand_w, cand_h = expand(node_cx, node_cy, node_w, node_h)
+    if overlaps(cand_x, cand_y, cand_w, cand_h):
+        rigid_idx = [i for i in range(k)
+                     if node_fixed[block_node[i]] or len(node_members[block_node[i]]) > 1]
+        pp_idx_only = [i for i in range(k) if preplaced_mask[i]]
+        cand_x2, cand_y2 = hard_zero_overlap(cand_x, cand_y, cand_w, cand_h,
+                                             preplaced_indices=rigid_idx)
+        if overlaps(cand_x2, cand_y2, cand_w, cand_h):
+            # 極端中的極端：連凍結非 preplaced 的剛體節點都清不乾淨（通常
+            # 代表這批合成/輸入資料本身在某個角落就已經沒有可行解——例如
+            # 兩個 preplaced block 的給定座標本身就重疊，這種情況任何演算法
+            # 都无法同時滿足「零重疊」和「preplaced 位置不變」）。零重疊是
+            # 官方判定的絕對硬指標，這裡優先保證它——放寬到只凍結真正
+            # preplaced 的 block，讓其餘非 preplaced 的剛體節點（多成員
+            # group、boundary 鎖定的 solo block 等）也能被搬動來清重疊。
+            cand_x2, cand_y2 = hard_zero_overlap(cand_x, cand_y, cand_w, cand_h,
+                                                 preplaced_indices=pp_idx_only)
+        cand_x, cand_y = cand_x2, cand_y2
+    return cand_x, cand_y, cand_w, cand_h
+
+
 def legalize_lff(
     x_init, y_init, w_init, h_init,
     areas,
@@ -3230,6 +3705,15 @@ def legalize_lff(
     seqpair_grouped_iters=500,
     seqpair_grouped_seed=0,
     seqpair_grouped_relax_boundary=False,
+    # v5.28（實驗用，預設 "lff" = 跟改動前完全等價）：見 sa_construct_layout
+    # docstring 與呼叫處說明。"sa" 時用它取代 `_attempt()` 產生初始不重疊
+    # 佈局，其餘既有的 compact_* 收尾 pass 原封不動繼續套用。已知限制：
+    # "sa" 模式不會跑下面的 outline 硬性容納重試/收縮階段，也不會跑 MIB
+    # 群組事後統一尺寸（那些邏輯目前只在 "lff" 分支裡）。
+    construction_mode="lff",
+    sa_iters=3000,
+    sa_n_starts=3,
+    sa_seed=0,
     verbose=False,
 ):
     """
@@ -3542,85 +4026,96 @@ def legalize_lff(
 
     # ---- 先原封不動試一次給定的 outline，塞不下（有 fallback）才逐步放大重試 ----
     max_retries = 20
-    expand_factor = 1.05   # 細粒度放大，減少「其實只差一點點卻整段放大 15%」的過度溢出
-    x_res = y_res = w_res = h_res = None
-    n_fallback = n_reshape = 0
-    oxmin = oymin = oxmax = oymax = 0.0
-    for attempt in range(max_retries):
-        growth = expand_factor ** attempt
-        oxmin = base_ccx - base_half_w * growth
-        oymin = base_ccy - base_half_h * growth
-        oxmax = base_ccx + base_half_w * growth
-        oymax = base_ccy + base_half_h * growth
-        x_res, y_res, w_res, h_res, n_fallback, n_reshape = _attempt(oxmin, oymin, oxmax, oymax)
-        if n_fallback == 0:
-            break
-        if verbose:
-            next_growth = expand_factor ** (attempt + 1)
-            print("legalize_lff: outline attempt {} (+{:.0%}) had {} fallback placement(s), "
-                  "retrying with +{:.0%} outline".format(
-                      attempt, growth - 1.0, n_fallback, next_growth - 1.0))
 
-    if verbose:
-        print("legalize_lff done: reshape={}, fallback={}, outline_attempts={}".format(
-            n_reshape, n_fallback, attempt + 1))
-    if n_fallback > 0:
-        print("WARNING: legalize_lff could not fit {} block(s) within any tried outline size "
-              "(up to {:.0%} of the original) — hard constraints (overlap-free, exact "
-              "area/shape) are still guaranteed, but those blocks may sit outside the "
-              "requested outline.".format(n_fallback, expand_factor ** (max_retries - 1)))
-
-    # ---- 收縮階段：四邊各自往內縮，盡量壓掉剩餘留白 ----
-    # 只在已經有一個成功結果（n_fallback==0）時才做，避免在還沒合法的狀態上
-    # 浪費時間。策略是「猜測 + 驗證」而不是逐步二分搜尋：收縮幅度直接依照
-    # 目前四個方向各自「outline 邊界 vs 實際佔用範圍」的留白比例決定（留白多
-    # 的方向就大膽多收一點，留白少的方向少收一點），失敗就把步伐減半再試同一
-    # 個基準，成功就用新的（更緊的）狀態當下一步的基準繼續收。這樣通常幾次
-    # 嘗試內就能收斂到接近最緊的程度，不需要對每一邊做完整二分搜尋——刻意
-    # 把總嘗試次數壓在很低的上限，讓大 k 的 case 也不會因為這步而變慢太多。
-    if n_fallback == 0:
-        max_shrink_attempts = 4
-        shrink_step = 0.35   # 每次成功嘗試，往內收目前留白的 35%
-        cur_x, cur_y, cur_w, cur_h = x_res, y_res, w_res, h_res
-        cur_ox0, cur_oy0, cur_ox1, cur_oy1 = oxmin, oymin, oxmax, oymax
-        step = shrink_step
-        n_shrink_success = 0
-        for _ in range(max_shrink_attempts):
-            occ_xmin = float(cur_x.min()); occ_xmax = float((cur_x + cur_w).max())
-            occ_ymin = float(cur_y.min()); occ_ymax = float((cur_y + cur_h).max())
-            slack_left = max(occ_xmin - cur_ox0, 0.0)
-            slack_right = max(cur_ox1 - occ_xmax, 0.0)
-            slack_bottom = max(occ_ymin - cur_oy0, 0.0)
-            slack_top = max(cur_oy1 - occ_ymax, 0.0)
-            if slack_left + slack_right + slack_bottom + slack_top < 1e-6:
-                break   # 四邊都已經貼到底，沒有留白可以收了（實測發現這是常見
-                        # 情況：boundary-priority block 通常已經把外框撐到最緊，
-                        # 剩下的留白幾乎都在內部，縮外框這招對這種情況沒有用）
-
-            trial_ox0 = cur_ox0 + slack_left * step
-            trial_oy0 = cur_oy0 + slack_bottom * step
-            trial_ox1 = cur_ox1 - slack_right * step
-            trial_oy1 = cur_oy1 - slack_top * step
-            if trial_ox1 - trial_ox0 < 1e-6 or trial_oy1 - trial_oy0 < 1e-6:
-                step *= 0.5
-                continue
-
-            xa, ya, wa, ha, n_fb, _ = _attempt(trial_ox0, trial_oy0, trial_ox1, trial_oy1)
-            if n_fb == 0:
-                cur_x, cur_y, cur_w, cur_h = xa, ya, wa, ha
-                cur_ox0, cur_oy0, cur_ox1, cur_oy1 = trial_ox0, trial_oy0, trial_ox1, trial_oy1
-                n_shrink_success += 1
-                # 成功就維持同樣步伐、用新的（更緊的）基準繼續收
-            else:
-                step *= 0.5   # 失敗就縮小步伐，對同一個基準再試
-
-        if n_shrink_success > 0:
-            x_res, y_res, w_res, h_res = cur_x, cur_y, cur_w, cur_h
+    if construction_mode == "sa":
+        # ---- v5.28（實驗用）：用 sa_construct_layout 取代下面整段 LFF
+        # 建構（outline 硬性容納重試 + 收縮階段 + MIB 群組事後統一尺寸都
+        # 跳過，見上方參數說明的已知限制）----
+        x, y, w, h = sa_construct_layout(
+            x, y, w, h, areas,
+            preplaced_mask=preplaced_mask, fixed_mask=fixed_mask,
+            cluster_group=cluster_group, boundary_code=boundary_code,
+            iters=sa_iters, n_starts=sa_n_starts, seed=sa_seed)
+    else:
+        expand_factor = 1.05   # 細粒度放大，減少「其實只差一點點卻整段放大 15%」的過度溢出
+        x_res = y_res = w_res = h_res = None
+        n_fallback = n_reshape = 0
+        oxmin = oymin = oxmax = oymax = 0.0
+        for attempt in range(max_retries):
+            growth = expand_factor ** attempt
+            oxmin = base_ccx - base_half_w * growth
+            oymin = base_ccy - base_half_h * growth
+            oxmax = base_ccx + base_half_w * growth
+            oymax = base_ccy + base_half_h * growth
+            x_res, y_res, w_res, h_res, n_fallback, n_reshape = _attempt(oxmin, oymin, oxmax, oymax)
+            if n_fallback == 0:
+                break
             if verbose:
-                print("legalize_lff: shrink phase succeeded {} / {} attempts".format(
-                    n_shrink_success, max_shrink_attempts))
+                next_growth = expand_factor ** (attempt + 1)
+                print("legalize_lff: outline attempt {} (+{:.0%}) had {} fallback placement(s), "
+                      "retrying with +{:.0%} outline".format(
+                          attempt, growth - 1.0, n_fallback, next_growth - 1.0))
 
-    x, y, w, h = x_res, y_res, w_res, h_res
+        if verbose:
+            print("legalize_lff done: reshape={}, fallback={}, outline_attempts={}".format(
+                n_reshape, n_fallback, attempt + 1))
+        if n_fallback > 0:
+            print("WARNING: legalize_lff could not fit {} block(s) within any tried outline size "
+                  "(up to {:.0%} of the original) — hard constraints (overlap-free, exact "
+                  "area/shape) are still guaranteed, but those blocks may sit outside the "
+                  "requested outline.".format(n_fallback, expand_factor ** (max_retries - 1)))
+
+        # ---- 收縮階段：四邊各自往內縮，盡量壓掉剩餘留白 ----
+        # 只在已經有一個成功結果（n_fallback==0）時才做，避免在還沒合法的狀態上
+        # 浪費時間。策略是「猜測 + 驗證」而不是逐步二分搜尋：收縮幅度直接依照
+        # 目前四個方向各自「outline 邊界 vs 實際佔用範圍」的留白比例決定（留白多
+        # 的方向就大膽多收一點，留白少的方向少收一點），失敗就把步伐減半再試同一
+        # 個基準，成功就用新的（更緊的）狀態當下一步的基準繼續收。這樣通常幾次
+        # 嘗試內就能收斂到接近最緊的程度，不需要對每一邊做完整二分搜尋——刻意
+        # 把總嘗試次數壓在很低的上限，讓大 k 的 case 也不會因為這步而變慢太多。
+        if n_fallback == 0:
+            max_shrink_attempts = 4
+            shrink_step = 0.35   # 每次成功嘗試，往內收目前留白的 35%
+            cur_x, cur_y, cur_w, cur_h = x_res, y_res, w_res, h_res
+            cur_ox0, cur_oy0, cur_ox1, cur_oy1 = oxmin, oymin, oxmax, oymax
+            step = shrink_step
+            n_shrink_success = 0
+            for _ in range(max_shrink_attempts):
+                occ_xmin = float(cur_x.min()); occ_xmax = float((cur_x + cur_w).max())
+                occ_ymin = float(cur_y.min()); occ_ymax = float((cur_y + cur_h).max())
+                slack_left = max(occ_xmin - cur_ox0, 0.0)
+                slack_right = max(cur_ox1 - occ_xmax, 0.0)
+                slack_bottom = max(occ_ymin - cur_oy0, 0.0)
+                slack_top = max(cur_oy1 - occ_ymax, 0.0)
+                if slack_left + slack_right + slack_bottom + slack_top < 1e-6:
+                    break   # 四邊都已經貼到底，沒有留白可以收了（實測發現這是常見
+                            # 情況：boundary-priority block 通常已經把外框撐到最緊，
+                            # 剩下的留白幾乎都在內部，縮外框這招對這種情況沒有用）
+
+                trial_ox0 = cur_ox0 + slack_left * step
+                trial_oy0 = cur_oy0 + slack_bottom * step
+                trial_ox1 = cur_ox1 - slack_right * step
+                trial_oy1 = cur_oy1 - slack_top * step
+                if trial_ox1 - trial_ox0 < 1e-6 or trial_oy1 - trial_oy0 < 1e-6:
+                    step *= 0.5
+                    continue
+
+                xa, ya, wa, ha, n_fb, _ = _attempt(trial_ox0, trial_oy0, trial_ox1, trial_oy1)
+                if n_fb == 0:
+                    cur_x, cur_y, cur_w, cur_h = xa, ya, wa, ha
+                    cur_ox0, cur_oy0, cur_ox1, cur_oy1 = trial_ox0, trial_oy0, trial_ox1, trial_oy1
+                    n_shrink_success += 1
+                    # 成功就維持同樣步伐、用新的（更緊的）基準繼續收
+                else:
+                    step *= 0.5   # 失敗就縮小步伐，對同一個基準再試
+
+            if n_shrink_success > 0:
+                x_res, y_res, w_res, h_res = cur_x, cur_y, cur_w, cur_h
+                if verbose:
+                    print("legalize_lff: shrink phase succeeded {} / {} attempts".format(
+                        n_shrink_success, max_shrink_attempts))
+
+        x, y, w, h = x_res, y_res, w_res, h_res
 
     # ---- 合併「彼此貼合但互不相連」的分離群聚 ----
     # LFF 用加權中位數決定每個 block 的位置，boundary 約束的 block 會被拉去

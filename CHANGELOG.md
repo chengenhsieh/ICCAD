@@ -603,6 +603,34 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.29 —— `lambda_area` packing density 訓練端 soft loss（未實際執行，使用者改為專注推論端）
+
+**背景**：v5.22-v5.28 九個 legalize 階段的機制全部不採用後，使用者同意
+換一個槓桿：從訓練端加一項 packing density（bbox 面積）soft loss，讓
+model 一開始預測出來的座標就更緊。
+
+**實作**：重用 `_soft_constraint_loss`（v4.0）已經在算 overlap loss 時
+算好的每個 block `x_left/x_right/y_bot/y_top`，直接算整個預測佈局的
+bounding box 面積除以 block 總面積當 loss（`area_loss_ps`，數學上恆
+`>= 0`，對應這個 session 全程在用的 `area_gap` 定義）。`config.py` 新增
+`lambda_area`（預設 0.0）、`diffusion.py: _soft_constraint_loss`／
+`training_loss` 接上計算與回傳、`train.py: _soft_weights_for_epoch`
+接上傳遞。不改 `model.py`，沒有新增可學習參數，舊 checkpoint 對
+inference 完全相容。單元測試驗證：`lambda_area=0.0` 時逐位元跟改動前
+相同；`>0` 時梯度有限、`area_loss_ps` 數值 `>= 0`（驗證 masked min/max
+padding 處理正確）。`train.py` 一度設定好 30 epoch 短跑（`lambda_area=
+0.1`）等使用者手動執行。
+
+**決定**：使用者決定不繼續投入這個方向，改為專注在推論端——**沒有實際
+跑過任何訓練**，所以不算「測試後不採用」，是「實作完成、單元測試通過，
+但沒有機會驗證真實效果就先擱置」。程式碼保留（`lambda_area` 預設
+`0.0`，跟改動前完全等價），`train.py` 的 `__main__` 恢復成沒有排定中
+實驗的中性狀態。之後如果要重啟這個方向，接線都還在，可以直接繼續走
+「30 epoch 短跑 → 真實資料快速檢驗 → 完整 300 epoch → 官方 evaluate」
+這條既定路徑。
+
+---
+
 ## v5.30 —— best-of-N 評分改用 `x0_pred`（不採用，訊號在 100 樣本被稀釋到雜訊範圍）
 
 **背景**：使用者要求上網查推論端還有什麼改善方向。查到 SMC/particle

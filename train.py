@@ -395,16 +395,10 @@ def validate(model, diffusion, val_loader, device, use_amp=False, use_self_cond=
 
 
 if __name__ == "__main__":
+    # v5.29（packing density soft loss，`lambda_area`）決定不繼續投入，
+    # 使用者改為專注在推論端方向——沒有實際跑過訓練，機制保留在
+    # config.py／diffusion.py／train.py（`lambda_area` 預設 0.0，關閉），
+    # 之後如果要重啟這個實驗，接線都還在。目前沒有排定中的訓練實驗，
+    # 用 Config() 預設值。
     config = Config()
-    # v5.29 短跑（30 epoch）：packing density（bbox 面積）soft loss。其餘
-    # 實驗旗標全部維持 False／"epsilon"，只有 lambda_area 這一個變因，
-    # 避免混淆——包括 v5.20 的 prediction_type（不採用，見 CHANGELOG）。
-    config.epochs = 30
-    config.use_qk_norm = False
-    config.use_min_snr_main_loss = False
-    config.use_coord_sincos = False
-    config.use_self_cond = False
-    config.use_geo_augment = False
-    config.prediction_type = "epsilon"
-    config.lambda_area = 0.1                  # v5.29，實驗值
     train(config)

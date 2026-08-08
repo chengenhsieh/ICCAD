@@ -68,6 +68,19 @@ class Config:
     # v4.0: overlap soft loss，作用於 x0_pred，懲罰 pair-wise bbox 重疊面積。
     # 跟其他 soft loss 同步 warmup，從 warmup 之後才啟用。
     lambda_overlap: float = 0.3
+    # v5.29（實驗用，尚未訓練驗證，預設關閉）：packing density（bbox 面積）
+    # soft loss。這個 session 針對「怎麼提升 packing density」在 legalize
+    # 階段測試過九個機制（v5.22-v5.28）全部不採用，換個方向從訓練端下手
+    # ——讓模型一開始預測出來的座標就更緊，不是每次都靠 legalize 事後
+    # 補救。重用 overlap loss 已經算好的每個 block (x_left, x_right,
+    # y_bot, y_top)，直接算整個預測佈局的 bounding box 面積，除以 block
+    # 總面積當 loss（見 diffusion.py:
+    # GaussianDiffusion._soft_constraint_loss 說明）——跟 lambda_overlap
+    # 同時作用會形成正確的張力（面積 loss 拉緊、overlap loss 擋著不讓真的
+    # 疊在一起），均衡點就是「盡量緊但不重疊」，正是 packing density 的
+    # 定義本身。不新增模型參數、不改架構，舊 checkpoint 對 inference 完全
+    # 相容。
+    lambda_area: float = 0.0
     soft_loss_warmup_epochs: int = 10   # 前幾個 epoch 先只做去噪
 
     # v5.8（實驗用，尚未訓練驗證，預設關閉）：soft constraint loss

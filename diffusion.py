@@ -217,6 +217,7 @@ class GaussianDiffusion:
         #       而不是只 clamp forward 數值。
         #   (c) 強制升 fp32 算（AMP fp16 在 pair-wise N^2 累積容易溢位）。
         overlap_loss_ps = x0_pred.new_zeros(B)
+        area_loss_ps = x0_pred.new_zeros(B)
         if "areas_norm" in batch:
             areas = batch["areas_norm"].to(device, non_blocking=True).float()    # (B, N)
             # 強制升 fp32（從 AMP 的 fp16 升回來）
@@ -256,29 +257,52 @@ class GaussianDiffusion:
                 k_per_sample = mask.sum(dim=1).clamp(min=1)                  # (B,)
                 overlap_loss_ps = overlap_sum / k_per_sample                 # (B,)
 
+                # v5.29: Packing density（bbox 面積）loss，重用上面已經算好
+                # 的 x_left/x_right/y_bot/y_top（fp32、clamp 過、對 padding
+                # 安全）。padding 位置（mask=0）在算 min 前設 +inf、算 max
+                # 前設 -inf，避免無意義座標污染 bbox 範圍。
+                inf = float("inf")
+                mask_bool = mask > 0.5
+                bbox_xmin = torch.where(mask_bool, x_left, x_left.new_full((), inf)).min(dim=1).values
+                bbox_xmax = torch.where(mask_bool, x_right, x_right.new_full((), -inf)).max(dim=1).values
+                bbox_ymin = torch.where(mask_bool, y_bot, y_bot.new_full((), inf)).min(dim=1).values
+                bbox_ymax = torch.where(mask_bool, y_top, y_top.new_full((), -inf)).max(dim=1).values
+                area_pred_ps = (bbox_xmax - bbox_xmin) * (bbox_ymax - bbox_ymin)   # (B,)
+
+                total_block_area_ps = (areas * mask).sum(dim=1)             # (B,)，跟預測無關的固定值
+                # area_pred_ps 恆 >= total_block_area_ps（bbox 不可能比所有
+                # block 面積總和還小），這裡的 -1.0 純粹讓 loss=0 對應
+                # 100% packing density，不影響梯度方向。
+                area_loss_ps = area_pred_ps / total_block_area_ps.clamp(min=eps) - 1.0
+
         if t_weight is None:
-            # ---- 跟 v5.8 之前完全一致的算法 ----
+            # ---- 跟 v5.8 之前完全一致的算法（加 area 項時，lambda_area
+            # 預設 0.0，加法上完全不影響改動前的行為）----
             mib_loss = mib_loss_ps.mean()
             cluster_loss = cluster_loss_ps.mean()
             boundary_loss = b_num.sum() / b_cnt.sum().clamp(min=1)
             overlap_loss = overlap_loss_ps.mean()
+            area_loss = area_loss_ps.mean()
             total = (weights["lambda_mib"] * mib_loss +
                      weights["lambda_cluster"] * cluster_loss +
                      weights["lambda_boundary"] * boundary_loss +
-                     weights.get("lambda_overlap", 0.0) * overlap_loss)
+                     weights.get("lambda_overlap", 0.0) * overlap_loss +
+                     weights.get("lambda_area", 0.0) * area_loss)
             return total, (mib_loss.detach(), cluster_loss.detach(),
-                           boundary_loss.detach(), overlap_loss.detach())
+                           boundary_loss.detach(), overlap_loss.detach(), area_loss.detach())
 
-        # ---- t 加權：四項都先攤成 per-sample，再依 t_weight 加權平均 ----
+        # ---- t 加權：五項都先攤成 per-sample，再依 t_weight 加權平均 ----
         boundary_loss_ps = b_num.sum(dim=1) / b_cnt.sum(dim=1).clamp(min=1)   # (B,)
         total_ps = (weights["lambda_mib"] * mib_loss_ps +
                     weights["lambda_cluster"] * cluster_loss_ps +
                     weights["lambda_boundary"] * boundary_loss_ps +
-                    weights.get("lambda_overlap", 0.0) * overlap_loss_ps)     # (B,)
+                    weights.get("lambda_overlap", 0.0) * overlap_loss_ps +
+                    weights.get("lambda_area", 0.0) * area_loss_ps)           # (B,)
         w = t_weight.clamp(min=0.0)
         total = (total_ps * w).sum() / w.sum().clamp(min=1e-8)
         return total, (mib_loss_ps.mean().detach(), cluster_loss_ps.mean().detach(),
-                       boundary_loss_ps.mean().detach(), overlap_loss_ps.mean().detach())
+                       boundary_loss_ps.mean().detach(), overlap_loss_ps.mean().detach(),
+                       area_loss_ps.mean().detach())
 
     # ----------------------------------------------------------------
     # Training loss
@@ -426,11 +450,11 @@ class GaussianDiffusion:
             if soft_weights.get("weight_soft_loss_by_alpha_bar", False):
                 t_weight = alpha_bar_t.view(B)   # (B,)，見上方 docstring
 
-            soft_loss, (ml, cl, bl, ol) = self._soft_constraint_loss(
+            soft_loss, (ml, cl, bl, ol, al) = self._soft_constraint_loss(
                 x0_pred, batch, soft_weights, t_weight=t_weight)
             loss = loss + soft_loss
             info.update({"soft": soft_loss.detach(), "mib": ml, "cluster": cl,
-                         "boundary": bl, "overlap": ol})
+                         "boundary": bl, "overlap": ol, "area": al})
 
         return loss, info
 
@@ -879,6 +903,8 @@ class GaussianDiffusion:
         # docstring 說明——不是可以自由選的推論端選項，通常由呼叫方
         # （inference.py: generate_floorplan）從 model 的 config 自動帶入
         prediction_type="epsilon",
+        # v5.30: 純推論端實驗，見下方 docstring 說明
+        score_from_x0_pred=False,
     ):
         """
         GNN-style force-guided diffusion sampler。
@@ -965,6 +991,26 @@ class GaussianDiffusion:
             自由調的推論端超參數，一般由 `inference.py: generate_floorplan`
             從 model 自己的 config 自動帶入，不需要呼叫方手動記得設定
             （不像 `use_self_cond` 是獨立於 config 的推論端行為開關）。
+
+        score_from_x0_pred (v5.30，預設 False = 關閉，跟改動前完全等價):
+            best-of-N 的 re-noise checkpoint（`n_renoise_steps`，預設
+            70% 進度）目前用 `select_metric_fn(x)` 幫 N 個候選打分數，
+            但 `x` 是這一步 DDIM 更新算出來的**下一個雜訊 state**，不是
+            model 對「乾淨最終佈局」的估計——`_one_diffusion_step` 內部
+            其實已經算出這個估計（`x0_pred`，DDIM 更新公式本身就是從它
+            推出 `x` 的），只是原本沒有被傳出來給 `select_metric_fn` 用。
+
+            v5.13 測過「把硬性 argmin 選王者改成依分數 softmax 加權重
+            抽樣」，30 樣本沒有訊號（四組 temperature 全部變差樣本數 >
+            變好樣本數），診斷認為是「中途分數不夠準」。但 v5.13 一直
+            都是用雜訊 `x` 算分數，從沒測過「分數本身是不是可以更準」
+            這個更基礎的變因——`score_from_x0_pred=True` 時把
+            `select_metric_fn` 的輸入從 `x` 換成 `x0_pred`，其餘完全
+            不變（`_select_metric` 的 overlap 公式本身不用改，因為兩者
+            形狀/語意相同，都是 `(B, N, 3)` 的 x/y/log_r）。可以跟
+            `resample_temperature` 正交組合測試：只換評分輸入
+            （`resample_temperature=None`，維持硬性 argmin）、或評分
+            輸入+軟性重抽樣一起換，分開驗證兩個變因各自的貢獻。
         """
         device = block_features.device
         B = shape[0]
@@ -989,9 +1035,11 @@ class GaussianDiffusion:
 
         def _one_diffusion_step(x, i, t_cur, self_cond):
             """跑單一 reverse step + 套所有 mid-step 機制。
-            回傳 (x, next_self_cond)——next_self_cond 是這步的 x0_pred
-            （use_self_cond=True 時給下一步當自我調節輸入，否則恆為
-            None）。"""
+            回傳 (x, next_self_cond, x0_pred)——next_self_cond 是這步的
+            x0_pred（use_self_cond=True 時給下一步當自我調節輸入，否則
+            恆為 None）；x0_pred（v5.30）則不論 use_self_cond 為何都會
+            回傳，給 resample checkpoint 當評分輸入用（見
+            score_from_x0_pred docstring）。"""
             t = torch.full((B,), t_cur, device=device, dtype=torch.long)
             if use_amp:
                 with torch.autocast(device_type=device.type, dtype=torch.float16,
@@ -1065,7 +1113,7 @@ class GaussianDiffusion:
                                                max_step=max_step_per_iter,
                                                clamp_bbox=clamp_bbox)
             next_self_cond = x0_pred.detach() if use_self_cond else None
-            return x, next_self_cond
+            return x, next_self_cond, x0_pred
 
         def _repaint_jump_back(x_prev, t_from_val, t_to_val):
             """v5.14: 把 x_prev（在 t_from 這個雜訊量級）往回加噪聲跳到
@@ -1086,19 +1134,20 @@ class GaussianDiffusion:
         # use_self_cond=False 時恆為 None（Denoiser 內部視為零向量，
         # 跟改動前完全等價）。
         self_cond = None
+        last_x0_pred = None
         i = 0
         while i < len(timesteps):
             t_cur = timesteps[i]
             if repaint_resample_steps > 1 and has_constraints:
                 for r in range(repaint_resample_steps):
-                    x_next, self_cond = _one_diffusion_step(x, i, t_cur, self_cond)
+                    x_next, self_cond, last_x0_pred = _one_diffusion_step(x, i, t_cur, self_cond)
                     is_last = (r == repaint_resample_steps - 1)
                     if not is_last:
                         x = _repaint_jump_back(x_next, timesteps[i + 1] if i + 1 < len(timesteps) else 0, t_cur)
                     else:
                         x = x_next
             else:
-                x, self_cond = _one_diffusion_step(x, i, t_cur, self_cond)
+                x, self_cond, last_x0_pred = _one_diffusion_step(x, i, t_cur, self_cond)
 
             # Best-of-N + re-noise 檢查點
             # v3.9: 改成「短第二段」——re-noise 到 select 那個時間點，從 i+1 繼續，
@@ -1106,7 +1155,12 @@ class GaussianDiffusion:
             # 比舊版（n_renoise + n_steps）省一段 model forward。
             if (renoise_idx is not None and i == renoise_idx - 1 and not renoise_done
                 and select_metric_fn is not None):
-                scores = select_metric_fn(x)              # (B,) 低 = 好
+                # v5.30（預設 False，跟改動前完全等價）：score_from_x0_pred=True
+                # 時餵 model 這一步對「乾淨最終佈局」的估計（x0_pred），而不是
+                # 還帶著雜訊的 x——見該參數 docstring 與 CHANGELOG v5.30 的
+                # 根因分析（v5.13 用雜訊 x 算分數，訊號不夠可靠）。
+                score_input = last_x0_pred if score_from_x0_pred else x
+                scores = select_metric_fn(score_input)     # (B,) 低 = 好
                 if resample_temperature is None:
                     best_idx = int(scores.argmin().item())
                     # 複製 best 到所有 batch slot

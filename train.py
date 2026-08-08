@@ -127,6 +127,7 @@ def _soft_weights_for_epoch(config, epoch):
         "lambda_cluster": config.lambda_cluster,
         "lambda_boundary": config.lambda_boundary,
         "lambda_overlap": getattr(config, "lambda_overlap", 0.0),   # v4.0
+        "lambda_area": getattr(config, "lambda_area", 0.0),         # v5.29
         # v5.8：見 config.py / diffusion.py 說明，預設 False
         "weight_soft_loss_by_alpha_bar": getattr(config, "weight_soft_loss_by_alpha_bar", False),
     }
@@ -156,7 +157,7 @@ def train(config):
     use_amp = getattr(config, "use_amp", True) and device.type == "cuda"
 
     os.makedirs(config.output_dir, exist_ok=True)
-    loss_png_path = os.path.join(config.output_dir, "loss_curve_300epoch_overlap_v10.png")
+    loss_png_path = os.path.join(config.output_dir, "loss_curve_300epoch_overlap_v11.png")
 
     # In-memory history（取代 csv），畫 loss curve 用
     history = {k: [] for k in [
@@ -175,9 +176,11 @@ def train(config):
     print("Config: d_model={}, enc={}, dec={}, batch={}, epochs={}".format(
         config.d_model, config.encoder_layers, config.denoiser_layers,
         config.batch_size, config.epochs))
-    print("Soft loss: lambda_mib={}, lambda_cluster={}, lambda_boundary={}, warmup={}, "
+    print("Soft loss: lambda_mib={}, lambda_cluster={}, lambda_boundary={}, "
+          "lambda_overlap={}, lambda_area={}, warmup={}, "
           "weight_soft_loss_by_alpha_bar={}".format(
         config.lambda_mib, config.lambda_cluster, config.lambda_boundary,
+        getattr(config, "lambda_overlap", 0.0), getattr(config, "lambda_area", 0.0),
         config.soft_loss_warmup_epochs,
         getattr(config, "weight_soft_loss_by_alpha_bar", False)))
     print("v5.9: use_qk_norm={}, use_min_snr_main_loss={} (gamma={})".format(
@@ -351,7 +354,7 @@ def train(config):
         if is_best or epoch % config.save_interval == 0 or epoch == config.epochs:
             ema.apply_shadow()
             tag = "best" if is_best else "epoch{}".format(epoch)
-            path = os.path.join(config.output_dir, "model_{}_overlap_v10.pt".format(tag))
+            path = os.path.join(config.output_dir, "model_{}_overlap_v11.pt".format(tag))
             torch.save({
                 "epoch": epoch,
                 "global_step": global_step,
@@ -393,26 +396,15 @@ def validate(model, diffusion, val_loader, device, use_amp=False, use_self_cond=
 
 if __name__ == "__main__":
     config = Config()
-    # 縮小版（快速 debug 用）。要正式訓練時改回 config 預設或自訂。
-    # config.batch_size = 32
-    # config.d_model = 128
-    # config.encoder_layers = 4
-    # config.denoiser_layers = 6
-    # config.epochs = 60
-    # 正式訓練（v10，300 epoch）：v5.20 v-prediction 參數化。30 epoch 短跑
-    # 結論——area/hpwl/V_relative 全部同向變好，raw overlap -17.4%
-    # （28/30 樣本較好），cost-proxy -3.67%（20/30 較好），強度接近
-    # v5.19 幾何增強那次的短跑結果。**但** v5.19 已經示範過 paired 短跑
-    # 訊號可能被變異數縮減放大、官方 evaluate 卻打平的情況，所以這次
-    # 投入完整訓練後一定要走完整驗證流程（100 樣本 paired + 至少 2-3 次
-    # 獨立官方 evaluate），不能只看 paired 結果就下結論。其餘 QK-norm/
-    # Min-SNR/coord_sincos/self-cond/geo_augment 全部維持 False，避免
-    # 混淆變因。epochs/soft_loss_warmup_epochs 用 Config 預設值
-    # （300/10），不用再蓋。
+    # v5.29 短跑（30 epoch）：packing density（bbox 面積）soft loss。其餘
+    # 實驗旗標全部維持 False／"epsilon"，只有 lambda_area 這一個變因，
+    # 避免混淆——包括 v5.20 的 prediction_type（不採用，見 CHANGELOG）。
+    config.epochs = 30
     config.use_qk_norm = False
     config.use_min_snr_main_loss = False
     config.use_coord_sincos = False
     config.use_self_cond = False
     config.use_geo_augment = False
-    config.prediction_type = "v"              # v5.20
+    config.prediction_type = "epsilon"
+    config.lambda_area = 0.1                  # v5.29，實驗值
     train(config)

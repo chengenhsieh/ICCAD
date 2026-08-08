@@ -603,6 +603,71 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.30 —— best-of-N 評分改用 `x0_pred`（不採用，訊號在 100 樣本被稀釋到雜訊範圍）
+
+**背景**：使用者要求上網查推論端還有什麼改善方向。查到 SMC/particle
+resampling 類文獻（中途淘汰差的候選、保留好的），本來要提議實作，但動手
+前先查了現有程式碼，發現這個核心想法（依分數 softmax 加權重抽樣，取代
+硬性 argmin）**已經在 v5.13（`resample_temperature`）測試過、而且不
+採用**——30 樣本 quasi-paired 掃過 4 組 temperature，全部變差樣本數 >
+變好樣本數，診斷認為是「中途唯一能算的分數（overlap）沒辦法可靠預測
+最終品質」。
+
+使用者要求不要直接放棄或直接換方向，先深入分析 v5.13 失敗的細節、看能
+不能對症下藥。追查 `select_metric_fn` 的實際呼叫方式，發現一個更基礎的
+粗糙點：v5.13（以及 v5.13 之前的原始 best-of-N）餵給 `select_metric_fn`
+的是這一步 DDIM 更新算出來的**下一個雜訊 state**（`x`），不是
+`x0_pred`——model 對「乾淨最終佈局」的估計其實在 `_one_diffusion_step`
+內部已經算好，只是沒有被傳出來給評分用。連現有唯一在用的 overlap 分數，
+都是在一個還沒收斂的雜訊訊號上算出來的近似，這比「HPWL/V_relative 算
+不出來」更基礎。
+
+**實作**：`diffusion.py: ddim_sample_with_forces` 的 `_one_diffusion_
+step` 改成同時回傳 `x0_pred`（純內部 closure，不影響外部介面）；新增
+`score_from_x0_pred` 參數（預設 `False`，跟改動前完全等價），`True`
+時 resample checkpoint 用 `select_metric_fn(x0_pred)` 取代
+`select_metric_fn(x)`，評分公式本身完全不用改（`_select_metric` 的
+overlap 計算不在乎輸入是雜訊還是乾淨估計，形狀/語意相同）。`inference.py:
+generate_floorplan`／`run_one_sample` 一路傳遞。單元測試驗證：
+`score_from_x0_pred=False` 時同一 seed 逐位元可重現；`True` 時
+`select_metric_fn` 收到的 tensor 確實跟 `False` 時不同（證實 x0_pred
+真的被傳進去，不是靜默退回 x）。
+
+**驗證分兩階段、刻意把「評分品質」跟「軟性/硬性重抽樣」兩個變因分開測**
+（避免像 v5.13 一樣把兩者混在一起看）：
+
+30 樣本 quasi-paired（`score_from_x0_pred ∈ {False, True}` ×
+`resample_temperature ∈ {None, 0.3, 0.6, 1.0, 2.0}`）：`x0pred_hard`
+（只換評分輸入、維持硬性 argmin）比目前 production 行為
+（`xnoisy_hard`）real cost 1.1010→1.0901、15 好/12 壞/3 平——支持「評分
+品質本身是瓶頸」這個假說；`x0pred_t1.0`（評分+軟性重抽樣一起換）
+1.1010→1.0564、22 好/8 壞，是整張表裡最強的訊號。
+
+**100 樣本 paired 確認**（`x0pred_hard`、`x0pred_t1.0` 對照
+`off`）：訊號明顯被稀釋——`x0pred_hard` real cost 1.0822→1.0802
+（-0.18%），但好/壞樣本數反而**壞比好多**（46 好/52 壞）；
+`x0pred_t1.0` 1.0822→1.0768（-0.5%），好/壞打成 53:47 幾乎五五波。
+兩者都比這個 session 任何一次**採用**的改動在篩選階段的訊號弱上不只
+一個量級（v5.15-17 篩選階段都是 -2%~-16% 且好壞比例明顯偏向好），也比
+v5.19（**不採用**，paired -7%~-13% 卻在官方 evaluate 打平）篩選階段的
+訊號還弱——依這個 session 已經建立的校準基準，這個強度、這個好壞比的
+訊號如果拿去跑官方 evaluate，方向逆轉或打平的機率非常高，不值得再投入
+2-3 次官方 evaluate 的成本去確認。
+
+**決定**：**不採用**（`score_from_x0_pred` 維持預設 `False`）。這次的
+根因分析是對的方向（x0_pred 確實比雜訊 x 更適合當評分輸入，30 樣本、
+特別是隔離出「只換評分」這個變因時，訊號方向也確實一致轉正），但即使
+用上這個更合理的評分依據，訊號強度在 100 樣本就已經被稀釋到接近雜訊
+範圍——這進一步印證 v5.13 原本的診斷更深一層的含義：不只是「當下能算的
+分數不準」，而是這個問題的最終品質（尤其 V_relative、HPWL）有太大一部分
+是由 70% 之後的取樣步驟、加上整套 legalize 收尾管線共同決定的，**任何
+中途訊號**（不論算得多準）能提供的資訊量本身就有限，這是這個「中途
+評分 + best-of-N 選擇」整個機制家族的結構性天花板，不是換一個更好的
+分數來源就能突破的。機制保留備用（`score_from_x0_pred`／回傳 `x0_pred`
+的 `_one_diffusion_step` 改動）。
+
+---
+
 ## v5.28 —— `sa_construct_layout`：重新設計 LFF 初始排布（不採用，合成環境就決定性輸給 LFF）
 
 **背景**：v5.22-v5.27 一共八個「事後在 LFF 已經放好的結果上做局部/聯合

@@ -138,6 +138,8 @@ class MyOptimizer(FloorplanOptimizer):
     # 代價，必須換算真實 median runtime 才會現形。維持關閉（1 = 跟改動前
     # 完全等價）。
     REPAINT_RESAMPLE_STEPS = 1
+    # v5.31（不採用，見 CHANGELOG.md）：post-repel 階段加入 grouping force。
+    POST_REPEL_GROUPING = False
 
     def __init__(self, verbose: bool = False):
         super().__init__(verbose)
@@ -237,6 +239,7 @@ class MyOptimizer(FloorplanOptimizer):
             force_confidence_power=self.FORCE_CONFIDENCE_POWER,
             repaint_resample_steps=self.REPAINT_RESAMPLE_STEPS,
             use_self_cond=self.USE_SELF_COND,
+            post_repel_grouping=self.POST_REPEL_GROUPING,
         )
 
         legalized = legalize_result(

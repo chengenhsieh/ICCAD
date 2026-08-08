@@ -603,6 +603,82 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.31 —— post-repel 階段加入 grouping force（不採用，3 次官方 evaluate 平均在雜訊範圍內）
+
+**背景**：使用者要求比對 `quick_eval_solutions_ddim_legalized.json`（我們
+的 legalized DDIM 輸出，100 筆真實測試案例）跟 `optimal_solutions.json`
+（GT），找出目前最嚴重的問題並對症下藥。用兩份 JSON 已經算好的
+`actual_metrics`/`optimal_metrics` 加上 `utils.py` 的官方對齊違規函式，
+不用重新跑推論就能算出完整 100 樣本的診斷：
+
+| | mean | 對 cost 的邊際貢獻（log 尺度） |
+|---|---|---|
+| area_gap | +22.9% | 0.179 |
+| hpwl_gap | +16.4% |（併入上面）|
+| V_relative | 0.108 | **0.216**（比面積+HPWL項還高）|
+
+拆開 V_relative 三個分量，**grouping violation 出現在 97/100 樣本
+（97%）**——比 boundary（65%）、mib（8%）都普遍得多，且對 cost 的邊際
+貢獻比面積+HPWL項加起來還大，是目前最嚴重、最普遍的問題。
+
+**找根因**：抓最嚴重的案例（test_id=70, V_grouping=11）逐 block 檢查，
+同一個 grouping group 的成員常常相距 50-100+ 單位（畫布約 150×230）——
+不是差一點點沒貼齊，是根本在完全不同的區域。這種規模的落差，
+`compact_merge_cluster_groups`（legalize 階段既有機制）的安全閘門
+（HPWL 代價門檻）會正確拒絕合併，問題出在取樣過程本身沒把同組 block
+拉近，不是 legalize 沒做好。追查 `diffusion.py` 發現：現有的
+`_force_grouping`（拉同組 block 中心靠近）只在主 DDIM 迴圈內套用，
+post-repel 階段（純物理收尾迴圈）只有 repulsion／boundary nudge，沒有
+grouping force；而且 v5.15 把 `DDIM_STEPS` 30→10 之後，grouping force
+能作用的步數只剩三分之一，post-repel 沒有補上這個缺口。
+
+**實作**：`diffusion.py: ddim_sample_with_forces` 新增 `post_repel_
+grouping` 參數（預設 `False`，跟改動前完全等價），`True` 時在 post-repel
+迴圈裡加一個 `_force_grouping`（純物理、無 model forward，成本極低），
+用跟主迴圈相同的 `grouping_force_strength`。`inference.py` 一路傳遞。
+單元測試：機制本身正確（同組 block 平均中心距離確實縮小，0.142→
+0.123）；「逐位元重現」的檢查一開始失敗，追查發現是已知的 GPU
+非決定性（`scatter_add_` atomic 運算，config.py 的 `seed` 說明本來就
+寫明「不保證 GPU 運算逐 bit 重現」），差異量級 ~1e-7，改用寬鬆容忍度
+確認後正常，不是真的 bug。
+
+**真實資料驗證**：
+- 20 樣本：V_grouping 4.60→3.65（-20.7%，10 好/3 壞/7 平），real cost
+  1.0685→1.0435（-2.34%，12 好/8 壞）——這個 session 目前為止推論端
+  實驗裡最強的正面訊號。
+- 100 樣本：訊號方向一致但幅度收斂（符合這個 session 一貫的「篩選階段
+  效果會被稀釋」現象）——V_grouping 3.69→3.35（47 好/26 壞/27 平，約
+  2:1 有利），real cost 1.0827→1.0785（-0.39%，56 好/44 壞）。副作用：
+  V_boundary 略微變差（1.18→1.36，把同組 block 拉近偶爾會把 boundary
+  鎖定的 block 拉離它的邊）、hpwl_gap 也略微變差（+2%，post-repel 是
+  純物理、不知道 wirelength）。
+
+**官方 evaluate 三次獨立跑**（`POST_REPEL_GROUPING=True`，其餘沿用
+production 設定）：
+
+| | run1 | run2 | run3 | 平均 | 標準差 |
+|---|---|---|---|---|---|
+| 真實 median runtime 換算分數 | 1.1105 | 1.1433 | 1.1186 | **1.1241** | 0.0140 |
+
+對照 v4 baseline（v5.17 確認值 1.128）：平均看起來微幅變好（-0.35%），
+但三次跑之間的標準差（0.014，約 1.4%）比這個微小的平均差距還大，而且
+**run2（1.1433）本身就高於 baseline**——不是「三次都一致優於 baseline」
+（比照 v5.15/16/17 那種每次都在 baseline 之下的一致模式），是跨過
+baseline 兩邊都有，落在雜訊範圍內，不構成可信賴的真實改善。
+
+**決定**：**不採用**（`post_repel_grouping` 維持預設 `False`，
+`my_optimizer.py` 的 `POST_REPEL_GROUPING` 改回 `False`）。這次的診斷
+方法論（直接比對已存的官方 JSON、不用重跑推論就能找出「哪個問題最
+嚴重」）跟根因分析（post-repel 缺少 grouping force）都是對的方向，
+20/100 樣本篩選也確實看到目標指標（V_grouping）朝正確方向移動，但
+放大到官方 evaluate 的獨立重跑後，淨效果被 hpwl/boundary 的輕微副作用
+抵銷、被跑與跑之間本來就存在的隨機變異蓋過——這是這個 session 第三次
+遇到「篩選階段訊號方向正確、但強度不足以撐過跨獨立跑的雜訊」的情況
+（前兩次是 v5.19 幾何增強、v5.30 x0_pred 評分）。機制與診斷腳本
+（比對兩份官方 JSON 找最嚴重問題的方法）保留備用。
+
+---
+
 ## v5.29 —— `lambda_area` packing density 訓練端 soft loss（未實際執行，使用者改為專注推論端）
 
 **背景**：v5.22-v5.28 九個 legalize 階段的機制全部不採用後，使用者同意

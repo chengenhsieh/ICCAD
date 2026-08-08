@@ -875,6 +875,8 @@ class GaussianDiffusion:
         select_metric_fn=None,             # callable(x_state, ...) -> (B,) tensor (low=好)
         # Post-repel
         post_repel_steps=30,               # v3.9: 50→30，減少時間
+        # v5.31: 純推論端實驗，見下方 docstring 說明
+        post_repel_grouping=False,
         # 力的強度
         pin_force_strength=0.02,
         grouping_force_strength=0.015,
@@ -1011,6 +1013,25 @@ class GaussianDiffusion:
             `resample_temperature` 正交組合測試：只換評分輸入
             （`resample_temperature=None`，維持硬性 argmin）、或評分
             輸入+軟性重抽樣一起換，分開驗證兩個變因各自的貢獻。
+
+        post_repel_grouping (v5.31，預設 False = 關閉，跟改動前完全等價):
+            比對 `quick_eval_solutions_ddim_legalized.json`（真實 100
+            樣本）跟 `optimal_solutions.json` 發現：V_grouping（cluster
+            分組違規）比 area_gap/hpwl_gap 對 cost 的邊際貢獻還大，且
+            97/100 樣本都有——是目前最普遍、對分數影響最大的問題。追查
+            最嚴重的案例發現同組 block 常常相距整個 canvas 一大段距離，
+            這種規模的落差 `compact_merge_cluster_groups`（legalize 階段）
+            的安全閘門（HPWL 代價門檻）會正確拒絕合併，問題出在取樣過程
+            本身沒把同組 block 拉近，不是 legalize 沒做好。
+
+            現有的 `_force_grouping`（把同組 block 中心拉向組內平均中心）
+            只在主 DDIM 迴圈內套用，post-repel 階段（純物理收尾迴圈，
+            見下方主迴圈之後的區塊）只有 repulsion／boundary nudge，沒有
+            grouping force——而且 v5.15 把 `DDIM_STEPS` 30→10 之後，
+            grouping force 能作用的步數只剩三分之一，post-repel 沒有補上
+            這個缺口。`post_repel_grouping=True` 時在 post-repel 迴圈裡
+            加一個 `_force_grouping`（純物理、無 model forward，成本
+            極低），用跟主迴圈相同的 `grouping_force_strength`。
         """
         device = block_features.device
         B = shape[0]
@@ -1198,6 +1219,10 @@ class GaussianDiffusion:
                 d = self._force_boundary_nudge(x, boundary_code, mask_f, areas_norm,
                                                boundary_nudge_strength)
                 if d is not None: deltas.append(d)
+                if post_repel_grouping:
+                    d = self._force_grouping(x, grouping_group, mask_f,
+                                             grouping_force_strength)
+                    if d is not None: deltas.append(d)
                 if deltas:
                     x = self._apply_forces_clipped(x, deltas, preplaced_mask, fixed_mask,
                                                    max_step=max_step_per_iter,

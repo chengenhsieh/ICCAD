@@ -877,6 +877,8 @@ class GaussianDiffusion:
         post_repel_steps=30,               # v3.9: 50→30，減少時間
         # v5.31: 純推論端實驗，見下方 docstring 說明
         post_repel_grouping=False,
+        # v5.32: 獨立於主迴圈的 grouping_force_strength，見下方 docstring
+        post_repel_grouping_strength=0.030,
         # 力的強度
         pin_force_strength=0.02,
         grouping_force_strength=0.015,
@@ -1031,7 +1033,21 @@ class GaussianDiffusion:
             grouping force 能作用的步數只剩三分之一，post-repel 沒有補上
             這個缺口。`post_repel_grouping=True` 時在 post-repel 迴圈裡
             加一個 `_force_grouping`（純物理、無 model forward，成本
-            極低），用跟主迴圈相同的 `grouping_force_strength`。
+            極低）。
+
+            20/100 樣本篩選訊號方向正確（V_grouping 明顯改善），但 3 次
+            獨立官方 evaluate 平均落在 v4 baseline 的雜訊範圍內，沒有
+            通過確認（見 CHANGELOG.md v5.31）。
+
+        post_repel_grouping_strength (v5.32，預設 0.030，即沿用 v5.31
+            測試時用的值 = 跟主迴圈 `grouping_force_strength` 相同):
+            v5.31 的力道直接沿用主迴圈已經調校過的 `grouping_force_
+            strength`（0.030）——但那個值是在跟 pin/repulsion/boundary
+            force 互相競爭的情境下調出來的（v5.0 的 100 樣本 sweep），
+            post-repel 階段只剩 repulsion／boundary 兩個對手，同一個
+            數值不一定還是最佳點，從沒獨立掃過。這個參數讓 post-repel
+            的 grouping force 強度可以獨立於主迴圈調整，找真正適合這個
+            情境的值。
         """
         device = block_features.device
         B = shape[0]
@@ -1221,7 +1237,7 @@ class GaussianDiffusion:
                 if d is not None: deltas.append(d)
                 if post_repel_grouping:
                     d = self._force_grouping(x, grouping_group, mask_f,
-                                             grouping_force_strength)
+                                             post_repel_grouping_strength)
                     if d is not None: deltas.append(d)
                 if deltas:
                     x = self._apply_forces_clipped(x, deltas, preplaced_mask, fixed_mask,

@@ -603,6 +603,44 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.32 —— post-repel grouping force 強度獨立掃描（不採用，20 樣本訊號在 100 樣本反轉）
+
+**背景**：v5.31 的 post-repel grouping force 沿用主迴圈已調校過的
+`grouping_force_strength=0.030`，但那個值是在跟 pin/repulsion/boundary
+force 互相競爭的情境下調出來的（v5.0）——post-repel 階段只剩
+repulsion／boundary 兩個對手，同一個數值不一定是這個情境下的最佳點。
+使用者選擇先試這個成本最低的方向：把 post-repel 的 grouping force
+強度獨立出來（`post_repel_grouping_strength`，預設 0.030 = 跟改動前
+行為相同），單獨掃描。
+
+**實作**：`diffusion.py: ddim_sample_with_forces` 新增
+`post_repel_grouping_strength` 參數，post-repel 迴圈裡的 `_force_
+grouping` 呼叫改用這個值（不再固定沿用主迴圈的 `grouping_force_
+strength`）。`inference.py` 一路傳遞。
+
+**20 樣本掃描**（`{0.015, 0.030, 0.050, 0.075, 0.10, 0.15}`）：
+`strength=0.05` 明顯突出——avg_real_cost 1.0959→1.0543（**-3.8%**），
+是整張表裡唯一一個好壞樣本比對 off 有利的設定（12 好/8 壞；其餘強度
+都是好壞打平或不利）。V_grouping 3.70→3.35 同步改善。
+
+**100 樣本確認**：訊號完全反轉——avg_real_cost 1.0898→**1.1053
+（+1.4%，變差）**，45 好/55 壞（不利）。這是這個 session 第二次遇到
+「20-34 樣本篩選連方向都判斷錯，不只是誇大幅度」的情況（第一次是
+v5.21 boundary_nudge_strength），再次印證小樣本篩選的雜訊量級在這個
+問題上經常跟真實訊號同量級，方向本身都不可靠。
+
+**決定**：**不採用**（`post_repel_grouping_strength` 維持預設 `0.030`，
+`post_repel_grouping` 本身也維持 v5.31 的結論——關閉）。100 樣本已經
+是決定性的負面結果，不需要再花成本跑官方 evaluate 確認。連同 v5.31，
+「在 post-repel 階段加 grouping force」這整個方向（不論強度）目前看
+起來都無法穩定地帶來真實改善——問題可能出在 post-repel 是純物理、不
+知道 wirelength／boundary 這些其他目標，硬拉近同組 block 中心的副作用
+（hpwl_gap、V_boundary 都觀察到系統性變差）恰好抵銷掉 V_grouping 的
+改善，且這個抵銷關係本身就有相當大的樣本間變異，不會因為調整單一個
+強度參數而變得穩定。機制保留備用（`post_repel_grouping_strength`）。
+
+---
+
 ## v5.31 —— post-repel 階段加入 grouping force（不採用，3 次官方 evaluate 平均在雜訊範圍內）
 
 **背景**：使用者要求比對 `quick_eval_solutions_ddim_legalized.json`（我們

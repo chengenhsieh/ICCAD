@@ -108,6 +108,9 @@ def generate_floorplan(
     # ddim_sample_with_forces 的 post_repel_grouping docstring。
     # 預設 False = 關閉，跟改動前完全等價。
     post_repel_grouping=False,
+    # v5.32: 見 diffusion.py: ddim_sample_with_forces 的
+    # post_repel_grouping_strength docstring。
+    post_repel_grouping_strength=0.030,
 ):
     """
     Args:
@@ -370,6 +373,7 @@ def generate_floorplan(
             prediction_type=_prediction_type,
             score_from_x0_pred=score_from_x0_pred,
             post_repel_grouping=post_repel_grouping,
+            post_repel_grouping_strength=post_repel_grouping_strength,
         )
 
     preplaced_indices = [i for i in range(k) if preplaced_mask_np[i]]
@@ -983,6 +987,7 @@ def run_one_sample(sample_idx, official, model, config, device,
                    force_confidence_power=0.0, resample_temperature=None,
                    repaint_resample_steps=1, use_self_cond=False,
                    score_from_x0_pred=False, post_repel_grouping=False,
+                   post_repel_grouping_strength=0.030,
                    tie_break_modes=None, use_gravity=False, gravity_iters=40,
                    use_cluster_merge=True, hpwl_slack_ratio=5.0, use_snap_boundary=False,
                    boundary_hpwl_slack_ratio=0.0,
@@ -1149,6 +1154,7 @@ def run_one_sample(sample_idx, official, model, config, device,
         use_self_cond=use_self_cond,
         score_from_x0_pred=score_from_x0_pred,
         post_repel_grouping=post_repel_grouping,
+        post_repel_grouping_strength=post_repel_grouping_strength,
     )
 
     # v5.7（實驗用）：把額外 checkpoint 的候選池併進來，一起重新選最好的

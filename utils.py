@@ -2040,6 +2040,8 @@ def compact_merge_cluster_groups(x, y, w, h, preplaced_mask=None, boundary_code=
                                  mib_group=None,
                                  use_cost_aware_gate=False,
                                  cost_alpha=0.5, cost_beta=2.0,
+                                 use_expanded_search=False,
+                                 expanded_search_max_pairs=20,
                                  verbose=False):
     """
     針對每個 cluster group，檢查該組成員在目前 touching graph 裡是否已經是
@@ -2118,6 +2120,32 @@ def compact_merge_cluster_groups(x, y, w, h, preplaced_mask=None, boundary_code=
     大 group」（`Δv_rel` 很負）跟「修好一個只分裂成 2 塊的小 group」
     （`Δv_rel` 小幅負）一視同仁；公式對齊的版本會讓前者能接受更大的
     HPWL 代價、後者的容忍度更小，更貼近官方指數懲罰的精神。
+
+    use_expanded_search（v5.34，實驗用，預設 False = 關閉，跟改動前完全
+    等價）：v5.33 驗證發現 HPWL 閘門鬆緊在真實資料上很少是瓶頸——這個
+    函式自己的候選搬移邏輯太窄才是真正的限制，具體是兩個限制：
+      1. 每個衛星子分量只算「距離最近的一對 (衛星組員 a, target 組員
+         b)」，只試這一對的 4 種貼齊方向；這一對被擋住（不重疊/違規
+         閘門任一個不過）就直接放棄整個衛星子分量，不會改試次近的配對
+         ——但「最近的一對」被擋住，不代表其他配對也會被擋住。
+      2. 永遠只搬衛星子分量、從不搬 target——`compact_merge_clusters`
+         （姊妹函式）已經有「衛星卡住時改搬 main」的 fallback，這裡
+         完全沒有對應機制。
+
+    `True` 時：先把候選配對依距離排序，最多保留
+    `expanded_search_max_pairs` 對（避免大 group 時配對數平方成長，
+    預設 20），逐對嘗試（沿用完全相同的 4 方向候選 + 既有安全閘門，
+    見 `_try_abut` 內部）；如果所有「搬衛星」的配對都卡住，追加一輪
+    「搬 target」的對稱嘗試——衛星組員變成固定參考點，target 那一側的
+    剛體變成 mover，一樣套用完全相同的候選生成/驗證邏輯，只是如果
+    target 所在剛體含 preplaced block 就跳過（比照 `compact_merge_
+    clusters` 對 `main_immovable` 的既有處理）。
+
+    兩個新方向的每個候選解都還是要通過現有那些安全閘門（不重疊、
+    boundary/cluster 違規不比移動前差、HPWL 閘門），純粹是多給幾個
+    候選方向去試，不改變任何驗收標準。運算量隨 `expanded_search_
+    max_pairs` 線性增加（`use_cost_aware_gate=True` 時每個候選還要
+    多算一次 HPWL，成本更高），`False` 時完全不變。
     """
     x = np.array(x, dtype=np.float64).copy()
     y = np.array(y, dtype=np.float64).copy()
@@ -2231,45 +2259,18 @@ def compact_merge_cluster_groups(x, y, w, h, preplaced_mask=None, boundary_code=
             subcomps.sort(key=lambda ms: -float(areas_arr[ms].sum()))
             t_members_idx = np.array(subcomps[0], dtype=int)
 
-            for sat_members in subcomps[1:]:
-                s_members_idx = np.array(sat_members, dtype=int)
-
-                # 找「最近的一對 (衛星組員 a, target 組員 b)」，算出 4 種
-                # 「a 精確貼齊 b 的某一邊、且另一軸置中對齊（保證有重疊
-                # margin）」候選位移，逐一驗證是否安全，選第一個可行的整段
-                # 套用——套用後 a、b 保證真的共邊，不是只有比較近。
-                best_pair = None
-                best_d2 = None
-                for a in s_members_idx:
-                    for b in t_members_idx:
-                        gxg = max(0.0, x[a] - (x[b] + w[b]), x[b] - (x[a] + w[a]))
-                        gyg = max(0.0, y[a] - (y[b] + h[b]), y[b] - (y[a] + h[a]))
-                        d2 = gxg * gxg + gyg * gyg
-                        if best_d2 is None or d2 < best_d2:
-                            best_d2 = d2; best_pair = (int(a), int(b))
-                a, b = best_pair
-                if preplaced_mask[a]:
-                    continue   # a 本身位置固定，跳過
-
-                # comp_mask：要整塊一起移動的剛體範圍。正常情況下是「a 所在的
-                # 全域 touching component」（把跟 a 已經貼合的其他 block 一起
-                # 搬，避免拆散既有的合法貼合關係）；但如果 a、b 剛好已經在
-                # 同一個全域 component 裡（例如透過非成員 block 間接相連，
-                # 但兩個組員本身沒有直接共邊——這正是前面 comp_id 判斷會誤判
-                # 的那種情況），這時不能整塊移動（等於要把一個剛體往它自己
-                # 身上搬），改成只搬 a 自己（把它從目前位置「拔出來」平移到
-                # 新位置，其餘 block 留在原地）。
-                if comp_id[a] == comp_id[b] or preplaced_mask[comp_id == comp_id[a]].any():
-                    comp_mask = np.zeros(k, dtype=bool)
-                    comp_mask[a] = True
-                else:
-                    comp_mask = comp_id == comp_id[a]
+            def _try_abut(mover, ref, comp_mask):
+                """試著把 comp_mask 這塊剛體整體平移，讓 mover 精確貼齊
+                ref 的某一邊（4 種候選方向，依所需移動距離由小到大嘗試）。
+                每個候選都要通過既有安全閘門（不重疊、boundary/cluster
+                違規不比移動前差、HPWL 閘門）。成功時直接套用到 x,y、
+                回傳 True；全部候選都不可行則回傳 False、x,y 不變。"""
                 others_mask = ~comp_mask
 
-                def _apply(dx, dy, t):
+                def _apply(dx, dy):
                     xt = x.copy(); yt2 = y.copy()
-                    xt[comp_mask] = x[comp_mask] + dx * t
-                    yt2[comp_mask] = y[comp_mask] + dy * t
+                    xt[comp_mask] = x[comp_mask] + dx
+                    yt2[comp_mask] = y[comp_mask] + dy
                     return xt, yt2
 
                 def _overlap_bad(xt, yt2):
@@ -2295,7 +2296,7 @@ def compact_merge_cluster_groups(x, y, w, h, preplaced_mask=None, boundary_code=
                 baseline_hpwl = _total_hpwl(x, y) if check_hpwl else 0.0
 
                 def _feasible_full(dx, dy):
-                    xt, yt2 = _apply(dx, dy, 1.0)
+                    xt, yt2 = _apply(dx, dy)
                     if _overlap_bad(xt, yt2):
                         return False
                     v_bnd_after = compute_boundary_violations(xt, yt2, w, h, boundary_code)
@@ -2324,35 +2325,93 @@ def compact_merge_cluster_groups(x, y, w, h, preplaced_mask=None, boundary_code=
                             return False
                     return True
 
-                ax0, ay0, aw_, ah_ = float(x[a]), float(y[a]), float(w[a]), float(h[a])
-                bx0, by0, bw_, bh_ = float(x[b]), float(y[b]), float(w[b]), float(h[b])
-                bcx, bcy = bx0 + bw_ / 2.0, by0 + bh_ / 2.0
+                mx0, my0, mw_, mh_ = float(x[mover]), float(y[mover]), float(w[mover]), float(h[mover])
+                rx0, ry0, rw_, rh_ = float(x[ref]), float(y[ref]), float(w[ref]), float(h[ref])
+                rcx, rcy = rx0 + rw_ / 2.0, ry0 + rh_ / 2.0
                 candidates = [
-                    ((bx0 + bw_) - ax0, bcy - (ay0 + ah_ / 2.0)),          # 貼 b 右邊
-                    (bx0 - (ax0 + aw_), bcy - (ay0 + ah_ / 2.0)),          # 貼 b 左邊
-                    (bcx - (ax0 + aw_ / 2.0), (by0 + bh_) - ay0),          # 貼 b 上邊
-                    (bcx - (ax0 + aw_ / 2.0), by0 - (ay0 + ah_)),          # 貼 b 下邊
+                    ((rx0 + rw_) - mx0, rcy - (my0 + mh_ / 2.0)),          # 貼 ref 右邊
+                    (rx0 - (mx0 + mw_), rcy - (my0 + mh_ / 2.0)),          # 貼 ref 左邊
+                    (rcx - (mx0 + mw_ / 2.0), (ry0 + rh_) - my0),          # 貼 ref 上邊
+                    (rcx - (mx0 + mw_ / 2.0), ry0 - (my0 + mh_)),          # 貼 ref 下邊
                 ]
-                # 依所需移動距離由小到大嘗試，優先選最省力（最少擾動其他佈局）
-                # 的可行貼合方式。
                 candidates.sort(key=lambda d: d[0] * d[0] + d[1] * d[1])
 
-                moved = False
                 for dx, dy in candidates:
                     if abs(dx) + abs(dy) < 1e-9:
                         continue
                     if _feasible_full(dx, dy):
-                        xt, yt2 = _apply(dx, dy, 1.0)
+                        xt, yt2 = _apply(dx, dy)
                         x[:] = xt; y[:] = yt2
+                        return True
+                return False
+
+            for sat_members in subcomps[1:]:
+                s_members_idx = np.array(sat_members, dtype=int)
+
+                # 依距離排序建立候選配對清單。v5.34: use_expanded_search=False
+                # 時只留最近一對（逐位元等同改動前的行為）；True 時最多保留
+                # expanded_search_max_pairs 對，逐一試「衛星貼 target」，
+                # 全部卡住才追加一輪「target 貼衛星」的對稱嘗試（見 docstring）。
+                pair_list = []
+                for a in s_members_idx:
+                    for b in t_members_idx:
+                        gxg = max(0.0, x[a] - (x[b] + w[b]), x[b] - (x[a] + w[a]))
+                        gyg = max(0.0, y[a] - (y[b] + h[b]), y[b] - (y[a] + h[a]))
+                        d2 = gxg * gxg + gyg * gyg
+                        pair_list.append((d2, int(a), int(b)))
+                pair_list.sort(key=lambda t: t[0])
+                if use_expanded_search:
+                    pair_list = pair_list[:max(int(expanded_search_max_pairs), 1)]
+                else:
+                    pair_list = pair_list[:1]
+
+                moved = False
+                moved_desc = None
+                for _d2, a, b in pair_list:
+                    if preplaced_mask[a]:
+                        continue   # a 本身位置固定，跳過
+
+                    # comp_mask：要整塊一起移動的剛體範圍。正常情況下是「a 所在
+                    # 的全域 touching component」（把跟 a 已經貼合的其他 block
+                    # 一起搬，避免拆散既有的合法貼合關係）；但如果 a、b 剛好
+                    # 已經在同一個全域 component 裡（例如透過非成員 block 間接
+                    # 相連，但兩個組員本身沒有直接共邊——這正是前面 comp_id
+                    # 判斷會誤判的那種情況），這時不能整塊移動（等於要把一個
+                    # 剛體往它自己身上搬），改成只搬 a 自己。
+                    if comp_id[a] == comp_id[b] or preplaced_mask[comp_id == comp_id[a]].any():
+                        comp_mask = np.zeros(k, dtype=bool)
+                        comp_mask[a] = True
+                    else:
+                        comp_mask = comp_id == comp_id[a]
+
+                    if _try_abut(a, b, comp_mask):
                         moved = True
+                        moved_desc = ("block {} abutted to block {} "
+                                      "(moved {} block(s))").format(a, b, int(comp_mask.sum()))
                         break
+
+                if not moved and use_expanded_search:
+                    # v5.34: 所有「搬衛星」的配對都卡住，反過來試「搬 target」
+                    # ——衛星組員變成固定參考點，target 那一側的剛體變成 mover。
+                    for _d2, a, b in pair_list:
+                        if comp_id[a] == comp_id[b]:
+                            continue   # 同一全域剛體，搬 target 沒有意義
+                        target_comp_mask = comp_id == comp_id[b]
+                        if preplaced_mask[target_comp_mask].any():
+                            continue   # target 所在剛體含 preplaced，不能動
+                        if _try_abut(b, a, target_comp_mask):
+                            moved = True
+                            moved_desc = ("target block {} abutted to satellite "
+                                          "block {} (moved {} block(s), reverse "
+                                          "direction)").format(
+                                              b, a, int(target_comp_mask.sum()))
+                            break
 
                 if moved:
                     moved_any = True
                     if verbose:
-                        print("compact_merge_cluster_groups: round={} group={} block {} "
-                              "abutted to block {} (moved {} block(s))".format(
-                                  _round, gid, a, b, int(comp_mask.sum())))
+                        print("compact_merge_cluster_groups: round={} group={} {}".format(
+                            _round, gid, moved_desc))
 
         if not moved_any:
             break
@@ -3748,6 +3807,10 @@ def legalize_lff(
     use_cost_aware_gate=False,
     cost_alpha=0.5,
     cost_beta=2.0,
+    # v5.34（實驗用，預設關閉）：見 compact_merge_cluster_groups
+    # docstring 的 use_expanded_search 說明。
+    use_expanded_search=False,
+    expanded_search_max_pairs=20,
     use_snap_boundary=False,   # 實驗用：見 compact_snap_boundary 呼叫處說明
     boundary_hpwl_slack_ratio=0.0,   # 實驗用：見 compact_snap_boundary docstring
     # v4.6: 100 樣本 A/B 驗證後改為預設開啟。compact_reinsert 的局部搜尋常常
@@ -4345,6 +4408,8 @@ def legalize_lff(
                                             use_cost_aware_gate=use_cost_aware_gate,
                                             cost_alpha=cost_alpha,
                                             cost_beta=cost_beta,
+                                            use_expanded_search=use_expanded_search,
+                                            expanded_search_max_pairs=expanded_search_max_pairs,
                                             verbose=verbose)
 
     # ---- 2-block 聯合 reinsert（v4.9，實驗用）----

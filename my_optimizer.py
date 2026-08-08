@@ -140,6 +140,11 @@ class MyOptimizer(FloorplanOptimizer):
     REPAINT_RESAMPLE_STEPS = 1
     # v5.31（不採用，見 CHANGELOG.md）：post-repel 階段加入 grouping force。
     POST_REPEL_GROUPING = False
+    # v5.34（不採用，見 CHANGELOG.md）：compact_merge_cluster_groups
+    # 擴大候選搬移搜尋範圍，疊加 v5.33 的 cost-aware 閘門。
+    USE_EXPANDED_SEARCH = False
+    EXPANDED_SEARCH_MAX_PAIRS = 20
+    USE_COST_AWARE_GATE = False
 
     def __init__(self, verbose: bool = False):
         super().__init__(verbose)
@@ -253,6 +258,9 @@ class MyOptimizer(FloorplanOptimizer):
             use_second_merge_pass=True,
             use_cluster_merge=True,
             hpwl_slack_ratio=5.0,
+            use_expanded_search=self.USE_EXPANDED_SEARCH,
+            expanded_search_max_pairs=self.EXPANDED_SEARCH_MAX_PAIRS,
+            use_cost_aware_gate=self.USE_COST_AWARE_GATE,
             reinsert_sweeps=self.REINSERT_SWEEPS,
             reinsert_grid_density=self.REINSERT_GRID_DENSITY,
             verbose=self.verbose,

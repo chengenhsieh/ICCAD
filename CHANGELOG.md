@@ -603,6 +603,69 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.34 —— `compact_merge_cluster_groups` 擴大候選搬移搜尋範圍（不採用，官方 evaluate 變異度過大）
+
+**背景**：v5.33 證實 HPWL 閘門鬆緊不是真實資料上的瓶頸——真正限制是
+`compact_merge_cluster_groups` 自己的候選搬移邏輯太窄。這次直接針對這個
+根因：函式對每個分裂成多塊的 cluster group，找「面積最大的子分量」當
+target，其餘子分量逐一嘗試合併，但有兩個具體限制：(1) 每個衛星子分量
+只算「距離最近的一對 (衛星組員, target 組員)」，只試 4 種貼齊方向，這一
+對被擋住就直接放棄，不會改試次近的配對；(2) 永遠只搬衛星、從不搬
+target——姊妹函式 `compact_merge_clusters` 已經有「衛星卡住時改搬 main」
+的 fallback，這裡完全沒有對應機制。
+
+**實作**：新增 `use_expanded_search`（預設 `False`，跟改動前完全等價）、
+`expanded_search_max_pairs`（預設 20，避免大 group 時配對數平方成長）。
+`True` 時：候選配對依距離排序，最多嘗試 `expanded_search_max_pairs`
+對（沿用完全相同的 4 方向候選 + 既有安全閘門邏輯，抽成共用的
+`_try_abut` 內部函式）；所有「搬衛星」的配對都卡住時，追加一輪「搬
+target」的對稱嘗試（target 所在剛體含 preplaced block 則跳過，比照
+`compact_merge_clusters` 對 `main_immovable` 的既有處理）。兩個新方向
+的每個候選解都還是要通過現有的不重疊／boundary／cluster／HPWL 閘門，
+純粹是多給候選方向去試，不改變任何驗收標準。`inference.py`／
+`legalize_lff` 一路傳遞（4 點接線）。
+
+**驗證**：
+- 逐位元反向相容：`use_expanded_search=False` 跟改動前完全一致。
+- 60 組隨機合成 fuzz test：100% 安全（不重疊、boundary 違規恆為 0）；
+  `True` 時 20/60 案例找到比 `False` 更多的改善，**0 個更差**。
+
+**真實資料驗證**（疊加 v5.33 的 `use_cost_aware_gate=True`，因為兩者
+要一起生效才能讓「搜尋更廣」跟「閘門更聰明」同時發揮作用）：
+- 20 樣本：V_grouping 4.25→4.00，**4 個變好、0 個變差**、16 個打平——
+  這個 session 整個 grouping 調查裡目標指標最乾淨的一次訊號。real cost
+  1.0869→1.0860（5 好/4 壞/11 平），avg_legalize_time +8.7%。
+- 100 樣本：V_grouping 3.59→3.43（**16 好/3 壞/81 平，約 5:1**），
+  real cost 1.0799→1.0743（-0.52%，33 好/25 壞/42 平），
+  avg_legalize_time 只增加 +3.5%（0.981s→1.015s）、0/100 infeasible。
+
+**官方 evaluate 三次獨立跑**：
+
+| | run1 | run2 | run3 | 平均 | 標準差 |
+|---|---|---|---|---|---|
+| 真實 median runtime 換算分數 | 1.1126 | 1.1338 | **1.1833** | 1.1432 | **0.0296** |
+
+前兩次（平均 1.1232）看起來比 v4 baseline（1.128）好，但第三次出現
+明顯離群值（1.1833，中性 Total Score 也同步偏高，不是單純 runtime
+波動），把三次平均拉到 **1.1432——比 baseline 差約 +1.3%**，標準差
+（0.0296）是 v4 baseline 自身跨跑變異度（v5.17 確認時約 0.0104）的
+將近 3 倍。
+
+**決定**：**不採用**（`use_expanded_search`／`USE_EXPANDED_SEARCH`
+維持預設 `False`）。這是這個 session 目標指標（V_grouping）篩選訊號
+最乾淨、最一致的一次（20/100 樣本均為壓倒性正比例、zero/少量負比例），
+卻是官方 evaluate 變異度最大的一次——推測「搜尋更廣」雖然平均而言更常
+找到修復 grouping 的機會，但也讓「這一輪 legalize 具體修好哪些、修好後
+連帶影響後續貪婪 pass 怎麼收斂」的結果對 diffusion 取樣的隨機性更敏感，
+在少數樣本上把 V_relative 以外的其他指標帶往更差的方向，篩選階段用的
+平均值/勝負比看不出這種「偶爾大幅波動」的風險，只有官方 evaluate 的
+獨立重跑才會現形——這是 v5.14（中性 evaluate 看不出 runtime 代價）之後
+這個 session 第二次抓到「篩選指標本身有盲點」的案例，但這次的盲點是
+「變異度」而不是某個特定被忽略的維度。機制保留備用
+（`use_expanded_search`／`expanded_search_max_pairs`）。
+
+---
+
 ## v5.33 —— `compact_merge_cluster_groups` 的 HPWL 閘門改成跟官方 cost 公式對齊（不採用，真實資料上很少觸發到差異）
 
 **背景**：v5.31/v5.32 兩次嘗試從「推論端加 grouping force」修 V_grouping

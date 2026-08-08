@@ -521,6 +521,11 @@ def legalize_result(
     # 說明（utils.py）。
     use_cluster_merge=True,
     hpwl_slack_ratio=5.0,
+    # v5.33（實驗用，預設關閉）：見 utils.py:
+    # compact_merge_cluster_groups docstring 的 use_cost_aware_gate 說明。
+    use_cost_aware_gate=False,
+    cost_alpha=0.5,
+    cost_beta=2.0,
     use_snap_boundary=False,   # 實驗用：見 compact_snap_boundary 呼叫處說明（utils.py）
     boundary_hpwl_slack_ratio=0.0,   # 實驗用：見 compact_snap_boundary docstring
     use_pair_reinsert=False,  # 實驗用：見 compact_pair_reinsert 呼叫處說明（utils.py）
@@ -618,6 +623,9 @@ def legalize_result(
             gravity_iters=gravity_iters,
             use_cluster_merge=use_cluster_merge,
             hpwl_slack_ratio=hpwl_slack_ratio,
+            use_cost_aware_gate=use_cost_aware_gate,
+            cost_alpha=cost_alpha,
+            cost_beta=cost_beta,
             use_snap_boundary=use_snap_boundary,
             boundary_hpwl_slack_ratio=boundary_hpwl_slack_ratio,
             use_pair_reinsert=use_pair_reinsert,
@@ -990,6 +998,7 @@ def run_one_sample(sample_idx, official, model, config, device,
                    post_repel_grouping_strength=0.030,
                    tie_break_modes=None, use_gravity=False, gravity_iters=40,
                    use_cluster_merge=True, hpwl_slack_ratio=5.0, use_snap_boundary=False,
+                   use_cost_aware_gate=False, cost_alpha=0.5, cost_beta=2.0,
                    boundary_hpwl_slack_ratio=0.0,
                    use_pair_reinsert=False, pair_reinsert_sweeps=2, pair_reinsert_grid_density=8,
                    pair_reinsert_hpwl_slack_ratio=0.0,
@@ -1254,6 +1263,9 @@ def run_one_sample(sample_idx, official, model, config, device,
         gravity_iters=gravity_iters,
         use_cluster_merge=use_cluster_merge,
         hpwl_slack_ratio=hpwl_slack_ratio,
+        use_cost_aware_gate=use_cost_aware_gate,
+        cost_alpha=cost_alpha,
+        cost_beta=cost_beta,
         use_snap_boundary=use_snap_boundary,
         boundary_hpwl_slack_ratio=boundary_hpwl_slack_ratio,
         use_pair_reinsert=use_pair_reinsert,

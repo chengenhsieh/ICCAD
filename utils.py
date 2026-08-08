@@ -2037,6 +2037,9 @@ def compact_merge_cluster_groups(x, y, w, h, preplaced_mask=None, boundary_code=
                                  cluster_group=None, touch_tol_ratio=0.02, rounds=10,
                                  W_int=None, p2b_edges=None, pins_pos=None,
                                  hpwl_slack_ratio=0.0,
+                                 mib_group=None,
+                                 use_cost_aware_gate=False,
+                                 cost_alpha=0.5, cost_beta=2.0,
                                  verbose=False):
     """
     針對每個 cluster group，檢查該組成員在目前 touching graph 裡是否已經是
@@ -2085,6 +2088,36 @@ def compact_merge_cluster_groups(x, y, w, h, preplaced_mask=None, boundary_code=
     contest 的 HPWL_gap/Area_gap 需要 GT optimal 值才能算，而 legalize 在
     真實推論時拿不到 GT，所以無法在執行當下精確計算「這步移動對最終分數的
     淨影響」，只能用這個長度尺度的代理閾值去近似「值不值得」。
+
+    use_cost_aware_gate（v5.33，實驗用，預設 False = 關閉，跟改動前完全
+    等價）：上面這段話裡「legalize 在真實推論時拿不到 GT，所以無法精確
+    計算」，仔細想其實只對了一半——官方公式
+    `Cost = (1+α(HPWL_gap+Area_gap)) × exp(β·V_relative)` 裡，HPWL_gap
+    的分母（opt_hpwl）確實需要 GT，但我們真正要問的問題不是「這步移動
+    後 cost 的絕對值是多少」，而是「這步移動讓 cost 變好還是變差」——
+    這只需要**符號**，不需要絕對值。把移動前的目前總 HPWL
+    （`baseline_hpwl`，這個函式本來就會算）當一致的代理分母，兩邊都除
+    以同一個東西，符號判斷依然穩健：
+
+        Δhpwl_frac = (hpwl_after - hpwl_before) / hpwl_before   # GT-free
+        Δv_rel     = (v_total_after - v_total_before) / N_soft  # 本來就 GT-free
+        接受 ⟺ (1 + cost_alpha·Δhpwl_frac) · exp(cost_beta·Δv_rel) < 1
+
+    `N_soft`（= N_boundary + N_grouping + N_mib）只跟 `boundary_code`／
+    `cluster_group`／`mib_group` 這些**約束規格本身**有關，不是 GT
+    答案，函式最上方算一次即可；`v_total` 是 boundary+grouping+mib
+    違規數總和，這個函式只動 x,y（不動 w,h），MIB 違規在整個函式執行
+    期間恆定不變，`Δv_rel` 的 mib 項恆為 0，`mib_group` 只用來讓
+    `N_soft` 分母精確，不需要重算 MIB 違規本身。
+
+    這個判斷式取代現有的 `hpwl_slack` 絕對門檻，但**不取代**「boundary/
+    cluster 違規數不能比移動前差」這兩道既有的硬性閘門——那兩道是「絕對
+    不允許退步」的安全底線，跟「這步移動划不划算」是不同層次的問題，
+    新機制只換掉後者的判斷依據。理論效益：舊版 `hpwl_slack_ratio` 是
+    固定長度尺度，同一個絕對 HPWL 增量，對「修好一個嚴重分裂成 5 塊的
+    大 group」（`Δv_rel` 很負）跟「修好一個只分裂成 2 塊的小 group」
+    （`Δv_rel` 小幅負）一視同仁；公式對齊的版本會讓前者能接受更大的
+    HPWL 代價、後者的容忍度更小，更貼近官方指數懲罰的精神。
     """
     x = np.array(x, dtype=np.float64).copy()
     y = np.array(y, dtype=np.float64).copy()
@@ -2122,6 +2155,27 @@ def compact_merge_cluster_groups(x, y, w, h, preplaced_mask=None, boundary_code=
         if p2b_edges and pins_pos is not None:
             total += compute_p2b_hpwl(xx, yy, w, h, p2b_edges, pins_pos)
         return total
+
+    # v5.33: N_soft 只跟約束規格本身有關（不是 GT 答案），
+    # cost_aware 閘門用來把違規數差換算成 Δv_rel。
+    n_soft = 1
+    if use_cost_aware_gate:
+        n_boundary_soft = int(np.sum(boundary_code > 0))
+        n_grouping_soft = 0
+        for gid in group_ids:
+            sz = int(np.sum(cluster_group == gid))
+            if sz >= 2:
+                n_grouping_soft += (sz - 1)
+        n_mib_soft = 0
+        if mib_group is not None:
+            mib_arr = np.asarray(mib_group)
+            for gid in np.unique(mib_arr):
+                if gid == 0:
+                    continue
+                sz = int(np.sum(mib_arr == gid))
+                if sz >= 2:
+                    n_mib_soft += (sz - 1)
+        n_soft = max(n_boundary_soft + n_grouping_soft + n_mib_soft, 1)
 
     for _round in range(rounds):
         xr = x + w; yt = y + h
@@ -2244,12 +2298,30 @@ def compact_merge_cluster_groups(x, y, w, h, preplaced_mask=None, boundary_code=
                     xt, yt2 = _apply(dx, dy, 1.0)
                     if _overlap_bad(xt, yt2):
                         return False
-                    if compute_boundary_violations(xt, yt2, w, h, boundary_code) > baseline_v:
+                    v_bnd_after = compute_boundary_violations(xt, yt2, w, h, boundary_code)
+                    if v_bnd_after > baseline_v:
                         return False
-                    if compute_cluster_violations(xt, yt2, w, h, cluster_group) > baseline_cluster_v:
+                    v_clu_after = compute_cluster_violations(xt, yt2, w, h, cluster_group)
+                    if v_clu_after > baseline_cluster_v:
                         return False
-                    if check_hpwl and _total_hpwl(xt, yt2) > baseline_hpwl + hpwl_slack + 1e-6:
-                        return False
+                    if not check_hpwl:
+                        return True
+                    hpwl_after = _total_hpwl(xt, yt2)
+                    if use_cost_aware_gate:
+                        # v5.33: 見函式 docstring 的 use_cost_aware_gate 說明。
+                        # 用移動前的 HPWL 當代理分母，兩邊用同一個分母，
+                        # 符號判斷不需要 GT 就穩健。
+                        delta_hpwl_frac = ((hpwl_after - baseline_hpwl) /
+                                           max(baseline_hpwl, 1e-9))
+                        delta_v_rel = ((v_bnd_after + v_clu_after) -
+                                       (baseline_v + baseline_cluster_v)) / n_soft
+                        cost_ratio = ((1.0 + cost_alpha * delta_hpwl_frac) *
+                                     np.exp(cost_beta * delta_v_rel))
+                        if cost_ratio >= 1.0 - 1e-9:
+                            return False
+                    else:
+                        if hpwl_after > baseline_hpwl + hpwl_slack + 1e-6:
+                            return False
                     return True
 
                 ax0, ay0, aw_, ah_ = float(x[a]), float(y[a]), float(w[a]), float(h[a])
@@ -3671,6 +3743,11 @@ def legalize_lff(
     # 平均 hpwl_gap 代價僅 +0.16%。
     use_cluster_merge=True,
     hpwl_slack_ratio=5.0,
+    # v5.33（實驗用，預設關閉）：見 compact_merge_cluster_groups
+    # docstring 的 use_cost_aware_gate 說明。
+    use_cost_aware_gate=False,
+    cost_alpha=0.5,
+    cost_beta=2.0,
     use_snap_boundary=False,   # 實驗用：見 compact_snap_boundary 呼叫處說明
     boundary_hpwl_slack_ratio=0.0,   # 實驗用：見 compact_snap_boundary docstring
     # v4.6: 100 樣本 A/B 驗證後改為預設開啟。compact_reinsert 的局部搜尋常常
@@ -4264,6 +4341,10 @@ def legalize_lff(
                                             W_int=W_int, p2b_edges=p2b_edges,
                                             pins_pos=pins_pos,
                                             hpwl_slack_ratio=hpwl_slack_ratio,
+                                            mib_group=mib_group,
+                                            use_cost_aware_gate=use_cost_aware_gate,
+                                            cost_alpha=cost_alpha,
+                                            cost_beta=cost_beta,
                                             verbose=verbose)
 
     # ---- 2-block 聯合 reinsert（v4.9，實驗用）----

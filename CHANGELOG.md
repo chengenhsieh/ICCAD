@@ -603,6 +603,74 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.33 —— `compact_merge_cluster_groups` 的 HPWL 閘門改成跟官方 cost 公式對齊（不採用，真實資料上很少觸發到差異）
+
+**背景**：v5.31/v5.32 兩次嘗試從「推論端加 grouping force」修 V_grouping
+都沒通過官方 evaluate 的雜訊考驗。這次改從 legalize 階段下手：
+`compact_merge_cluster_groups`（v4.7，**production 預設開啟**的機制）
+用來決定「值不值得為了修 V_grouping 多花 HPWL」的安全閘門，是一個
+經驗性的絕對門檻（`hpwl_slack_ratio=5.0`，「HPWL 增加不能超過 5 個
+block 平均邊長」），跟官方 cost 公式（HPWL/area 線性代價、V_relative
+指數代價）完全脫鉤——函式自己的 docstring 也承認這是「經驗性折衷，不是
+從公式精確反推」，理由是「legalize 在真實推論時拿不到 GT，沒辦法精確算
+這步移動對最終分數的淨影響」。
+
+**關鍵設計限制**：真正的 GT（`opt_hpwl`/`opt_area`）在實際比賽的推論
+流程裡本來就拿不到——`my_optimizer.py` 被官方 evaluate 呼叫時看不到
+GT，所以新閘門**不能**依賴 GT 當輸入，否則沒辦法真的部署到 production。
+
+**設計**：官方 docstring 那句話只對了一半——我們真正要問的不是「這步
+移動後 cost 的絕對值」，而是「cost 變好還是變差」，這只需要**符號**，
+不需要絕對值。把移動前的目前總 HPWL（函式本來就會算的 `baseline_hpwl`）
+當一致的代理分母，兩邊除以同一個東西，符號判斷不需要 GT 就穩健：
+
+```
+Δhpwl_frac = (hpwl_after - hpwl_before) / hpwl_before      # GT-free
+Δv_rel     = (v_total_after - v_total_before) / N_soft     # 本來就 GT-free
+接受 ⟺ (1 + α·Δhpwl_frac) · exp(β·Δv_rel) < 1
+```
+
+`N_soft`（= N_boundary + N_grouping + N_mib）只跟約束規格本身有關，不是
+GT 答案。`compact_merge_cluster_groups` 新增 `mib_group`（只為了讓
+`N_soft` 分母精確）、`use_cost_aware_gate`（預設 `False`，跟改動前完全
+等價）、`cost_alpha=0.5`/`cost_beta=2.0`（對齊官方常數）。這個判斷式
+只取代 HPWL 那道閘門，**不取代**「boundary/cluster 違規數不能比移動前
+差」這兩道既有硬性安全底線。`inference.py`／`legalize_lff` 一路傳遞。
+
+**驗證**：
+- 逐位元反向相容：`use_cost_aware_gate=False`（不論有沒有提供 HPWL
+  相關參數）跟改動前完全一致。
+- 40 組合成 fuzz test：100% 不重疊、boundary 違規恆為 0、cluster
+  違規（相對移動前）恆不變差；20/40 案例 `cost_aware` 找到比舊版
+  `hpwl_slack_ratio=5.0` **更多**的改善，0 個更少——證實機制本身
+  正確、至少不比舊版差。
+- 刻意構造案例（5 人 group 被拆成 2 塊，一塊透過另一個真實 B2B net
+  連到別的 block）：`hpwl_slack_ratio=5.0` 只部分修好（V_grouping
+  4→3），`cost_aware` 完全修好（4→0）。
+
+**真實資料驗證**：20 樣本篩選，效果遠比合成測試小得多——16/20 樣本
+完全打平（兩種閘門從頭到尾沒有任何差異），只有 4 個樣本有變化。100
+樣本確認：V_grouping **0 個變好、4 個變差、96 個打平**；avg_real_cost
+1.0836→1.0843，幾乎打平（24 好/20 壞/56 平）。
+
+**為什麼合成測試效果好、真實資料幾乎沒差**：這個函式的候選搬移邏輯本身
+有限——每個 group 每輪只挑「最近的一對 (衛星組員, target 組員)」、只試
+4 種貼齊方向，很多真實案例裡候選搬移根本就找不到（被其他 block 擋住、
+只能單獨搬 a 自己、preplaced 卡死等），HPWL 閘門只在「候選搬移已經
+幾何可行、唯一卡住的是 HPWL」這個相對窄的情境下才有機會發揮作用——這個
+情境在真實資料上顯然不常見，96-100% 的樣本兩種閘門完全沒有差異可言。
+
+**決定**：**不採用**（`use_cost_aware_gate` 維持預設 `False`）。機制
+本身設計正確、驗證安全，但真實資料上很少觸發，不值得為了幾乎打平的
+淨效果承擔任何風險或維護成本，也不需要再花成本跑官方 evaluate 確認。
+這次的落差再次印證：這個 legalize 階段的候選搬移**搜尋範圍**本身
+（而不是安全閘門的鬆緊）才是真正的限制——跟 v5.24/v5.27 探查
+`compact_merge_clusters`／`compact_seqpair_grouped` 時得到的結論
+一致，可能要往「搜尋更多候選搬移方式」而不是「閘門更聰明」的方向
+才能真正突破。機制保留備用（`use_cost_aware_gate`）。
+
+---
+
 ## v5.32 —— post-repel grouping force 強度獨立掃描（不採用，20 樣本訊號在 100 樣本反轉）
 
 **背景**：v5.31 的 post-repel grouping force 沿用主迴圈已調校過的

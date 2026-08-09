@@ -603,6 +603,101 @@ paired 比較都曾顯示正面訊號，但用公平（同一套 v5.11 修正後
 
 ---
 
+## v5.35 —— `legalize_lff`：cluster group 當「已組裝好的整體」放進初始排布主迴圈（不採用，代價超過收益，且過程中修正了兩個浮點數正確性 bug）
+
+**背景**：v5.22-v5.34 一共九個「事後在已經排好的結果上做局部/聯合搜尋或
+修補」的機制，全部要嘛找不到真實改善、要嘛（v5.34）雖然平均更常修好
+V_grouping，卻讓官方 evaluate 的跨跑變異度明顯放大（約是 v4 baseline
+自身變異度的 3 倍）——根因是這些機制都是「一連串各自獨立的貪婪決定，
+環環相扣」的結構，對輸入（diffusion 取樣噪聲）的小差異天生敏感。這次
+換一個完全不同的策略：不在排完之後才回頭修補連通性，而是在最初的排布
+階段，把每個 cluster group（前提：組內沒有 preplaced 成員、也沒有
+boundary 鎖定成員）當成一個**已經組裝好的整體**放進 `_attempt()` 主
+迴圈，V_grouping 對這個 group 理論上是結構上保證為 0，不是搜尋/修補
+出來的。
+
+**實作過程中發現並修正的兩個浮點數正確性 bug**（過程本身值得記錄，避免
+未來類似「保證由構造達成」的設計重蹈覆轍）：
+
+1. **第一版打包邏輯沒有真正的連通性保證**：一開始重用既有的
+   `_pack_cluster_group_internal`（v5.28 遺留、遞迴呼叫 `legalize_lff`
+   本身打包 group 內部佈局）圖方便（現成、已測試過的程式碼）。但這個
+   函式內部一樣只有「往組重心拉」的軟性訊號，跟外層想解決的問題是
+   同一個根源——30-50 組合成案例驗證發現套用在子集合上一樣沒有硬
+   保證，約 95% 的 group 事後 V_grouping 仍然 > 0，直接違背這個機制
+   存在的目的。改寫成 `_pack_cluster_group_shelf`：純幾何構造的
+   NFDH-style shelf packing（高度遞減排序、逐列塞滿、每列一律從
+   x=0 左邊界對齊起排），數學上可證明整個 group 一定是一塊連通多邊形
+   （見函式 docstring 的完整論證）。
+2. **即使打包本身連通，浮點加法不滿足結合律仍能讓「保證」在寫回/
+   搬移時失效**：即使换成純幾何構造的 shelf packer，40 組合成案例
+   驗證仍有 38 組事後 V_grouping > 0！追查發現兩處獨立的浮點誤差
+   來源：(a) `_attempt()` 寫回最終座標時用「錨點 `bx0` + 預先算好的
+   offset」（`xa[mi] = bx0 + offset[mi]`）——`offset[B] == offset[A]
+   + w[A]` 只在 offset 陣列自己的加法鏈裡位元級精確，換成
+   `(bx0+offset[A])+w[A]` 對比 `bx0+offset[B]` 是兩條不同的浮點加法
+   路徑，可能差 1 ULP（實測真的發生，量級 ~1e-14）；(b) 即使 (a)
+   修好，`compact_merge_clusters`（pipeline 中唯一無條件執行、對「彼此
+   貼合的連通分量」做剛體平移的收尾 pass）把整個已經打包好的 group
+   平移同一個位移量時，同樣的非結合律問題會把「位元級共邊」變成極小
+   的非零間隙。這種間隙人眼/實務上完全無感，但官方用 Shapely 精確
+   拓樸相交判定 V_grouping，不接受任何容忍度，1 ULP 的間隙就足以把
+   「一塊連通多邊形」判成「兩塊」。修法：(a) 把寫回邏輯改成**重播**
+   打包時的加法鏈（`_pack_cluster_group_shelf` 額外回傳 `shelves`
+   結構，`_attempt()` 用 `xa[next]=xa[prev]+w[prev]` 直接鏈式計算，
+   不用「錨點+offset」公式）；(b) 把所有原子放置的 group 成員，從
+   `_attempt()`/收縮階段結束後開始，用跟 `preplaced_mask` 完全相同的
+   「這群不可動」機制凍結（`preplaced_mask_ds = preplaced_mask |
+   atomic_frozen_mask`），一路傳給後面所有 16 處會搬動座標的 compact_*
+   呼叫（含唯一無條件的 `compact_merge_clusters` 與最終防禦性驗證用的
+   `hard_zero_overlap`）——這跟設計初衷本來就一致（組內不再逐一微調，
+   一次放好後不該再被任何後續 pass 碰）。兩處都修好後，40 組合成案例
+   （0/40 違規）與 300 組更大規模壓力測試（全部 compact_* pass 開啟、
+   group 大小最多 10 個成員，0/300 違規）都確認 V_grouping=0 的保證
+   真正成立。
+
+**驗證**：
+- 逐位元反向相容：`use_atomic_group_placement=False` 跟改動前完全一致
+  （20 組合成案例，0 mismatch）。
+- 40 + 300 組合成案例：符合條件的 group（無 preplaced、無 boundary
+  鎖定成員）**保證 V_grouping=0**，0 個反例。
+- preplaced/boundary 鎖定成員的正確 fallback（20 組，0 違反）、
+  fixed_mask 成員形狀不被打包邏輯改動（20 組，0 違反）、fuzz test
+  （50 組隨機案例：不重疊、面積守恆，0 個失敗）全部通過。
+
+**真實資料驗證**（在目前 production 設定之上疊加）：
+- 20 樣本：V_grouping(raw) 完全打平（3.800 vs 3.800，3 個變好/6 個
+  變差/11 個打平），area_gap 明顯變差（+20.73%→+22.82%）、hpwl_gap
+  同步變差（+17.26%→+19.21%），avg_real_cost 1.0550→1.0734（6 好/
+  12 壞/2 平，淨負）。
+- 100 樣本：V_grouping(raw) 小幅改善（3.500→3.310，24 好/17 壞/59
+  平，淨正但幅度小），但 area_gap（+22.53%→+24.48%）、hpwl_gap
+  （+16.83%→+18.97%）兩項代價都更大，avg_real_cost 1.0729→1.0763
+  （40 好/45 壞/15 平，淨負，約 +0.32%）。
+
+**決定**：**不採用**（`use_atomic_group_placement`/
+`USE_ATOMIC_GROUP_PLACEMENT` 維持預設 `False`）。100 樣本結果已經是
+一致、非雜訊等級的淨負向訊號（area_gap／hpwl_gap 雙雙變差、real cost
+勝負比 40:45 淨負），未達「有希望」的門檻，依既有協定不再往下跑官方
+evaluate。根因跟這份文件開頭 v5.28（`sa_construct_layout`）的教訓
+呼應：group 打包成一個剛體單元、放進主排布迴圈當一整塊處理，雖然真的
+能結構性保證 V_grouping=0（這次連同底層兩個浮點數 bug 都一併修正、
+確認保證真的成立），但代價是徹底放棄組內每個成員各自對齊 wirelength/
+boundary 目標的微調空間，shelf packing 也不是面積最優的排法——這個
+代價在真實資料上超過 V_grouping 改善帶來的收益，即使保證本身做對了，
+機制整體仍然不划算。機制保留備用（`use_atomic_group_placement`、
+`_pack_cluster_group_shelf`），`_pack_cluster_group_internal` 維持
+原本給 `sa_construct_layout` 用的既有用途不變。**方法論教訓**：「保證
+由構造達成」聽起來比「事後搜尋修補」更根本、更該免疫於 v5.34 那種
+跨跑變異度問題，但構造過程本身（尤其是牽涉浮點數運算、以及跟 pipeline
+其他既有 pass 的交互）一樣需要用合成案例窮舉驗證，不能因為設計理念
+「聽起來對」就跳過這一步——這次兩個浮點數 bug 都是先在真實資料 20
+樣本篩選階段前，靠 30-300 組合成案例才抓到的，若沒有先做這一步、直接
+拿去跑真實資料，會誤以為「V_grouping 保證」本身有問題，錯過真正的
+根因（打包演算法沒有硬保證、浮點加法不滿足結合律）。
+
+---
+
 ## v5.34 —— `compact_merge_cluster_groups` 擴大候選搬移搜尋範圍（不採用，官方 evaluate 變異度過大）
 
 **背景**：v5.33 證實 HPWL 閘門鬆緊不是真實資料上的瓶頸——真正限制是

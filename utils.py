@@ -3266,7 +3266,8 @@ def _l1_cost(pos, targets, weights):
     return sum(w_ * abs(pos - t_) for t_, w_ in zip(targets, weights))
 
 
-def _pack_cluster_group_internal(x, y, w, h, areas, preplaced_mask, fixed_mask, boundary_code):
+def _pack_cluster_group_internal(x, y, w, h, areas, preplaced_mask, fixed_mask, boundary_code,
+                                  allow_reshape=True):
     """
     v5.28 輔助函式：`sa_construct_layout` 把每個 cluster group 當剛體超
     節點之前，先用這個函式把 group 自己的成員排成一份緊湊、不重疊的內部
@@ -3295,7 +3296,7 @@ def _pack_cluster_group_internal(x, y, w, h, areas, preplaced_mask, fixed_mask, 
         return x.copy(), y.copy(), w.copy(), h.copy()
     return legalize_lff(x, y, w, h, areas,
                          preplaced_mask=preplaced_mask, fixed_mask=fixed_mask,
-                         boundary_code=boundary_code,
+                         boundary_code=boundary_code, allow_reshape=allow_reshape,
                          use_reinsert=True, reinsert_sweeps=2, reinsert_grid_density=8,
                          use_cluster_merge=False, use_second_merge_pass=True,
                          use_gravity=False, verbose=False)
@@ -3741,6 +3742,93 @@ def sa_construct_layout(x, y, w, h, areas, preplaced_mask=None, fixed_mask=None,
     return cand_x, cand_y, cand_w, cand_h
 
 
+def _pack_cluster_group_shelf(w, h):
+    """
+    v5.35 輔助函式：NFDH-style shelf packing，決定性、只跟這個 group 自己
+    的 block 尺寸有關，不受外部佈局或呼叫順序影響。
+
+    設計動機：一開始重用了既有的 `_pack_cluster_group_internal`（遞迴呼叫
+    `legalize_lff` 本身）來打包 group，理由是「現成、已測試過的邏輯」——
+    但實測（30-50 組合成案例）發現這個做法**不能真正保證** group 打包
+    出來是一塊連通的多邊形：`legalize_lff` 內部只有「往組重心拉」這種
+    軟性訊號，跟外層想解決的問題是同一個根源，套用在子集合上一樣沒有
+    硬保證（合成案例中約 95% 的 group 在整個 pipeline 跑完後 V_grouping
+    still > 0，直接違反這個機制存在的目的）。改用這個函式：純幾何構造，
+    不搜尋、不用任何軟性力，因此有真正的數學保證。
+
+    保證連通的論證：block 依高度（h）遞減排序後逐一塞進目前這一列
+    （shelf），一列塞滿（超過目標寬度）就另起一列疊上去，**每一列一律從
+    x=0 起排**（左邊界對齊，不是每列自己置中或靠右）。因為排序是全域高度
+    遞減，每一列的第一個 block 一定是這一列裡最高的（後面塞進同一列的都
+    是排序中更晚出現、高度更矮或相等的），所以「這一列的高度」＝「這一列
+    第一個 block 的高度」，下一列緊接著疊上去、y 起點正好等於上一列頂端，
+    不多不少——上一列的第一個 block（x=[0,w0]）跟下一列的第一個 block
+    （x=[0,w0']）因此在 y=分界線上共邊（x 範圍 [0, min(w0,w0')] > 0）。
+    這樣每一列都靠左邊界這條「脊柱」跟上下列相連，同一列內的 block 本來
+    就左右緊鄰共邊——整個 group 因此保證是一塊連通的多邊形，不是機率湊出
+    來的。
+
+    不重新決定個別成員的長寬比（用給定的 w,h 原樣打包），刻意把第一版
+    範圍限制在容易驗證正確性的最小改動，見 legalize_lff 呼叫處的
+    use_atomic_group_placement 說明。
+
+    浮點數警語（重要，見呼叫處的 shelves 用法說明）：這裡回傳的
+    `offsets_x`/`offsets_y` 只適合當「近似值」用（例如把個別成員的
+    anchor/b2b/p2b 目標換算成 group 錨點座標時的軟性訊號）——絕對不能
+    在事後用 `anchor + offsets_x[i]` 這種「獨立算出每個成員的絕對座標」
+    的方式來還原「保證共邊」的佈局！因為 `offsets_x[B] == offsets_x[A]
+    + w[A]` 只在 offsets 陣列自己的加法鏈裡是位元級精確，一旦換成
+    `(anchor+offsets_x[A])+w[A]` 對比 `anchor+offsets_x[B]`，這是兩條
+    不同的浮點加法路徑，IEEE754 加法不滿足結合律，可能差 1 ULP（實測
+    真的會發生，量級 ~1e-14）——這種等級的間隙人眼/實務上完全無感，但
+    官方用 Shapely 精確拓樸相交判定 V_grouping，不接受任何容忍度，1
+    ULP 的間隙就足以把「一塊連通多邊形」判成「兩塊」，讓這個函式存在的
+    保證落空。真正需要「保證共邊」的地方（`legalize_lff` 的原子放置
+    分支寫回最終座標時），必須用這裡額外回傳的 `shelves`（每列由哪些
+    成員、依左到右順序組成的巢狀 list）**重播**跟這裡完全相同的加法鏈
+    （`cur_x = 錨點; for member in shelf: x[member]=cur_x; cur_x =
+    x[member]+w[member]`），讓每個成員的座標都是「直接由前一個成員的
+    座標＋寬度算出」，不是「錨點＋預先算好的 offset」，才能不管錨點
+    是什麼值都維持位元級共邊。
+
+    回傳 (group_w, group_h, offsets_x, offsets_y, shelves)：group 自己
+    的 bounding box 尺寸、每個成員（跟輸入 w,h 同順序對齊）相對 group
+    錨點的近似偏移量（僅供軟性目標換算用，見上方警語），以及 shelves
+    （list of list，外層依由下到上的列順序，內層是該列由左到右的成員
+    local index 順序，寫回最終座標時要用這個結構重播加法鏈）。
+    """
+    w = np.asarray(w, dtype=np.float64)
+    h = np.asarray(h, dtype=np.float64)
+    n = len(w)
+    order = np.argsort(-h, kind="stable")
+    target_w = max(float(np.sqrt(np.sum(w * h))), float(np.max(w)))
+    offsets_x = np.zeros(n, dtype=np.float64)
+    offsets_y = np.zeros(n, dtype=np.float64)
+    shelves = []
+    cur_shelf = []
+    cur_x = 0.0
+    cur_y = 0.0
+    shelf_h = 0.0
+    for idx in order:
+        wi, hi = float(w[idx]), float(h[idx])
+        if cur_x > 0.0 and cur_x + wi > target_w + 1e-9:
+            cur_y += shelf_h
+            cur_x = 0.0
+            shelf_h = 0.0
+            shelves.append(cur_shelf)
+            cur_shelf = []
+        offsets_x[idx] = cur_x
+        offsets_y[idx] = cur_y
+        cur_shelf.append(int(idx))
+        cur_x += wi
+        shelf_h = max(shelf_h, hi)
+    if cur_shelf:
+        shelves.append(cur_shelf)
+    group_w = float(np.max(offsets_x + w))
+    group_h = float(cur_y + shelf_h)
+    return group_w, group_h, offsets_x, offsets_y, shelves
+
+
 def legalize_lff(
     x_init, y_init, w_init, h_init,
     areas,
@@ -3854,6 +3942,9 @@ def legalize_lff(
     sa_iters=3000,
     sa_n_starts=3,
     sa_seed=0,
+    # v5.35（實驗用，預設關閉）：見下方 use_atomic_group_placement 的
+    # docstring 說明（在 `_attempt()` 內的說明區塊）。
+    use_atomic_group_placement=False,
     verbose=False,
 ):
     """
@@ -3868,6 +3959,48 @@ def legalize_lff(
       - fixed block 形狀完全等於輸入
       - 其餘 block 面積跟輸入完全相等（reshape 只改長寬比）
       - 盡量都落在 outline_bbox 內（見下方 outline 不足時的處理）
+
+    use_atomic_group_placement（v5.35，實驗用，預設 False = 關閉，跟
+    改動前完全等價）：v5.22-v5.34 一共九個「事後在已經排好的結果上做
+    局部/聯合搜尋或修補」的機制，全部要嘛找不到真實改善、要嘛（v5.34）
+    雖然平均更常修好 V_grouping，卻讓官方 evaluate 的跨跑變異度明顯
+    放大（v5.34 三次官方 evaluate 標準差約是 v4 baseline 自身變異度的
+    3 倍）——追查發現這些機制都是「一連串各自獨立的貪婪決定，環環相扣」
+    的結構，套用了某個合併會改變 touching graph、連帶影響同一輪/後續
+    輪次其他 group 的處理，也會改變後面 compact_* 收尾 pass 的起點，
+    這種結構天生會把輸入的小差異（每次 diffusion 取樣不同的隨機噪聲）
+    放大成輸出的大差異。
+
+    這次換一個策略：不在排完之後才回頭修補連通性，而是在最初的排布
+    階段，把每個 cluster group 當成一個**已經組裝好的整體**去放——
+    V_grouping 對這個 group 因此是結構上保證為 0，不是搜尋/修補出來的，
+    沒有「這次找到候選、下次沒找到」這種對輸入敏感的失敗模式。
+
+    範圍（刻意縮小、降低風險）：只對「組內沒有 preplaced 成員、也沒有
+    boundary 鎖定成員」的 cluster group 生效——preplaced 成員位置不可
+    談判，boundary 鎖定牽涉「最終貼齊真正的 layout 邊界」這個只有排完
+    全部 block 才知道答案的性質，兩者都跟「把整組當一個剛體、一次放進
+    MAXRECTS」的簡單模型衝突，先排除，退回既有的逐一放置行為（V_grouping
+    靠既有的軟性訊號+事後補救機制處理，這次改動前的行為完全不變）。
+
+    做法：先用 `_pack_cluster_group_shelf`（純幾何構造的 NFDH shelf
+    packing，見其 docstring 的連通性數學論證——**不是**重用既有的
+    `_pack_cluster_group_internal`：後者遞迴呼叫 `legalize_lff` 本身，
+    只有「往組重心拉」的軟性訊號，實測套用在 group 子集合上一樣沒有
+    連通性硬保證，合成資料驗證中約 95% 的 group 事後 V_grouping 仍然
+    > 0，直接違背這個機制存在的目的，因此改用純幾何構造）把符合條件的
+    每個 group 打包成一個固定的剛體單元（形狀 + 組內每個成員的相對
+    偏移量）；主排布迴圈遇到這個 group 的第一個成員時，
+    把整個打包好的單元當成「一個大 block」放進既有的 MAXRECTS + 加權
+    中位數邏輯（組內每個成員自己的 anchor/b2b/p2b 軟性目標，透過偏移量
+    換算成 group 錨點的等價目標，合併成一個加權中位數問題，直接重用
+    `_weighted_median_1d`/`_l1_cost`），一次性 `pool.occupy()` 整個
+    group 的 bbox、所有成員的座標一次寫入；後續遇到同一個 group 的其他
+    成員時直接跳過（已經放過）。
+
+    代價：組內不再逐一微調每個成員的位置去貼合各自的 wirelength/boundary
+    目標（那些訊號被合併成群體層級的單一決策），可能犧牲一些 wirelength
+    或緊湊度，用真實資料驗證量化這個取捨值不值得。
     """
     k = len(x_init)
     x = np.array(x_init, dtype=np.float64).copy()
@@ -3957,11 +4090,37 @@ def legalize_lff(
             if 0 <= p_idx < len(pins_arr) and 0 <= b_idx < k:
                 p2b_adj[b_idx].append((pins_arr[p_idx, 0], pins_arr[p_idx, 1], w_e))
 
+    # v5.35: 把「無 preplaced、無 boundary 鎖定成員」的 cluster group
+    # 事先各自打包成一個緊湊的剛體單元（跟 outline/oxmin 等無關，所有
+    # retry attempt 共用同一份打包結果，只算一次）。見 _attempt() 內
+    # 主迴圈插入點旁的說明。用 `_pack_cluster_group_shelf`（純幾何構造，
+    # 見其 docstring 的連通性證明）而不是重用 `_pack_cluster_group_
+    # internal`——後者遞迴呼叫 legalize_lff 本身，只有「往組重心拉」的
+    # 軟性訊號，實測無法真正保證打包出來的 group 是連通的（合成資料
+    # ~95% 的 group 事後 V_grouping 仍然 > 0），違背這個機制存在的目的。
+    group_pack = {}
+    if use_atomic_group_placement:
+        for gid in sorted(int(g) for g in np.unique(cluster_group) if g > 0):
+            members = np.nonzero(cluster_group == gid)[0]
+            if len(members) < 2:
+                continue
+            if preplaced_mask[members].any() or (boundary_code[members] != 0).any():
+                continue   # 這兩種情況退回既有的逐一放置行為，見函式 docstring
+            gw_in, gh_in = w[members], h[members]
+            gw_use, gh_use, offx, offy, shelves = _pack_cluster_group_shelf(gw_in, gh_in)
+            group_pack[gid] = dict(
+                members=members,
+                offsets_x=offx, offsets_y=offy,   # 近似值，僅供軟性目標換算用
+                shelves=shelves,   # 寫回最終座標時要重播的加法鏈結構，見 docstring
+                member_w=gw_in.copy(), member_h=gh_in.copy(),
+                group_w=gw_use, group_h=gh_use)
+
     def _attempt(oxmin, oymin, oxmax, oymax):
         """單趟嘗試在給定 outline 內排完所有 block；回傳 (x,y,w,h,n_fallback,n_reshape)。"""
         xa = x.copy(); ya = y.copy(); wa = w.copy(); ha = h.copy()
         pool = _FreeRectPool(oxmin, oymin, oxmax, oymax)
         placed_mask = np.zeros(k, dtype=bool)
+        group_placed = set()
         for i in range(k):
             if preplaced_mask[i]:
                 pool.occupy(xa[i], ya[i], wa[i], ha[i])
@@ -3988,6 +4147,124 @@ def legalize_lff(
         cur_oymax = oymax   # 極端 fallback 分支可能往上疊放，需要動態擴張
 
         for i in pending:
+            # v5.35: 把整個 cluster group 當一個已經組裝好（見上方
+            # group_pack 的打包）的剛體單元一次放進去，取代逐一放置——
+            # V_grouping 對這個 group 因此是結構上保證為 0，不是搜尋/
+            # 修補出來的。只對 group_pack 裡有的 group（無 preplaced、
+            # 無 boundary 鎖定成員）生效，其餘 group／個別 block 完全
+            #落到下面既有的逐一放置邏輯，行為不變。
+            gid = int(cluster_group[i])
+            if gid in group_pack:
+                if gid in group_placed:
+                    continue   # 這個 group 已經整組放過了
+                pack = group_pack[gid]
+                members = pack["members"]
+                gw_use, gh_use = pack["group_w"], pack["group_h"]
+
+                # 把組內每個成員自己的（anchor／b2b／p2b）軟性目標，透過
+                # 該成員在打包結果裡的偏移量，換算成「group 錨點（bbox
+                # 中心）」的等價目標，合併成一個加權中位數問題，直接重用
+                # 既有的 _weighted_median_1d／_l1_cost，不需要新的求解
+                # 邏輯。clu_target（組重心拉力）／cluster_adjacency_bonus
+                # （精確貼合折扣）對這個分支不適用——組內已經靠打包保證
+                # 貼合，直接略過。
+                targets_x = []; weights_x = []
+                targets_y = []; weights_y = []
+                for mi_local in range(len(members)):
+                    mi = int(members[mi_local])
+                    ox_m = float(pack["offsets_x"][mi_local])
+                    oy_m = float(pack["offsets_y"][mi_local])
+                    mw_m = float(pack["member_w"][mi_local])
+                    mh_m = float(pack["member_h"][mi_local])
+
+                    anchor_cx_m = float(x[mi] + w[mi] / 2.0)
+                    anchor_cy_m = float(y[mi] + h[mi] / 2.0)
+                    targets_x.append(anchor_cx_m + gw_use / 2.0 - ox_m - mw_m / 2.0)
+                    weights_x.append(weight_dist)
+                    targets_y.append(anchor_cy_m + gh_use / 2.0 - oy_m - mh_m / 2.0)
+                    weights_y.append(weight_dist)
+
+                    for (j, w_e) in b2b_adj[mi]:
+                        if not placed_mask[j]:
+                            continue
+                        tx = float(xa[j] + wa[j] / 2.0)
+                        ty = float(ya[j] + ha[j] / 2.0)
+                        targets_x.append(tx + gw_use / 2.0 - ox_m - mw_m / 2.0)
+                        weights_x.append(weight_b2b * w_e)
+                        targets_y.append(ty + gh_use / 2.0 - oy_m - mh_m / 2.0)
+                        weights_y.append(weight_b2b * w_e)
+                    for (px, py, w_e) in p2b_adj[mi]:
+                        targets_x.append(float(px) + gw_use / 2.0 - ox_m - mw_m / 2.0)
+                        weights_x.append(weight_p2b * w_e)
+                        targets_y.append(float(py) + gh_use / 2.0 - oy_m - mh_m / 2.0)
+                        weights_y.append(weight_p2b * w_e)
+
+                cands = pool.candidates(gw_use, gh_use)
+                best_group = None
+                for rect in cands:
+                    rx0, ry0, rx1, ry1 = rect
+                    cx_lo, cx_hi = rx0 + gw_use / 2.0, rx1 - gw_use / 2.0
+                    cy_lo, cy_hi = ry0 + gh_use / 2.0, ry1 - gh_use / 2.0
+                    if cx_hi < cx_lo or cy_hi < cy_lo:
+                        continue
+                    bx = _weighted_median_1d(targets_x, weights_x, cx_lo, cx_hi)
+                    by = _weighted_median_1d(targets_y, weights_y, cy_lo, cy_hi)
+                    cost = _l1_cost(bx, targets_x, weights_x) + _l1_cost(by, targets_y, weights_y)
+                    if best_group is None or cost < best_group[0] - 1e-9:
+                        best_group = (cost, bx - gw_use / 2.0, by - gh_use / 2.0)
+
+                if best_group is None:
+                    # fallback：比照單一 block 的 fallback，找最大自由矩形
+                    # 硬塞（group 形狀已經固定，不像單一 block 有「壓扁塞
+                    # 進去」的彈性），讓外層既有的「outline 太小就放大
+                    # 重試」機制接手。
+                    n_fallback += 1
+                    if pool.rects:
+                        rect = max(pool.rects, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]))
+                        bx0, by0 = rect[0], rect[1]
+                    else:
+                        bx0 = oxmin
+                        by0 = float((ya[placed_mask] + ha[placed_mask]).max()) if placed_mask.any() else oymin
+                        cur_oymax = max(cur_oymax, by0 + gh_use)
+                else:
+                    _, bx0, by0 = best_group
+
+                # 寫回最終座標：重播打包時的加法鏈（見 _pack_cluster_group_
+                # shelf docstring 的浮點數警語）——每個成員的座標直接由
+                # 「前一個成員的座標 + 寬度/列高」算出，不是「錨點(bx0,by0)
+                # + 預先算好的 offset」，這樣無論 bx0,by0 是什麼值，共邊
+                # 都是位元級精確，不會被浮點加法不滿足結合律這件事破壞。
+                cur_gy = by0
+                shelf_h_actual = 0.0
+                for shelf in pack["shelves"]:
+                    cur_gx = bx0
+                    shelf_h_actual = 0.0
+                    for mi_local in shelf:
+                        mi = int(members[mi_local])
+                        mw_m = float(pack["member_w"][mi_local])
+                        mh_m = float(pack["member_h"][mi_local])
+                        if abs(mw_m - w[mi]) > 1e-6 or abs(mh_m - h[mi]) > 1e-6:
+                            n_reshape += 1
+                        xa[mi] = cur_gx
+                        ya[mi] = cur_gy
+                        wa[mi] = mw_m
+                        ha[mi] = mh_m
+                        placed_mask[mi] = True
+                        cur_gx = xa[mi] + wa[mi]
+                        if ha[mi] > shelf_h_actual:
+                            shelf_h_actual = ha[mi]
+                    cur_gy = cur_gy + shelf_h_actual
+
+                pool.occupy(bx0, by0, gw_use, gh_use)
+                for mi in members:
+                    _update_cluster(int(mi))
+                group_placed.add(gid)
+                if verbose:
+                    print("legalize_lff: use_atomic_group_placement group={} "
+                          "placed as unit ({} members, {:.1f}x{:.1f})".format(
+                              gid, len(members), gw_use, gh_use))
+                continue
+
             orig_w, orig_h = wa[i], ha[i]
             orig_log_r = float(np.log(orig_w / max(orig_h, 1e-9)))
             anchor_cx = xa[i] + orig_w / 2.0
@@ -4257,6 +4534,33 @@ def legalize_lff(
 
         x, y, w, h = x_res, y_res, w_res, h_res
 
+    # v5.35: 從這裡開始，之後所有 compact_* 收尾 pass 都只在 (x,y) 上做
+    # 浮點數幾何變換（平移／二分搜尋找安全距離等）——即使是「整個連通元件
+    # 一起平移同一個量」這種看似不會破壞內部相對關係的操作，實測仍然可能
+    # 因為浮點加法不滿足結合律（`(a+delta)+w` 不保證等於 `(a+w)+delta`），
+    # 把 `_pack_cluster_group_shelf` 精確建構出的「零間隙、位元級相等」邊界
+    # 變成極小的非零間隙（量級 ~1e-14，任何視覺/實務意義上都無感，但官方
+    # 判定用 Shapely 的精確拓樸相交，不接受任何容忍度，這種極小間隙就足以
+    # 讓 unary_union 判成 MultiPolygon，讓這個機制存在的目的落空）。合成
+    # 資料驗證中實際復現：`compact_merge_clusters` 對某個 group 做一次剛體
+    # 平移，V_grouping 就從 0 變成 > 0，即使該平移對整個 group 套用完全
+    # 相同的位移量。既然 v5.35 的設計本來就是「組內不再逐一微調」（見上方
+    # docstring 的取捨說明），把已經放好的 atomic group 成員直接凍結、
+    # 不讓後面任何 compact_* pass 再碰它們，跟設計初衷一致，也是唯一能
+    # 真正杜絕這個浮點誤差來源的辦法——用跟 preplaced_mask 完全相同的
+    # 「這群不可動」機制（下面所有 compact_* 呼叫都改傳這個擴充過的遮罩），
+    # 而不是事後想辦法讓浮點運算剛好湊巧不出錯。
+    # 只有 construction_mode="lff" 時 `_attempt()` 才真的跑了上面的原子
+    # 放置分支——"sa" 模式（v5.28，實驗用，見該參數說明的已知限制）用
+    # 完全不同的機制（sa_construct_layout）建構初始佈局，不知道 group_pack
+    # 這件事，這裡不該把它的成員也凍結（會讓 sa 模式的 group 沒有任何
+    # 收尾 pass 可以碰，反而變成不必要的限制）。
+    atomic_frozen_mask = np.zeros(k, dtype=bool)
+    if construction_mode == "lff":
+        for _pack in group_pack.values():
+            atomic_frozen_mask[_pack["members"]] = True
+    preplaced_mask_ds = preplaced_mask | atomic_frozen_mask
+
     # ---- 合併「彼此貼合但互不相連」的分離群聚 ----
     # LFF 用加權中位數決定每個 block 的位置，boundary 約束的 block 會被拉去
     # 貼指定邊，但「拉去貼邊」這件事跟「跟主要群聚保持接觸」是兩回事——如果
@@ -4266,7 +4570,7 @@ def legalize_lff(
     # 抓出「彼此貼合」的連通分量，把非主要群的衛星群整體平移過去貼緊主要群
     # （每一軸都優先移動沒有 boundary 鎖定的那一方，兩邊都鎖定就跳過該軸），
     # 保證只會讓 bbox 縮小或持平，直接解決這種巨集尺度的留白。
-    x, y = compact_merge_clusters(x, y, w, h, preplaced_mask=preplaced_mask,
+    x, y = compact_merge_clusters(x, y, w, h, preplaced_mask=preplaced_mask_ds,
                                   boundary_code=boundary_code, verbose=verbose)
 
     # ---- 每個 block 各自往（面積加權）全域重心靠攏 ----
@@ -4279,7 +4583,7 @@ def legalize_lff(
     # 便宜（不用枚举網格）但不保證找到「最佳」位置；compact_reinsert 之後
     # 會再對每個 block 做更精細的局部搜尋。
     if use_gravity:
-        x, y = compact_gravity(x, y, w, h, preplaced_mask=preplaced_mask,
+        x, y = compact_gravity(x, y, w, h, preplaced_mask=preplaced_mask_ds,
                                boundary_code=boundary_code, iters=gravity_iters)
 
     # ---- Remove-and-reinsert 局部搜尋：填內部縫隙、進一步壓縮 bbox ----
@@ -4291,7 +4595,7 @@ def legalize_lff(
     # 目前佔用範圍內成本最低的位置（bbox 面積 + 緊密度），能找到
     # compact_positions 那種單純滑動搆不到的位置，直接把內部縫隙填掉。
     if use_reinsert:
-        x, y = compact_reinsert(x, y, w, h, preplaced_mask=preplaced_mask,
+        x, y = compact_reinsert(x, y, w, h, preplaced_mask=preplaced_mask_ds,
                                 boundary_code=boundary_code, sweeps=reinsert_sweeps,
                                 grid_density=reinsert_grid_density)
 
@@ -4302,7 +4606,7 @@ def legalize_lff(
     # 之後、compact_positions 之前：先讓 swap 找拓樸層級的改善，再讓
     # compact_positions 把新拓樸下的縫隙壓緊。
     if use_swap:
-        x, y = compact_swap(x, y, w, h, preplaced_mask=preplaced_mask,
+        x, y = compact_swap(x, y, w, h, preplaced_mask=preplaced_mask_ds,
                             boundary_code=boundary_code, cluster_group=cluster_group,
                             sweeps=swap_sweeps)
 
@@ -4312,7 +4616,7 @@ def legalize_lff(
     # 跟 use_swap 是兩個獨立的 opt-in 開關（可以同時開，anneal 接在
     # swap 之後從它的結果繼續搜）。
     if use_anneal:
-        x, y = compact_anneal(x, y, w, h, preplaced_mask=preplaced_mask,
+        x, y = compact_anneal(x, y, w, h, preplaced_mask=preplaced_mask_ds,
                               boundary_code=boundary_code, cluster_group=cluster_group,
                               iters=anneal_iters, seed=anneal_seed)
 
@@ -4323,7 +4627,7 @@ def legalize_lff(
     # 見 compact_seqpair docstring。獨立於 use_swap/use_anneal 的開關，
     # 接在它們之後從目前的結果繼續搜。
     if use_seqpair:
-        x, y = compact_seqpair(x, y, w, h, preplaced_mask=preplaced_mask,
+        x, y = compact_seqpair(x, y, w, h, preplaced_mask=preplaced_mask_ds,
                                boundary_code=boundary_code, cluster_group=cluster_group,
                                iters=seqpair_iters, seed=seqpair_seed,
                                relax_boundary=seqpair_relax_boundary)
@@ -4337,7 +4641,7 @@ def legalize_lff(
     # 尾端（use_seqpair_grouped_end）也放了一份，比照 v5.26 的教訓兩個位置都
     # 測過再下結論。
     if use_seqpair_grouped:
-        x, y = compact_seqpair_grouped(x, y, w, h, preplaced_mask=preplaced_mask,
+        x, y = compact_seqpair_grouped(x, y, w, h, preplaced_mask=preplaced_mask_ds,
                                        boundary_code=boundary_code, cluster_group=cluster_group,
                                        iters=seqpair_grouped_iters, seed=seqpair_grouped_seed,
                                        relax_boundary=seqpair_grouped_relax_boundary)
@@ -4350,7 +4654,7 @@ def legalize_lff(
     # compact_positions 是純幾何的沿 x/y 軸滑到貼齊，保證不會把不重疊變成
     # 重疊、不會讓 bbox 變大，成本也很低（不需要重新跑排布），適合當這裡的
     # 收尾動作。
-    x, y = compact_positions(x, y, w, h, preplaced_mask=preplaced_mask,
+    x, y = compact_positions(x, y, w, h, preplaced_mask=preplaced_mask_ds,
                              boundary_code=boundary_code)
 
     # ---- compact_reinsert / compact_positions 之後再跑一次
@@ -4360,7 +4664,7 @@ def legalize_lff(
     # 看不到這些新機會。在 pipeline 尾端再補一次，成本低（多數情況下第一輪
     # 就會因為沒有東西可移動而立刻收斂）。
     if use_second_merge_pass:
-        x, y = compact_merge_clusters(x, y, w, h, preplaced_mask=preplaced_mask,
+        x, y = compact_merge_clusters(x, y, w, h, preplaced_mask=preplaced_mask_ds,
                                       boundary_code=boundary_code, verbose=verbose)
 
     # ---- 把還沒真正貼到邊的 boundary block 推向真實邊界（v4.8，實驗用）----
@@ -4374,7 +4678,7 @@ def legalize_lff(
     # hpwl_slack_ratio 分開，方便個別調參）。放在跟 compact_merge_cluster_groups
     # 一樣的 pipeline 尾端位置，理由相同：避免被後續步驟撤銷。
     if use_snap_boundary:
-        x, y = compact_snap_boundary(x, y, w, h, preplaced_mask=preplaced_mask,
+        x, y = compact_snap_boundary(x, y, w, h, preplaced_mask=preplaced_mask_ds,
                                      boundary_code=boundary_code,
                                      cluster_group=cluster_group,
                                      W_int=W_int, p2b_edges=p2b_edges,
@@ -4398,7 +4702,7 @@ def legalize_lff(
     # grouping 這個 boolean 鄰接需求），導致總 V_grouping 不降反升；放在
     # 最尾端、所有其他幾何調整都完成之後才做，就不會再被後續步驟撤銷。
     if use_cluster_merge:
-        x, y = compact_merge_cluster_groups(x, y, w, h, preplaced_mask=preplaced_mask,
+        x, y = compact_merge_cluster_groups(x, y, w, h, preplaced_mask=preplaced_mask_ds,
                                             boundary_code=boundary_code,
                                             cluster_group=cluster_group,
                                             W_int=W_int, p2b_edges=p2b_edges,
@@ -4427,7 +4731,7 @@ def legalize_lff(
     # pass，只要後面還有其他貪婪 pass 會重新處理同一批 block，就不能保證
     # 對「最終」結果也是單調不變差，必須放在真正的尾端才安全。
     if use_pair_reinsert:
-        x, y = compact_pair_reinsert(x, y, w, h, preplaced_mask=preplaced_mask,
+        x, y = compact_pair_reinsert(x, y, w, h, preplaced_mask=preplaced_mask_ds,
                                      boundary_code=boundary_code, cluster_group=cluster_group,
                                      sweeps=pair_reinsert_sweeps, grid_density=pair_reinsert_grid_density,
                                      W_int=W_int, p2b_edges=p2b_edges, pins_pos=pins_pos,
@@ -4445,7 +4749,7 @@ def legalize_lff(
     # 原因），其餘 block 仍可搬位置、形狀不變。刻意放在 pipeline 最尾端，
     # 理由跟 compact_pair_reinsert 相同：避免被後續其他貪婪 pass 撤銷。
     if use_reinsert_reshape:
-        x, y, w, h = compact_reinsert_reshape(x, y, w, h, preplaced_mask=preplaced_mask,
+        x, y, w, h = compact_reinsert_reshape(x, y, w, h, preplaced_mask=preplaced_mask_ds,
                                               fixed_mask=fixed_mask, mib_group=mib_group,
                                               boundary_code=boundary_code,
                                               sweeps=reinsert_reshape_sweeps,
@@ -4465,7 +4769,7 @@ def legalize_lff(
     # `gradient_finetune_hpwl_slack_ratio` 之內時才採用，否則整個操作
     # 視同沒發生（見 compact_gradient_finetune docstring）。
     if use_gradient_finetune:
-        x, y = compact_gradient_finetune(x, y, w, h, preplaced_mask=preplaced_mask,
+        x, y = compact_gradient_finetune(x, y, w, h, preplaced_mask=preplaced_mask_ds,
                                          boundary_code=boundary_code,
                                          cluster_group=cluster_group, W_int=W_int,
                                          outline_bbox=(oxmin, oymin, oxmax, oymax),
@@ -4492,7 +4796,7 @@ def legalize_lff(
     # pass 走到更差的最終解。放在尾端可以避免這個問題（後面只剩防禦性的
     # hard_zero_overlap，不會再被任何貪婪 pass 撤銷或改道）。
     if use_boundary_shelf:
-        x, y = compact_boundary_shelf(x, y, w, h, preplaced_mask=preplaced_mask,
+        x, y = compact_boundary_shelf(x, y, w, h, preplaced_mask=preplaced_mask_ds,
                                       boundary_code=boundary_code,
                                       cluster_group=cluster_group,
                                       rounds=boundary_shelf_rounds, verbose=verbose)
@@ -4505,13 +4809,13 @@ def legalize_lff(
     # 任何 pass 撤銷或改道）。兩個位置各自獨立測試比較，見呼叫處的真實資料
     # 驗證結果。
     if use_seqpair_grouped_end:
-        x, y = compact_seqpair_grouped(x, y, w, h, preplaced_mask=preplaced_mask,
+        x, y = compact_seqpair_grouped(x, y, w, h, preplaced_mask=preplaced_mask_ds,
                                        boundary_code=boundary_code, cluster_group=cluster_group,
                                        iters=seqpair_grouped_iters, seed=seqpair_grouped_seed,
                                        relax_boundary=seqpair_grouped_relax_boundary)
 
     # ---- 保底驗證：理論上此時已經零重疊，這裡只是零成本的防禦性再確認 ----
-    preplaced_idx_list = [i for i in range(k) if preplaced_mask[i]]
+    preplaced_idx_list = [i for i in range(k) if preplaced_mask_ds[i]]
     x, y = hard_zero_overlap(x, y, w, h, preplaced_indices=preplaced_idx_list)
 
     return x.astype(np.float64), y.astype(np.float64), w.astype(np.float64), h.astype(np.float64)

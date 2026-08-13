@@ -24,7 +24,9 @@ Stage 2 (legalize, utils.py:legalize_lff via inference.py:legalize_result):
   reintroduce a hard-constraint violation.
 """
 
+import os
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import List, Tuple
 
@@ -49,7 +51,7 @@ from iccad2026_evaluate import FloorplanOptimizer
 sys.modules.pop("utils", None)
 sys.path.insert(0, str(_THIS_DIR))
 
-from inference import load_model, generate_floorplan, legalize_result
+from inference import load_model, generate_floorplan, legalize_top_k_candidates
 
 
 class MyOptimizer(FloorplanOptimizer):
@@ -145,12 +147,46 @@ class MyOptimizer(FloorplanOptimizer):
     USE_EXPANDED_SEARCH = False
     EXPANDED_SEARCH_MAX_PAIRS = 20
     USE_COST_AWARE_GATE = False
+    # v5.37（採用）：generate_floorplan() 原本只用 legalize 之前的 raw
+    # 指標排序，只 legalize 排第一名的候選——但 legalize（尤其是
+    # compact_merge_clusters / compact_merge_cluster_groups）常常大幅
+    # 改變 overlap 和 bbox_area，raw 排序不保證跟 legalize 後的真實品質
+    # 同序。改成把排名前 TOP_K_CANDIDATES 個候選都各自 legalize，legalize
+    # 完之後才用真實的 (V_relative, total_hpwl, bbox_area) 選最終答案
+    # （見 inference.py: legalize_top_k_candidates docstring，含跟隊友
+    # repo diffusion-floorplanner 的比較）。100 樣本官方 evaluate 前的
+    # 篩選：K=5 real cost 1.0519->1.0002（-4.9%），71/100 樣本變好、
+    # 14/100 變差。
+    #
+    # 序列跑 K 次 legalize 在 real cost 上是淨負的（K=2 就已經輸給
+    # K=1，runtime 代價完全蓋過品質好處）——`legalize_lff` 是純
+    # Python/numpy、不碰 torch/CUDA，可以安全丟到獨立 process 平行跑
+    # （LEGALIZE_WORKERS 個 worker，用 ProcessPoolExecutor），平行化後
+    # wall-clock 時間不再跟 K 成正比，才讓這個機制轉成真正的淨改善。
+    # LEGALIZE_WORKERS 用 min(TOP_K_CANDIDATES, cpu_count) 動態決定，
+    # 不要寫死成開發機（12 核）量到的數字——正式比賽硬體是 48 核
+    # ICELAKE，核心數比開發機多很多。
+    TOP_K_CANDIDATES = 5
+    LEGALIZE_WORKERS = min(TOP_K_CANDIDATES, os.cpu_count() or 1)
 
     def __init__(self, verbose: bool = False):
         super().__init__(verbose)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         checkpoint_path = str(Path(__file__).parent / "checkpoints" / self.CHECKPOINT_NAME)
         self.model, self.config = load_model(checkpoint_path, self.device)
+        # 常駐 process pool：跨所有 solve() 呼叫重複使用，攤提 process
+        # 啟動 + 每個子行程重新 import torch 的一次性成本（Windows spawn
+        # 語意下這個成本不小，每個 test case 都新建 pool 會嚴重低估
+        # 平行化的真實效益，見 legalize_top_k_candidates docstring）。
+        self._legalize_pool = (
+            ProcessPoolExecutor(max_workers=self.LEGALIZE_WORKERS)
+            if self.TOP_K_CANDIDATES > 1 else None
+        )
+
+    def __del__(self):
+        pool = getattr(self, "_legalize_pool", None)
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def solve(
         self,
@@ -229,7 +265,7 @@ class MyOptimizer(FloorplanOptimizer):
             x_offset = y_offset = 0.0
             outline_bbox = None
 
-        best, _ = generate_floorplan(
+        _, all_results = generate_floorplan(
             self.model, self.config, areas, W_int,
             canvas_w=canvas_w, canvas_h=canvas_h,
             x_offset=x_offset, y_offset=y_offset,
@@ -247,8 +283,7 @@ class MyOptimizer(FloorplanOptimizer):
             post_repel_grouping=self.POST_REPEL_GROUPING,
         )
 
-        legalized = legalize_result(
-            best, areas, W_int, p2b_edges, pins_np,
+        legalize_kwargs = dict(
             preplaced_mask=preplaced_mask,
             fixed_mask=fixed_mask,
             mib_group=mib_group,
@@ -264,6 +299,11 @@ class MyOptimizer(FloorplanOptimizer):
             reinsert_sweeps=self.REINSERT_SWEEPS,
             reinsert_grid_density=self.REINSERT_GRID_DENSITY,
             verbose=self.verbose,
+        )
+        n_cand = max(1, self.TOP_K_CANDIDATES)
+        legalized = legalize_top_k_candidates(
+            all_results[:n_cand], legalize_kwargs, areas, W_int, p2b_edges, pins_np,
+            n_workers=self.LEGALIZE_WORKERS, executor=self._legalize_pool,
         )
 
         x, y, w, h = legalized["x"], legalized["y"], legalized["w"], legalized["h"]

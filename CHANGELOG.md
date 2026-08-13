@@ -6,6 +6,113 @@
 
 ---
 
+## v5.37 —— legalize 排名前 K 個候選、legalize 後才選最終答案 + 平行化（採用，官方 evaluate 兩次確認約 -7%）
+
+**背景**：使用者提供隊友團隊（ICCAD2026-Problem-C/diffusion-floorplanner）
+的 repo 連結，請求參考對方的 legalization 方法。用 GitHub API 讀取對方
+`docs/METHOD.md`／`docs/OPT_IN_FLAGS.md`／兩份 grouping 相關實驗紀錄
+（沒有 clone 整包，只抓幾份文件內容）後發現：
+
+1. 對方的 legalizer 是完全不同架構（precedence-DAG + SOCP/凸優化聯合
+   求解），沒辦法直接搬過來套用在我們的 MAXRECTS + 加權中位數貪婪排布
+   架構上。
+2. 對方 `GROUP_SUPERMODULE_SCREEN.md`（把 disconnected group 打包成剛體
+   supermodule 再重新放）的結論——「post-hoc rigid reinsertion is not a
+   viable repair」——跟我們的 v5.35（獨立想到、獨立實作的同一種點子）
+   結論完全一致，算是兩個獨立團隊、兩種完全不同架構得到的同一個負面
+   結論，替 v5.35 的決定做了一次獨立驗證。
+3. 對方 `docs/METHOD.md` 明確指出「raw sample 的排序沒辦法準確預測
+   legalize 後的品質」，因此他們的作法是**legalize 排名前 K 個候選，
+   legalize 完之後才用真實品質選最終答案**（而不是像我們現有的
+   `generate_floorplan()` 一樣，只用 legalize **之前**的 raw 指標
+   （overlap/V_relative/hpwl/bbox_area）排序，只把第一名送進 legalize，
+   其餘候選直接丟棄）。這件事不需要動到 legalizer 本身、純粹是**選擇
+   時機**的改動，架構上完全可行——是這次真正嘗試的方向。
+
+**實作（`legalize_top_k_candidates`，`inference.py`）**：新增這個函式，
+把 `generate_floorplan()` 回傳的 `all_results`（已依 raw 排序鍵排好序）
+取前 K 個，各自跑一次完整 `legalize_result`，legalize 完之後用跟
+`generate_floorplan()` 排序 raw 候選同一套 GT-free 排序鍵
+`(V_relative, total_hpwl, bbox_area)`（legalize 後 overlap 恆為 0，
+拿掉這項）選最好的一個。刻意不用 area_gap/hpwl_gap，因為那需要 GT，
+正式比賽推論時沒有。`run_one_sample`／`my_optimizer.py` 新增
+`top_k_candidates`（預設 1＝跟改動前完全等價，逐一驗證過 K=1 時輸出
+逐位元相同）。
+
+**第一次篩選（序列執行）：淨負，K=2 就已經輸給 K=1**——20 樣本掃描
+K∈{1,2,3,5}：real cost 1.0283→1.0425→1.1026→1.2343，單調變差，K=2
+就有 12/20 樣本變差。序列跑 K 次 legalize 的時間幾乎線性疊加
+（K=2 時 legalize 時間直接翻倍），runtime penalty 完全蓋過品質好處。
+
+**平行化（v5.37b）**：`legalize_lff`／`legalize_result` 全部是純
+Python/numpy，完全不碰 torch/CUDA，可以安全丟到獨立 process 平行跑
+——隊友的系統之所以「legalize 多個候選再選」划算，正是因為他們用
+`LEGALIZE_WORKERS=12` 多核心平行跑。這裡用 `ProcessPoolExecutor` 實作
+（`legalize_top_k_candidates` 新增 `n_workers`／`executor` 參數，
+`n_workers<=1` 時完全維持原本的序列迴圈，零風險）。`MyOptimizer.
+__init__` 建立一個常駐 pool（`TOP_K_CANDIDATES=5`，
+`LEGALIZE_WORKERS=min(TOP_K_CANDIDATES, os.cpu_count())`——用
+`cpu_count()` 動態決定，不寫死開發機的核心數，因為使用者的正式比賽
+硬體是 48 核 ICELAKE CPU + A100 GPU，比這台 12 核開發機寬裕很多），
+跨所有 `solve()` 呼叫重複使用，攤提 process 啟動＋每個子行程重新
+import torch 的一次性成本（這個成本在 Windows spawn 語意下不小，
+每個 test case 都新建 pool 會嚴重低估平行化的真實效益）。
+
+**過程中發現並修正一個 Windows multiprocessing 的 import bug**：
+`iccad2026_evaluate.py --evaluate my_optimizer.py --test-id 0` 一開始
+直接炸掉——子行程要 unpickle `_legalize_worker`（定義在 `inference.py`）
+時丟 `ImportError: cannot import name 'state_to_xywh' from 'utils'`。
+根因：Windows spawn 啟動子行程時會「安全重新 import」啟動腳本
+（`iccad2026_evaluate.py`）——重跑它自己把 `FloorSet/` 塞進
+`sys.path[0]` 的頂層程式碼，但**跳過** `if __name__ == "__main__":`
+區塊；而 `my_optimizer.py` 原本用來把 `iccad2026contest/` 目錄重新頂到
+`sys.path` 最前面、清掉 `sys.modules["utils"]` 快取的修正，正好寫在那個
+會被跳過的區塊裡（`--evaluate` 參數處理流程內），子行程完全不會跑到，
+於是 `from utils import (...)` 解析到 `FloorSet/utils.py`（沒有
+`state_to_xywh` 等函式）。修法：把同一套修正動作搬進 `inference.py`
+自己的模組頂層（`from utils import` 之前），不依賴呼叫端有沒有先做過
+——不管是主行程還是子行程、不管誰先 import 誰，都能保證拿到正確的
+`iccad2026contest/utils.py`。
+
+**驗證**：
+- 平行 vs 序列：3 個真實樣本（tid=0/20/50），同樣的 K=5 候選池，逐位元
+  比對 legalize 後的 (x,y,w,h)，**完全相同**——平行化只是換一種方式算
+  同一個結果，不影響任何演算法輸出。
+- 開發機（12 核）上的 wall-clock：某樣本 K=5 的 legalize 時間從 2.15s
+  （序列）降到 0.74s（平行，~2.9x）。
+- 20 樣本篩選（平行執行）：K=3 real cost 1.0286→0.9951（-3.3%，
+  11 好/3 壞/6 平）、K=5 real cost →0.9996（-2.8%，13 好/4 壞/3 平）。
+- 100 樣本篩選（平行執行）：K=3 real cost 1.0519→1.0068（-4.3%，
+  58 好/14 壞/28 平）、K=5 →1.0002（-4.9%，71 好/14 壞/15 平）——
+  K=5 樣本數大時反而比 K=3 更好，勝負比也更乾淨，選 K=5。
+- `MyOptimizer` 端到端：5 個真實 test case 透過真正的 `ContestEvaluator`
+  跑一次，確認常駐 pool 真的有跨呼叫重複使用（第一個 test case 付出
+  完整 cold-start 成本 6.36s，後面 4 個降到 0.58-0.88s），5/5 feasible。
+
+**官方 evaluate（在 `my_optimizer.py` 正式送測路徑上，2 次獨立跑）**：
+
+| | run1 | run2 | 平均 |
+|---|---|---|---|
+| 真實 median runtime 換算分數 | 1.0481 | 1.0520 | **1.0500** |
+| avg runtime | 1.25s | 1.29s | — |
+| feasible | 100/100 | 100/100 | — |
+
+兩次跑非常一致（差距僅 0.0039，遠低於 v4 baseline 自身跨跑變異度
+~0.0104），平均 **1.0500**，比 v4 baseline（1.128）進步約 **-6.9%**
+——是這個 session 目前最大的一次真實分數改善，跟 v5.15（DDIM_STEPS
+10→30，-4.4%）同量級甚至更好。
+
+**決定**：**採用**。`TOP_K_CANDIDATES=5`、`LEGALIZE_WORKERS=min(5,
+cpu_count())` 成為 `my_optimizer.py` 新的 production 設定。這個機制的
+性質跟這個 session 大部分「品質 vs runtime 代價」的取捨機制不同——它
+不是靠某個新的搜尋/修補邏輯讓品質變好，而是單純把「選擇時機」從
+legalize 之前挪到 legalize 之後，用平行化把 runtime 代價壓到可以忽略，
+幾乎是純粹的淨改善。方法論上呼應隊友文件反覆強調的教訓：raw 排序不是
+legalize 後品質的可靠代理，選擇應該盡量晚（在有更多真實資訊之後）才
+發生。
+
+---
+
 ## v5.36 —— `_FreeRectPool.occupy()` 效能優化：向量化自由矩形剔除邏輯（採用，純效能改動、輸出逐位元不變）
 
 **背景**：使用者要求「在不修改任何程式碼邏輯的前提下降低運行時間」。用

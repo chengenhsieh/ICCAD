@@ -10,11 +10,34 @@ v2 -> v3 變動：
   6. 計算並印出 soft constraint violations
 """
 import os
+import sys
 import json
 import time
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor
+
+# v5.37b：Windows 的 multiprocessing spawn 啟動子行程時，會「安全重新
+# import」啟動腳本（iccad2026_evaluate.py）——重跑它的頂層程式碼（含它
+# 自己把 FloorSet/ 塞進 sys.path[0] 的副作用），但跳過 `if __name__ ==
+# "__main__":` 區塊。my_optimizer.py 原本用來把 iccad2026contest/ 目錄
+# 重新頂到 sys.path 最前面、清掉 sys.modules["utils"] 快取的修正，正好
+# 就寫在那個會被跳過的區塊裡（`--evaluate` 的參數處理流程內）——子行程
+# 裡完全不會跑到，導致子行程 unpickle `_legalize_worker`、import 這個
+# 模組時，`from utils import (...)` 解析到 FloorSet/utils.py（沒有
+# state_to_xywh 等函式），直接 ImportError。修法：把同一套修正動作搬進
+# 這個模組自己的頂層，不依賴呼叫端（my_optimizer.py 或任何人）有沒有
+# 先做過——不管是主行程還是子行程、不管是誰先 import 誰，這裡都能保證
+# 拿到正確的 iccad2026contest/utils.py。清掉 sys.modules["utils"] 快取
+# 是安全的：如果 iccad2026_evaluate.py 自己的 `from utils import
+# unpad_tensor, ...` 已經執行過，它要的名字早就綁進自己的 namespace，
+# 不受這裡清快取影響。
+_THIS_DIR = str(Path(__file__).resolve().parent)
+if sys.path[0] != _THIS_DIR:
+    sys.modules.pop("utils", None)
+    sys.path.insert(0, _THIS_DIR)
 
 from config import Config
 from model import FloorplanDiffusionModel
@@ -714,6 +737,112 @@ def legalize_result(
     }
 
 
+def _legalize_worker(args):
+    """
+    v5.37b：`ProcessPoolExecutor` 的 worker 進入點，必須是 module-level
+    函式才能在 Windows（spawn，沒有 fork）下被 pickle 送進子行程。
+    `legalize_lff`／`legalize_result` 全部是純 Python/numpy，不碰
+    torch/CUDA，丟到獨立行程跑是安全的。子行程裡強制 verbose=False——
+    多個行程同時印字會在同一個 stdout 上交錯亂碼，不是任何一個候選
+    自己的邏輯壞了。
+    """
+    cand, legalize_kwargs, areas, W_int, p2b_edges, pins_pos = args
+    kw = dict(legalize_kwargs)
+    kw["verbose"] = False
+    return legalize_result(cand, areas, W_int, p2b_edges, pins_pos, **kw)
+
+
+def legalize_top_k_candidates(candidates, legalize_kwargs, areas, W_int, p2b_edges, pins_pos,
+                               n_workers=1, executor=None):
+    """
+    v5.37（實驗用，預設 top_k_candidates=1 時跟改動前完全等價）：
+    generate_floorplan() 目前只用 raw（legalize 之前）的
+    (overlap, V_relative, total_hpwl, bbox_area) 排序，只把排第一名的
+    候選送進 legalize——其餘 n_samples-1 個候選直接丟棄。這個排序是
+    legalize 前的近似值，legalize（尤其是 compact_merge_clusters /
+    compact_merge_cluster_groups 這些會大幅搬動 block 的收尾 pass）常常
+    大幅改變 overlap 和 bbox_area，raw 排序不保證跟 legalize 後的真實
+    品質同序。
+
+    參考隊友 repo（ICCAD2026-Problem-C/diffusion-floorplanner）
+    docs/METHOD.md 的診斷："Raw overlap or raw bounding-box area is a
+    poor predictor because legalization can radically change both."
+    ——他們的作法是把排名前 K 個候選都個別跑一次完整 legalize，legalize
+    完之後才用 legalize 後的品質選最終答案。這裡沿用同樣的原則，但
+    不是套用他們的 SOCP/MILP 聯合求解架構（那是完全不同的 legalizer，
+    没辦法直接搬過來)——只是把「選擇時機」從 legalize 之前挪到 legalize
+    之後，重用我們現有的 legalize_result，不改動 legalize_result 本身
+    的任何邏輯。
+
+    選擇準則刻意不用 area_gap/hpwl_gap（需要 GT，正式比賽推論時沒有）：
+    用跟 generate_floorplan() 排序 raw 候選同一套 GT-free 排序鍵
+    （V_relative, total_hpwl, bbox_area），只是這裡是套在 legalize
+    **之後**的真實值上，不是套在 legalize 之前的近似值上——overlap
+    這一項 legalize 後恆為 0（legalize_lff 結構上保證），拿掉即可。
+
+    代價：跑幾個候選就要跑幾次完整 legalize，runtime 大約跟
+    `len(candidates)` 成正比（不像 diffusion 的候選共享同一個 GPU
+    batch，legalize 目前是逐一序列跑的）——這正是這個機制能不能通過
+    「real cost」（含 RuntimeFactor）驗證的關鍵風險，需要照這個 session
+    一貫的協定（20/100 樣本篩選 + 官方 evaluate）驗證清楚，不能只看
+    品質有沒有變好。
+
+    candidates：generate_floorplan() 回傳的 `all_results`（已經依 raw
+    排序鍵排好序）取前 K 個，呼叫端自己決定 K。
+    legalize_kwargs：轉呼叫給 legalize_result() 的所有其餘參數（dict）。
+    回傳：跟 legalize_result() 同 schema 的 dict（勝出的那個候選）。
+
+    n_workers（v5.37b，實驗用，預設 1＝序列執行，跟改動前完全等價）：
+    20 樣本篩選證實序列跑 K 個候選在 real cost 上是淨負的——K=2 就已經
+    輸給 K=1（K 次 legalize 幾乎線性疊加時間，RuntimeFactor 的代價完全
+    蓋過品質好處）。隊友的系統（diffusion-floorplanner）之所以「多
+    legalize 幾個候選再選」划算，是因為他們用多核心平行跑
+    （`LEGALIZE_WORKERS=12`）。`legalize_lff`／`legalize_result` 全部是
+    純 Python/numpy、完全不碰 torch/CUDA，可以安全丟到獨立 process 裡
+    平行跑，這裡用 `ProcessPoolExecutor`。
+
+    executor：呼叫端可以自備一個已經建立好的 `ProcessPoolExecutor`
+    重複使用（跨多個 test case／多次呼叫共用，攤提 process 啟動 +
+    重新 import torch 的一次性成本——這個成本在 Windows 的 spawn 語意下
+    不小，每次都新建 pool 會嚴重低估平行化的真實效益）。不給的話（predominantly
+    測試用途）這裡會自己建一個臨時 pool，用完即丟。
+
+    注意：這裡量到的 wall-clock 數字是在開發機（12 核）上測的，正式
+    比賽硬體是 48 核 ICELAKE CPU + A100 GPU——這裡驗證的是「平行化本身
+    正確、方向有沒有比序列快」，K 選多大在 real cost 上划算，最終應該
+    在正式硬體上重新確認一次，開發機的核心數會低估效益上限。
+    """
+    if n_workers <= 1 or len(candidates) <= 1:
+        best = None
+        best_key = None
+        for cand in candidates:
+            leg = legalize_result(cand, areas, W_int, p2b_edges, pins_pos, **legalize_kwargs)
+            s = leg["soft"]
+            key = (s["V_relative"], leg["total_hpwl"], leg["bbox_area"])
+            if best_key is None or key < best_key:
+                best_key = key
+                best = leg
+        return best
+
+    args_list = [(cand, legalize_kwargs, areas, W_int, p2b_edges, pins_pos) for cand in candidates]
+    n_proc = min(n_workers, len(candidates))
+    if executor is not None:
+        results = list(executor.map(_legalize_worker, args_list))
+    else:
+        with ProcessPoolExecutor(max_workers=n_proc) as tmp_executor:
+            results = list(tmp_executor.map(_legalize_worker, args_list))
+
+    best = None
+    best_key = None
+    for leg in results:
+        s = leg["soft"]
+        key = (s["V_relative"], leg["total_hpwl"], leg["bbox_area"])
+        if best_key is None or key < best_key:
+            best_key = key
+            best = leg
+    return best
+
+
 def evaluate_and_report(result, W_int, areas, constraints=None, optimal=None, stage=""):
     k = len(areas)
     print("=" * 64)
@@ -1029,7 +1158,13 @@ def run_one_sample(sample_idx, official, model, config, device,
                    weight_dist=1.0, weight_boundary=3.0, weight_cluster=1.0,
                    weight_b2b=0.5, weight_p2b=0.15, weight_shape=3.0,
                    use_cluster_adjacency=False, cluster_adjacency_bonus=5.0,
-                   extra_checkpoints=None):
+                   extra_checkpoints=None,
+                   # v5.37（實驗用，預設 1＝跟改動前完全等價）：見
+                   # legalize_top_k_candidates() docstring 的完整說明。
+                   top_k_candidates=1,
+                   # v5.37b（實驗用，預設 1＝序列執行）：見
+                   # legalize_top_k_candidates() docstring 的 n_workers 說明。
+                   legalize_n_workers=1, legalize_executor=None):
     """
     跑單一 validation sample：
       1. 解析 inputs / GT / constraints
@@ -1260,8 +1395,10 @@ def run_one_sample(sample_idx, official, model, config, device,
     # 並讓 block 落在 pin bbox 裡頭
     # ====================================================
     t_legal_start = time.perf_counter()
-    legalized = legalize_result(
-        best, areas, W_int, p2b_edges, pins_pos,
+    # v5.37: 這份 kwargs dict 跟改動前逐一傳給 legalize_result() 的參數
+    # 完全相同，只是包成 dict 才能重複用在多個候選上（見
+    # legalize_top_k_candidates() docstring）。
+    legalize_kwargs = dict(
         preplaced_mask=preplaced_mask_pb,
         fixed_mask=fixed_mask_pb,
         mib_group=mib_group_arr,
@@ -1321,6 +1458,10 @@ def run_one_sample(sample_idx, official, model, config, device,
         use_cluster_adjacency=use_cluster_adjacency,
         cluster_adjacency_bonus=cluster_adjacency_bonus,
     )
+    n_cand = max(1, top_k_candidates)
+    legalized = legalize_top_k_candidates(
+        all_results[:n_cand], legalize_kwargs, areas, W_int, p2b_edges, pins_pos,
+        n_workers=legalize_n_workers, executor=legalize_executor)
     t_legalize = time.perf_counter() - t_legal_start
 
     print("\n>>> LEGALIZED (post-processed, zero overlap guaranteed)")

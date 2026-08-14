@@ -6,6 +6,81 @@
 
 ---
 
+## v5.38 —— 品質觸發的自適應 step 預算（不採用，runtime 固定成本太貴）
+
+**背景**：v5.37 完成後，使用者請我繼續參考隊友 repo
+（diffusion-floorplanner）的**推論端**做法（明確排除重新訓練模型），思考
+還有什麼可以套用。（過程中一度誤解成訓練端的 EDM 參數化遷移，寫了一半
+`config.py` 的欄位——使用者馬上澄清只要推論端，這部分已完整 revert，
+不留痕跡。）
+
+**先排除一個已經測過的方向**：隊友的 EDM Heun sampler 概念，我們
+`diffusion.py` 其實已經有（`edm_sample_with_forces`，v4.2 加的），但
+CHANGELOG 裡的 v5.3 已經測過、確認在**同計算量**下明顯輸給 DDIM
+（area_gap +4.2pp、hpwl_gap +5.6pp，40 樣本中 28 個 DDIM 更好），原因
+是這個 sampler 目前只是把 DDPM 訓練出來的模型包裝成 EDM denoiser
+（`_model_to_denoiser`），不是原生 EDM 訓練的網路——重跑一次沒有新
+資訊，不重複測試。
+
+**選定方向：品質觸發的自適應 step 預算**。隊友的做法是「先試 16 步，
+legalize 失敗就升級到 64、再不行升到 100」——但我們的 `legalize_lff`
+結構上保證一定「成功」，沒有對應的「失敗」訊號。改用 legalize 後的
+真實 `V_relative`（GT-free，跟正式送測環境一致）當觸發訊號：第一次用
+正常的 `DDIM_STEPS` 跑完，`V_relative` 還是偏高就重跑一次用更多步數的
+diffusion 取樣，兩次都 legalize 完之後用跟 `legalize_top_k_candidates`
+同一套排序鍵 `(V_relative, total_hpwl, bbox_area)` 選較好的一個——只有
+「難」的樣本才付出第二次 diffusion+legalize 的成本，容易的樣本完全不
+受影響。實作在 `my_optimizer.py`（`USE_ADAPTIVE_STEPS`／
+`ADAPTIVE_STEPS_V_REL_THRESHOLD`／`ADAPTIVE_STEPS_RETRY_DDIM_STEPS`，
+`solve()` 內的 `_attempt()` 抽出重跑邏輯）。門檻 `0.12` 依 v5.37
+100 樣本官方 evaluate 量到的 `V_relative` 分布（mean=0.079/
+median=0.076/p75=0.102/p90=0.136）挑，大約卡在 p75-p90，抓最難的
+15-20% 觸發重試。
+
+**驗證機制本身正確**：強制門檻=0（每個樣本都觸發）跑 3 個真實樣本，
+直接數 `generate_floorplan` 被呼叫次數，確認每個樣本都精準呼叫 2 次
+（`ddim_steps=10` 接著 `ddim_steps=30`），runtime 也對應翻倍——機制
+本身沒有 bug。
+
+**方法論教訓：第一次 20 樣本篩選的比較方法有漏洞**。原本直接用
+`ContestEvaluator.evaluate()` 對同一批 `test_id` 分別跑「關閉」「開啟」
+兩次、比較結果，以為這樣是配對比較——但 `evaluate()` 內部迴圈**不會**
+每個 test case 重設隨機種子，而這個機制本身消耗的隨機數次數是**不固定
+的**（觸發重試的樣本會多消耗一次 diffusion 取樣的隨機數）。只要序列中
+較早的樣本觸發過一次重試，後面所有樣本的 RNG 狀態就會跟對照組（沒有
+觸發過任何重試）分岔，兩邊看似「同一個 test_id」實際上吃到完全不同的
+diffusion 雜訊——這個問題只有在測試「消耗可變數量隨機性」的機制時才會
+出現，這個 session 之前測過的機制都是固定隨機數消耗量，沒踩過這個坑。
+第一次測出來的「4 好/16 壞」嚴重失真。修正做法：繞過 `evaluate()` 自己
+的迴圈，直接呼叫 `MyOptimizer.solve()`，每個 test case 呼叫前明確
+`torch.manual_seed(BASE_SEED + test_id)`，兩個條件都用完全相同的起點。
+
+**真實（修正後）結果**（20 樣本，配對）：
+
+| | OFF | retry=30 | retry=15 |
+|---|---|---|---|
+| avg_real_cost | 1.1504 | 1.2413（+7.9%） | 1.2113（+5.3%） |
+| avg_V_relative | 0.0954 | 0.0937 | **0.0901**（最好） |
+| avg_runtime | 1.055s | 1.379s | 1.277s |
+| 勝負比 vs OFF | — | 9 好/7 壞/4 平 | 9 好/8 壞/3 平 |
+
+修正後的訊號比第一次乾淨很多（勝負比不再一面倒），且 `V_relative`
+確實有變好、重試挑出來的候選也確實不會比原本差——證明機制邏輯本身是
+對的。但兩個 retry 步數設定 **real cost 都仍然是淨負**：retry 步數
+減半（30→15）real cost 差距從 +7.9% 收斂到 +5.3%，但 runtime 只小幅
+下降（1.379s→1.277s，不是等比例）——重試的**固定成本**（整個
+`legalize_top_k_candidates` pipeline 要再跑一次）本身就不便宜，不是
+單純步數的問題，再往下調步數邊際報酬有限，還會失去「多給難樣本一點
+運算」的意義。
+
+**決定**：**不採用**（`USE_ADAPTIVE_STEPS` 維持預設 `False`）。跟
+v5.14（RePaint resampling）同一種教訓：品質確實有改善，但 runtime 代價
+蓋過去。機制保留當 opt-in，`ADAPTIVE_STEPS_RETRY_DDIM_STEPS` 預設值
+改成測出來較好的 `15`（不是原本試的 `30`），供未來若想在這個方向上
+繼續調（例如降低重試的固定成本本身，而不是只調步數）時使用。
+
+---
+
 ## v5.37 —— legalize 排名前 K 個候選、legalize 後才選最終答案 + 平行化（採用，官方 evaluate 兩次確認約 -7%）
 
 **背景**：使用者提供隊友團隊（ICCAD2026-Problem-C/diffusion-floorplanner）

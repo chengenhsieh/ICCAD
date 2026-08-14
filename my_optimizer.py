@@ -168,6 +168,38 @@ class MyOptimizer(FloorplanOptimizer):
     # ICELAKE，核心數比開發機多很多。
     TOP_K_CANDIDATES = 5
     LEGALIZE_WORKERS = min(TOP_K_CANDIDATES, os.cpu_count() or 1)
+    # v5.38（不採用，見 CHANGELOG.md）：品質觸發的自適應 step 預算。參考
+    # 隊友 repo（diffusion-floorplanner）「先試 16 步，legalize 失敗就升級
+    # 到 64、再不行升到 100」的做法——但我們的 legalize_lff 結構上保證一定
+    # 「成功」（不會真的失敗），沒有對應的「失敗」訊號可以觸發升級。改成
+    # 用 legalize 後的真實 V_relative（不需要 GT，跟正式送測環境一致）
+    # 當觸發訊號：第一次用正常的 DDIM_STEPS 跑完，V_relative 還是偏高
+    # 就重跑一次用更多步數的 diffusion 取樣，兩次都 legalize 完之後用跟
+    # legalize_top_k_candidates 同一套排序鍵 (V_relative, total_hpwl,
+    # bbox_area) 選較好的一個。只有「難」的樣本才會付出第二次
+    # diffusion+legalize 的成本，容易的樣本完全不受影響——這個設計本身
+    # 就是為了閃開這個 session 一路以來讓好幾個機制陣亡的問題（品質變好
+    # 但 runtime 代價蓋過去，見 v5.14/v5.31/v5.34 等）。
+    #
+    # V_REL_THRESHOLD=0.12：100 樣本官方 evaluate（v5.37 run1）量到的
+    # V_relative 分布 mean=0.079/median=0.076/p75=0.102/p90=0.136，0.12
+    # 大約卡在 p75-p90 之間，抓最難的 15-20% 左右觸發重試，不是隨便選的。
+    #
+    # 20 樣本配對篩選（同一批 test_id、每個樣本呼叫前都明確
+    # torch.manual_seed(BASE+tid)，確保兩邊起點相同——第一次沒有這樣做，
+    # 重試機制消耗的隨機數次數不固定，觸發過重試的樣本會讓後面所有樣本的
+    # RNG 狀態跟對照組分岔，比較結果嚴重失真，見 CHANGELOG 說明）：
+    # retry_steps=30 時 real cost 1.1504→1.2413（+7.9%，9 好/7 壞/4 平）；
+    # retry_steps=15 時收斂到 1.2113（+5.3%，9 好/8 壞/3 平），V_relative
+    # 反而是三者中最好的（0.0901 vs OFF 的 0.0954）——機制本身有效（挑出來
+    # 的候選確實不比原本差），但重試的固定成本（整個 legalize top-K
+    # pipeline 要再跑一次）太貴，runtime 只跟著步數減半小幅下降
+    # （1.379s→1.277s，不是等比例），再往下調步數也很難真正打平。
+    # **不採用**，保留機制當 opt-in（預設關閉），retry 步數留在測出來
+    # 較好的 15，不是原本試的 30。
+    USE_ADAPTIVE_STEPS = False
+    ADAPTIVE_STEPS_V_REL_THRESHOLD = 0.12
+    ADAPTIVE_STEPS_RETRY_DDIM_STEPS = 15
 
     def __init__(self, verbose: bool = False):
         super().__init__(verbose)
@@ -265,24 +297,6 @@ class MyOptimizer(FloorplanOptimizer):
             x_offset = y_offset = 0.0
             outline_bbox = None
 
-        _, all_results = generate_floorplan(
-            self.model, self.config, areas, W_int,
-            canvas_w=canvas_w, canvas_h=canvas_h,
-            x_offset=x_offset, y_offset=y_offset,
-            n_samples=self.N_SAMPLES, ddim_steps=self.DDIM_STEPS, device=self.device,
-            constraints=constraints_raw,
-            p2b_edges=p2b_edges, pins_pos=pins_np,
-            gt_w=gt_w, gt_h=gt_h, gt_x=gt_x, gt_y=gt_y,
-            sampler="ddim", post_repel_steps=self.POST_REPEL_STEPS,
-            grouping_force_strength=self.GROUPING_FORCE_STRENGTH,
-            boundary_nudge_strength=self.BOUNDARY_NUDGE_STRENGTH,
-            repulsion_strength=self.REPULSION_STRENGTH,
-            force_confidence_power=self.FORCE_CONFIDENCE_POWER,
-            repaint_resample_steps=self.REPAINT_RESAMPLE_STEPS,
-            use_self_cond=self.USE_SELF_COND,
-            post_repel_grouping=self.POST_REPEL_GROUPING,
-        )
-
         legalize_kwargs = dict(
             preplaced_mask=preplaced_mask,
             fixed_mask=fixed_mask,
@@ -301,10 +315,41 @@ class MyOptimizer(FloorplanOptimizer):
             verbose=self.verbose,
         )
         n_cand = max(1, self.TOP_K_CANDIDATES)
-        legalized = legalize_top_k_candidates(
-            all_results[:n_cand], legalize_kwargs, areas, W_int, p2b_edges, pins_np,
-            n_workers=self.LEGALIZE_WORKERS, executor=self._legalize_pool,
-        )
+
+        def _attempt(ddim_steps):
+            _, all_results = generate_floorplan(
+                self.model, self.config, areas, W_int,
+                canvas_w=canvas_w, canvas_h=canvas_h,
+                x_offset=x_offset, y_offset=y_offset,
+                n_samples=self.N_SAMPLES, ddim_steps=ddim_steps, device=self.device,
+                constraints=constraints_raw,
+                p2b_edges=p2b_edges, pins_pos=pins_np,
+                gt_w=gt_w, gt_h=gt_h, gt_x=gt_x, gt_y=gt_y,
+                sampler="ddim", post_repel_steps=self.POST_REPEL_STEPS,
+                grouping_force_strength=self.GROUPING_FORCE_STRENGTH,
+                boundary_nudge_strength=self.BOUNDARY_NUDGE_STRENGTH,
+                repulsion_strength=self.REPULSION_STRENGTH,
+                force_confidence_power=self.FORCE_CONFIDENCE_POWER,
+                repaint_resample_steps=self.REPAINT_RESAMPLE_STEPS,
+                use_self_cond=self.USE_SELF_COND,
+                post_repel_grouping=self.POST_REPEL_GROUPING,
+            )
+            return legalize_top_k_candidates(
+                all_results[:n_cand], legalize_kwargs, areas, W_int, p2b_edges, pins_np,
+                n_workers=self.LEGALIZE_WORKERS, executor=self._legalize_pool,
+            )
+
+        legalized = _attempt(self.DDIM_STEPS)
+
+        # v5.38：只有第一次的結果 legalize 後 V_relative 仍偏高（「難」樣本）
+        # 才付出第二次 diffusion+legalize 的成本，重跑一次用更多步數，兩次
+        # 都跑完才用同一套 GT-free 排序鍵挑較好的——不是無條件都跑兩次。
+        if self.USE_ADAPTIVE_STEPS and legalized["soft"]["V_relative"] > self.ADAPTIVE_STEPS_V_REL_THRESHOLD:
+            retry = _attempt(self.ADAPTIVE_STEPS_RETRY_DDIM_STEPS)
+            key_first = (legalized["soft"]["V_relative"], legalized["total_hpwl"], legalized["bbox_area"])
+            key_retry = (retry["soft"]["V_relative"], retry["total_hpwl"], retry["bbox_area"])
+            if key_retry < key_first:
+                legalized = retry
 
         x, y, w, h = legalized["x"], legalized["y"], legalized["w"], legalized["h"]
         return [(float(x[i]), float(y[i]), float(w[i]), float(h[i])) for i in range(k)]

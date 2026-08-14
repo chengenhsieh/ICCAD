@@ -6,6 +6,90 @@
 
 ---
 
+## v5.39 —— post-legalize 聯合形狀+位置凸優化壓縮（不採用，V_relative 大幅變差）
+
+**背景**：使用者請我再次參考隊友團隊
+（ICCAD2026-Problem-C/diffusion-floorplanner）的 legalization 做法，
+針對他們回報「packing density 可達 87%」的部分深入研究。用 GitHub API
+讀取 `docs/experiments/AREA_UTIL_SCREEN.md`（沒有 clone 整包）後發現：
+純位置優化（他們的 M5）一樣卡在 util ~0.79（跟我們自己量到的 packing
+density ~77.5% 幾乎一樣），只有加上**形狀自由度**、用**單一固定拓樸下
+的全域凸優化**（不是搜尋離散排列拓樸，是他們的 M9）聯合求解
+`(x, y, w, h)` 才真正突破到 0.866-0.873。
+
+用 Explore agent 核對過：這個方向（事後 reshape/reposition 拉高
+packing density）在這個專案裡已經試過 **10 次以上、全部否決**
+（v5.1/v5.2/v5.22-v5.28），根因都是「真實資料上只有 ~19-39% 的 block
+是真正自由的」。這次的做法在架構上跟前面 10 次都不一樣：連續變數的
+**單次全域凸優化**（沒有拓樸搜尋、沒有局部最優陷阱），同時優化形狀
+**和**位置（不是只有位置），使用者看過這個落差分析後選擇「繼續，完整
+規劃」。
+
+**實作**（`utils.py`）：新增 `_extract_precedence_graph`（從目前已合法
+的佈局，對每一對 block 挑「間隙較小的那個軸」當固定 precedence 邊，
+留給凸優化收的是間隙較大的那個軸）與 `compact_joint_convex`（`cvxpy`
++ CLARABEL；面積用 `h>=a/w` 凸鬆弛；MIB 組共用同一個形狀變數；
+preplaced 全部當常數；6 點 accept/reject 安全閘門，沒過就整個回傳輸入
+不變）。`legalize_lff` 新增 `use_joint_compaction`（預設 `False`），
+放在 pipeline 最尾端、防禦性 `hard_zero_overlap` 之前。4 點接線
+（`legalize_lff`／`legalize_result`／`run_one_sample`／
+`MyOptimizer.legalize_kwargs`）完整打通。
+
+**單元測試（零 GPU 成本）全過**：20 組隨機合成佈局驗證
+`_extract_precedence_graph` 逐軸無環（0/20 有環）；15 組隨機合成佈局
+驗證零重疊/面積在容差內/bbox 不變大（0/15 失敗）；`k=0`／`k=1`／全部
+preplaced／preplaced 子集逐位元保留／MIB 組共用形狀（成員原始形狀已
+相同時）／MIB 組面積不匹配時安全拒絕退回輸入／`fixed_mask` 形狀保留
+等邊界案例全部符合預期。
+
+**Stage 1 真實資料驗證（比照計畫，20 樣本篩選之前先做）發現兩個問題**：
+
+1. **Runtime 代價比預期更貴**：10 個真實樣本（block 數 21-103，涵蓋
+   小/中/大）單次 `compact_joint_convex` 呼叫耗時 0.3-4.2 秒（平均
+   2.23 秒），相對這個專案目前 ~1.05-1.29 秒的整體 pipeline runtime
+   是好幾倍的額外成本，比隊友回報的「n≈120 時約 5 秒（含 2-3 輪
+   rebuild-and-resolve）」量級接近但沒有比較划算。
+
+2. **100% 被安全閘門拒絕、V_relative 大幅變差**：10/10 個真實樣本
+   `compact_joint_convex` 全部回傳輸入不變（`bbox_before` 精確等於
+   `bbox_after`）。用 `verbose=True` 對 3 個代表性樣本（n=21/50/100）
+   追查，拒絕原因**全部**是 `V_relative 變差`：
+
+   | n_blocks | V_relative（前→後） |
+   |---|---|
+   | 21 | 0.1304 → 0.3478（+166%） |
+   | 50 | 0.1579 → 0.5526（+250%） |
+   | 100 | 0.1273 → 0.6182（+386%） |
+
+   且劣化幅度隨 block 數增加而變大。診斷：`_extract_precedence_graph`
+   抽出的邊只保證**相對順序**（i 在 j 左邊/下面），不保證**相對距離**
+   ——凸優化的目標只有「縮小 bbox」，對 grouping/boundary/cluster 這些
+   soft violation 完全沒有感知。這個專案的 `legalize_lff` 既有 pipeline
+   （`compact_merge_clusters`／`compact_merge_cluster_groups`／
+   boundary-lock 處理等）已經花了大量心力把同一個 cluster/boundary
+   family 的 block 排在一起——凸優化在完全不知道這件事的情況下，只要
+   能換到更小的 bbox，就會自由地把這些 block 拉開，量測結果顯示這個
+   代價遠大於 bbox 縮小帶來的好處。隊友的「boundary-anchored 消融實驗
+   反而更差」結論可能只適用於他們自己相對陽春的 baseline pipeline，
+   這個專案既有的 soft-violation-aware 壓縮已經做得夠好，讓「完全不管
+   soft violation」的做法反而是淨負。
+
+   安全閘門本身運作正確（100% 準確攔下劣化，從未讓退化結果流出），但
+   代表這個機制在目前實作下對這個專案的真實資料**沒有任何實際效益**，
+   只有 runtime 成本沒有品質回報——比 v5.38 的「品質有改善但 runtime
+   代價蓋過去」還要更差一個等級。
+
+**決定**：**不採用**（`use_joint_compaction` 維持預設 `False`）。三個
+樣本、涵蓋小/中/大 block 數的一致性劣化（且劣化幅度隨規模擴大）已經
+足以判斷根因是架構層級的目標函式缺陷，不是 precedence tie-break 規則
+的參數調整能解決的，因此不進一步做 20/100 樣本篩選（不會改變結論、
+只會用更多算力再次確認同一件事）。程式碼保留在 `utils.py` 當 opt-in
+機制，若未來想再嘗試，方向應該是在凸優化目標裡加入 soft-violation-aware
+的項（例如同 cluster/boundary family 的 block 之間加一個鄰近度懲罰項），
+而不是像這次一樣完全依賴「精簡到只剩 precedence」的目標函式。
+
+---
+
 ## v5.38 —— 品質觸發的自適應 step 預算（不採用，runtime 固定成本太貴）
 
 **背景**：v5.37 完成後，使用者請我繼續參考隊友 repo

@@ -608,6 +608,11 @@ def legalize_result(
     seqpair_grouped_iters=500,
     seqpair_grouped_seed=0,
     seqpair_grouped_relax_boundary=False,
+    # v5.39（實驗用，預設關閉）：見 utils.py: compact_joint_convex docstring
+    use_joint_compaction=False,
+    joint_compaction_ar_bound=8.0,
+    joint_compaction_area_tol=0.009,
+    joint_compaction_solver="CLARABEL",
     verbose=True,
 ):
     """
@@ -698,6 +703,10 @@ def legalize_result(
             weight_shape=weight_shape,
             use_cluster_adjacency=use_cluster_adjacency,
             cluster_adjacency_bonus=cluster_adjacency_bonus,
+            use_joint_compaction=use_joint_compaction,
+            joint_compaction_ar_bound=joint_compaction_ar_bound,
+            joint_compaction_area_tol=joint_compaction_area_tol,
+            joint_compaction_solver=joint_compaction_solver,
             verbose=(mode == modes[0]) and verbose,
         )
         # legalize_lff 內部已經呼叫過 hard_zero_overlap 做防禦性驗證，這裡再走
@@ -1164,7 +1173,13 @@ def run_one_sample(sample_idx, official, model, config, device,
                    top_k_candidates=1,
                    # v5.37b（實驗用，預設 1＝序列執行）：見
                    # legalize_top_k_candidates() docstring 的 n_workers 說明。
-                   legalize_n_workers=1, legalize_executor=None):
+                   legalize_n_workers=1, legalize_executor=None,
+                   # v5.39（實驗用，預設關閉）：見 utils.py:
+                   # compact_joint_convex docstring。
+                   use_joint_compaction=False,
+                   joint_compaction_ar_bound=8.0,
+                   joint_compaction_area_tol=0.009,
+                   joint_compaction_solver="CLARABEL"):
     """
     跑單一 validation sample：
       1. 解析 inputs / GT / constraints
@@ -1457,6 +1472,10 @@ def run_one_sample(sample_idx, official, model, config, device,
         weight_shape=weight_shape,
         use_cluster_adjacency=use_cluster_adjacency,
         cluster_adjacency_bonus=cluster_adjacency_bonus,
+        use_joint_compaction=use_joint_compaction,
+        joint_compaction_ar_bound=joint_compaction_ar_bound,
+        joint_compaction_area_tol=joint_compaction_area_tol,
+        joint_compaction_solver=joint_compaction_solver,
     )
     n_cand = max(1, top_k_candidates)
     legalized = legalize_top_k_candidates(

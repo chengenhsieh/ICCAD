@@ -201,6 +201,14 @@ class MyOptimizer(FloorplanOptimizer):
     ADAPTIVE_STEPS_V_REL_THRESHOLD = 0.12
     ADAPTIVE_STEPS_RETRY_DDIM_STEPS = 15
 
+    # v5.39（實驗用，預設關閉）：post-legalize 聯合形狀+位置凸優化壓縮，
+    # 見 utils.py: compact_joint_convex docstring 與 legalize_lff 呼叫處
+    # 說明。
+    USE_JOINT_COMPACTION = False
+    JOINT_COMPACTION_AR_BOUND = 8.0
+    JOINT_COMPACTION_AREA_TOL = 0.009
+    JOINT_COMPACTION_SOLVER = "CLARABEL"
+
     def __init__(self, verbose: bool = False):
         super().__init__(verbose)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -312,6 +320,10 @@ class MyOptimizer(FloorplanOptimizer):
             use_cost_aware_gate=self.USE_COST_AWARE_GATE,
             reinsert_sweeps=self.REINSERT_SWEEPS,
             reinsert_grid_density=self.REINSERT_GRID_DENSITY,
+            use_joint_compaction=self.USE_JOINT_COMPACTION,
+            joint_compaction_ar_bound=self.JOINT_COMPACTION_AR_BOUND,
+            joint_compaction_area_tol=self.JOINT_COMPACTION_AREA_TOL,
+            joint_compaction_solver=self.JOINT_COMPACTION_SOLVER,
             verbose=self.verbose,
         )
         n_cand = max(1, self.TOP_K_CANDIDATES)

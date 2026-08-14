@@ -3151,6 +3151,402 @@ def compact_seqpair_grouped(x, y, w, h, preplaced_mask=None, boundary_code=None,
     return best_x, best_y
 
 
+def _extract_precedence_graph(x, y, w, h, tol=1e-6):
+    """
+    v5.39：`compact_joint_convex` 用的固定 precedence 圖抽取。給定一個
+    已合法（不重疊）的佈局，對每一對 block 直接從目前的實際座標讀出
+    「目前是靠哪個軸分開的」，回傳 `(x_edges, y_edges)`：
+      x_edges: list of (i, j)，代表 x_i + w_i <= x_j（i 在 j 左邊）
+      y_edges: list of (i, j)，代表 y_i + h_i <= y_j（i 在 j 下面）
+
+    跟 `compact_seqpair` 既有的對角線排序 trick（`order_diag_p =
+    argsort(x+y)` 等，見該函式）不同：那是給 SA **搜尋**用的近似全域
+    表示法，本身不保證精確對應任何一組真實的成對分離關係，需要靠事後
+    的 `overlaps()` 檢查兜底。這裡是**逐 pair** 直接從真實座標讀出
+    「目前實際成立」的分離關係，不是近似、不需要搜尋——每條邊都是
+    「這兩個 block 在目前座標下，某一軸的間隙 >= 0」這個事實的直接
+    陳述，是實數集合上 `<=` 關係的子集，天生遞移、無環（不會有 i 在 j
+    左邊、j 在 k 左邊、k 又在 i 左邊這種矛盾——這是實數 `<=` 關係的基本
+    性質）。
+
+    每一對只留一條邊（兩軸間隙可能都 >= 0）：留**間隙較小**的那個軸當
+    固定的 precedence 邊——這一軸的兩個 block 本來就幾乎貼在一起，鎖住
+    它幾乎不損失自由度；間隙較大的那個軸完全留給後面的凸優化去收緊，
+    那正是造成 packing 留白的軸。
+
+    gap 矩陣本身用 numpy 向量化算好，逐 pair 判斷用 Python 迴圈
+    （O(k^2)，這裡的 k 通常在幾十到一兩百之間，不是這個函式的效能
+    瓶頸——凸優化求解本身才是）。
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    w = np.asarray(w, dtype=np.float64)
+    h = np.asarray(h, dtype=np.float64)
+    k = len(x)
+    xr = x + w
+    yt = y + h
+
+    # gap_x[i, j] = i 在 j 左邊時的間隙（x_j - xr_i）；i 不在 j 左邊時是負值
+    gap_x = x[None, :] - xr[:, None]
+    gap_y = y[None, :] - yt[:, None]
+
+    x_edges = []
+    y_edges = []
+    for i in range(k):
+        for j in range(i + 1, k):
+            candidates = []
+            if gap_x[i, j] >= -tol:
+                candidates.append(("x", i, j, float(gap_x[i, j])))
+            if gap_x[j, i] >= -tol:
+                candidates.append(("x", j, i, float(gap_x[j, i])))
+            if gap_y[i, j] >= -tol:
+                candidates.append(("y", i, j, float(gap_y[i, j])))
+            if gap_y[j, i] >= -tol:
+                candidates.append(("y", j, i, float(gap_y[j, i])))
+            if not candidates:
+                # 理論上不該發生（輸入應該已經合法，至少一個方向分開），
+                # 真實資料上的極端邊界案例保守略過——沒有 precedence 約束
+                # 不會讓重疊沒被發現，accept/reject 閘門最後仍會用
+                # count_overlaps 驗證整個結果。
+                continue
+            axis, a, b, _ = min(candidates, key=lambda c: c[3])
+            if axis == "x":
+                x_edges.append((a, b))
+            else:
+                y_edges.append((a, b))
+    return x_edges, y_edges
+
+
+def compact_joint_convex(x, y, w, h, areas,
+                         preplaced_mask=None, fixed_mask=None,
+                         mib_group=None, cluster_group=None,
+                         boundary_code=None, outline_bbox=None,
+                         ar_bound=8.0, area_tol=0.009,
+                         solver="CLARABEL", verbose=False):
+    """
+    v5.39（實驗用，預設關閉）：TOFU 風格的「聯合形狀+位置」凸優化壓縮，
+    參考隊友 repo（ICCAD2026-Problem-C/diffusion-floorplanner）
+    `docs/experiments/AREA_UTIL_SCREEN.md` 記錄的 M9 機制。
+
+    背景：這個專案的 packing density（bbox 面積使用率）長期卡在 ~77.5%
+    （GT optimal ~96.9%），v5.1/v5.2/v5.22-v5.28 一共 10+ 個事後 reshape/
+    reposition 機制全部在真實資料上找不到改善，根因是真實資料上只有
+    ~19-39% 的 block 是真正「自由」的（其餘被 boundary/cluster/
+    preplaced/MIB 釘死），這些機制的搜尋範圍又刻意只限制在「自由」
+    block，自然沒有空間可動。隊友的資料證實：(1) 純位置優化一樣卡在
+    ~79%（跟我們的數字幾乎一樣），只有加上**形狀自由度**才真正突破到
+    87%；(2) 用**離散搜尋**（他們的 M10，跟我們的 v5.24-v5.28
+    sequence-pair SA 系列同一個思路）一樣卡住，只有**單一固定拓樸下的
+    全域凸優化**才真正解鎖——不是搜尋更廣，是換一種質性不同的求解方式。
+
+    這裡的關鍵差異，也是這個函式沒有重蹈前 10 次覆轍的原因：不限制只有
+    「自由」block 能動——`fixed_mask`（非 preplaced）跟被 boundary/
+    cluster/MIB 影響的 block，位置 (x,y) 都還是凸優化裡的自由變數
+    （只有 preplaced 才整個是常數），只是全部一起受 `_extract_
+    precedence_graph` 抽出的固定拓樸約束。讓「原本被既有機制釘住」的
+    60-80% block 也能當連續變數參與，正是這個機制存在的價值所在——如果
+    為了省成本把變數集合縮小回只有「自由」block，等於自己拆掉這個
+    機制的核心價值，退化成前 10 次已經確認失敗的做法。
+
+    做法：
+      1. `_extract_precedence_graph` 從目前已合法的佈局抽出一個**固定**
+         的水平/垂直 precedence 圖（不搜尋拓樸）。
+      2. 對 (x, y, w, h) 解一次凸優化：目標是縮小 true bbox（用 epigraph
+         形式的 outline，不是量測到座標原點的距離，preplaced block 可能
+         把佈局定錨在遠離原點的地方）；precedence 約束零 slack（本身就
+         保證解出來零重疊）；面積用凸鬆弛 `h_i >= a_i/w_i`；aspect ratio
+         限制在 `[1/ar_bound, ar_bound]`（沿用 `_aspect_variants` 既有的
+         `max_ratio=8.0`）；preplaced 的 x,y,w,h 全部當常數（不是等式
+         約束，更精確、更省變數）；fixed_mask 只有 w,h 是常數；MIB 組
+         內所有成員共用**同一個** (w,h) 變數，`V_mib=0` 是結構保證，不是
+         約束出來的。
+      3. 面積凸鬆弛 `h>=a/w` 對任何可行點都直接蘊含 `w*h>=a`（不只是在
+         最優解成立），所以解出來的面積只可能偏大、不可能偏小——事後對
+         偏大的 block 做「置中收縮」修正到剛好等於目標面積：
+         `scale=sqrt(a/(w*h))`，`w,h` 各乘上 `scale`、中心點不變。置中
+         收縮讓每條邊往內縮，任何原本成立的 precedence 不等式只會多出
+         slack、不會變緊，所以收縮後保證仍然零重疊（不需要另外驗證，
+         這是可以直接證明的不變量）。
+      4. accept/reject 安全閘門（沒過就整個回傳輸入不變，不是回傳部分
+         修正的中間結果）：`count_overlaps==0`；每個非 preplaced block
+         的面積誤差 `<=area_tol`（MIB 組也對每個成員自己的 `areas[i]`
+         個別檢查，不是只看共用的 (w,h) 有沒有滿足組內最大面積）；
+         preplaced 逐位元不變；`outline_bbox` 提供時所有 block 落在
+         範圍內；`compute_soft_violations` 的 `V_relative` 不比輸入差；
+         `bbox_area` 嚴格不比輸入大（這個 pass 存在的唯一目的就是縮小
+         面積，數值上沒真的縮小就該拒絕）。
+
+    刻意不加 explicit 的 cluster-adjacency 約束（只靠 precedence）：
+    隊友自己的「boundary-anchored」消融實驗證實，額外加 explicit
+    boundary 硬約束反而更差（over-constrain，抵銷掉形狀自由度帶來的
+    好處）——他們的 grouping 違規是靠壓縮的副作用「順帶」改善的
+    （3.55→2.35），不是靠額外約束出來的。這代表這個函式對 `V_grouping`
+    的實際效果在我們的資料上未驗證，驗證階段要當獨立指標追蹤。
+
+    outline_bbox 圍住約束是隊友文件沒有、這裡額外加的：`compact_
+    gradient_finetune`（v5.2）當初就是因為目標函式對「整體平移」零
+    梯度、Adam 沒有錨定機制，把 block 帶出 outline 之外卻沒被發覺
+    （那筆假的 -4.54% 展示案例，事後查也是越界的無效解）。凸優化不會
+    像 Adam 那樣隨機漂移，這條約束可能根本不會 binding，但重用 outline
+    目標本來就有的 4 個輔助變數、幾乎零成本，寧可先加上。
+
+    Runtime 代價是這個機制最大的風險（不是正確性）：隊友回報 n≈120
+    時每個樣本約 5 秒（CPU，且是 2-3 輪 rebuild-and-resolve 的總和，
+    不是單輪），比這個專案目前 ~1.1s 的整體 pipeline runtime 貴得多，
+    很可能重蹈 v5.14/v5.31/v5.34/v5.38 的覆轍（品質真的變好，但官方
+    evaluate 的 `max(0.7, RuntimeFactor^0.3)` 代價蓋過去）——呼叫端
+    應該只在「便宜的 compact_* pass 都跑完後，bbox_area 仍有明顯落差」
+    時才觸發這個函式，不是每個樣本都無條件呼叫，見呼叫處的說明。
+    """
+    x = np.asarray(x, dtype=np.float64).copy()
+    y = np.asarray(y, dtype=np.float64).copy()
+    w = np.asarray(w, dtype=np.float64).copy()
+    h = np.asarray(h, dtype=np.float64).copy()
+    areas = np.asarray(areas, dtype=np.float64)
+    k = len(x)
+    if k <= 1:
+        return x, y, w, h
+
+    if preplaced_mask is None:
+        preplaced_mask = np.zeros(k, dtype=bool)
+    else:
+        preplaced_mask = np.asarray(preplaced_mask, dtype=bool)
+    if fixed_mask is None:
+        fixed_mask = np.zeros(k, dtype=bool)
+    else:
+        fixed_mask = np.asarray(fixed_mask, dtype=bool)
+    if mib_group is None:
+        mib_group = np.zeros(k, dtype=np.int64)
+    else:
+        mib_group = np.asarray(mib_group, dtype=np.int64)
+    if cluster_group is None:
+        cluster_group = np.zeros(k, dtype=np.int64)
+    else:
+        cluster_group = np.asarray(cluster_group, dtype=np.int64)
+    if boundary_code is None:
+        boundary_code = np.zeros(k, dtype=np.int64)
+    else:
+        boundary_code = np.asarray(boundary_code, dtype=np.int64)
+
+    if k == int(preplaced_mask.sum()):
+        return x, y, w, h   # 全部 preplaced，沒有自由變數，沒什麼好解的
+
+    try:
+        import cvxpy as cp
+    except ImportError:
+        if verbose:
+            print("compact_joint_convex: cvxpy 未安裝（pip install cvxpy），"
+                  "回傳輸入不變。")
+        return x, y, w, h
+
+    x_edges, y_edges = _extract_precedence_graph(x, y, w, h)
+
+    # ---- 變數宣告 ----
+    x_of = [None] * k
+    y_of = [None] * k
+    w_of = [None] * k
+    h_of = [None] * k
+
+    mib_shape_var = {}   # gid -> cp.Variable(2)（自由）或 (float,float)（有 fixed 錨點）
+    for gid in sorted(int(g) for g in np.unique(mib_group) if g > 0):
+        members = np.nonzero(mib_group == gid)[0]
+        fixed_members = [m for m in members if fixed_mask[m] and not preplaced_mask[m]]
+        if fixed_members:
+            anchor = fixed_members[0]
+            mib_shape_var[gid] = (float(w[anchor]), float(h[anchor]))
+        else:
+            mib_shape_var[gid] = cp.Variable(2, pos=True)
+
+    for i in range(k):
+        gid = int(mib_group[i])
+        if preplaced_mask[i]:
+            x_of[i], y_of[i] = float(x[i]), float(y[i])
+            w_of[i], h_of[i] = float(w[i]), float(h[i])
+            continue
+        x_of[i] = cp.Variable()
+        y_of[i] = cp.Variable()
+        if gid > 0:
+            sv = mib_shape_var[gid]
+            if isinstance(sv, tuple):
+                w_of[i], h_of[i] = sv
+            else:
+                w_of[i], h_of[i] = sv[0], sv[1]
+        elif fixed_mask[i]:
+            w_of[i], h_of[i] = float(w[i]), float(h[i])
+        else:
+            w_of[i] = cp.Variable(pos=True)
+            h_of[i] = cp.Variable(pos=True)
+
+    def _is_const(v):
+        return isinstance(v, float)
+
+    constraints = []
+
+    # ---- precedence（零 slack）----
+    for i, j in x_edges:
+        if _is_const(x_of[i]) and _is_const(w_of[i]) and _is_const(x_of[j]):
+            continue
+        constraints.append(x_of[i] + w_of[i] <= x_of[j])
+    for i, j in y_edges:
+        if _is_const(y_of[i]) and _is_const(h_of[i]) and _is_const(y_of[j]):
+            continue
+        constraints.append(y_of[i] + h_of[i] <= y_of[j])
+
+    # ---- 面積凸鬆弛 + aspect ratio（只套在真的是自由變數的形狀）----
+    mib_ar_done = set()
+    for i in range(k):
+        if preplaced_mask[i] or fixed_mask[i]:
+            continue
+        gid = int(mib_group[i])
+        constraints.append(areas[i] * cp.inv_pos(w_of[i]) <= h_of[i])
+        if gid > 0:
+            if gid in mib_ar_done:
+                continue
+            mib_ar_done.add(gid)
+        constraints += [w_of[i] <= ar_bound * h_of[i], h_of[i] <= ar_bound * w_of[i]]
+
+    # ---- outline 目標（epigraph）+ 可選圍住約束 ----
+    x_max = cp.Variable(); x_min = cp.Variable()
+    y_max = cp.Variable(); y_min = cp.Variable()
+    for i in range(k):
+        constraints.append(x_max >= x_of[i] + w_of[i])
+        constraints.append(x_min <= x_of[i])
+        constraints.append(y_max >= y_of[i] + h_of[i])
+        constraints.append(y_min <= y_of[i])
+    if outline_bbox is not None:
+        oxmin, oymin, oxmax, oymax = outline_bbox
+        constraints += [x_min >= oxmin, x_max <= oxmax, y_min >= oymin, y_max <= oymax]
+
+    objective = cp.Minimize((x_max - x_min) + (y_max - y_min))
+
+    try:
+        prob = cp.Problem(objective, constraints)
+        prob.solve(solver=getattr(cp, solver))
+    except Exception as e:
+        if verbose:
+            print("compact_joint_convex: solver raised {!r}，回傳輸入不變".format(e))
+        return x, y, w, h
+
+    if prob.status not in ("optimal", "optimal_inaccurate"):
+        if verbose:
+            print("compact_joint_convex: solver status={}，回傳輸入不變".format(prob.status))
+        return x, y, w, h
+
+    def _val(v):
+        return v if _is_const(v) else float(v.value)
+
+    x2 = np.array([_val(v) for v in x_of])
+    y2 = np.array([_val(v) for v in y_of])
+    w2 = np.array([_val(v) for v in w_of])
+    h2 = np.array([_val(v) for v in h_of])
+
+    if (np.any(np.isnan(x2)) or np.any(np.isnan(y2)) or
+            np.any(np.isnan(w2)) or np.any(np.isnan(h2))):
+        if verbose:
+            print("compact_joint_convex: solver 回傳 NaN，回傳輸入不變")
+        return x, y, w, h
+
+    # ---- 事後修正：超出面積公差的 block 置中收縮（見 docstring 證明）----
+    # MIB 組要當一整組修，不能逐 block 各自用自己的 areas[i] 算 scale——
+    # 求解出來時組內所有成員的 (w,h) 是同一個共用變數、逐位元相同，但如果
+    # 逐 block 各自用自己的 areas[i] 算縮放比例，不同目標面積的成員會被
+    # 縮成不同比例，反而破壞掉求解本身已經正確保證的「MIB 組共用形狀」
+    # 這個不變量。整組只算一次 scale（用組內最大 areas[i]，對應約束式
+    # 實際 binding 的那個面積），套用到每個成員身上時 shape 完全相同，
+    # 只有各自的 (x,y) 各自置中——組內面積比 group 目標小的成員，修正後
+    # 相對自己的 areas[i] 可能還是有一點誤差，這是共用形狀模型本身固有
+    # 的限制（跟既有 legalize_lff 內建的 MIB 統一尺寸邏輯一樣），交給
+    # 下面的 accept/reject 閘門對每個 block 個別檢查 area_tol 把關，不在
+    # 這裡假裝解決。
+    handled_mib_groups = set()
+    for i in range(k):
+        if preplaced_mask[i]:
+            continue
+        gid = int(mib_group[i])
+        if gid > 0:
+            if gid in handled_mib_groups:
+                continue
+            handled_mib_groups.add(gid)
+            members = [m for m in np.nonzero(mib_group == gid)[0] if not preplaced_mask[m]]
+            if not members:
+                continue
+            cur_area = w2[members[0]] * h2[members[0]]
+            target_area = float(areas[members].max())
+            if cur_area > target_area * (1.0 + area_tol):
+                scale = np.sqrt(target_area / cur_area)
+                for m in members:
+                    new_w = w2[m] * scale
+                    new_h = h2[m] * scale
+                    x2[m] = x2[m] + (w2[m] - new_w) / 2.0
+                    y2[m] = y2[m] + (h2[m] - new_h) / 2.0
+                    w2[m] = new_w
+                    h2[m] = new_h
+            continue
+        cur_area = w2[i] * h2[i]
+        if cur_area > areas[i] * (1.0 + area_tol):
+            scale = np.sqrt(areas[i] / cur_area)
+            new_w = w2[i] * scale
+            new_h = h2[i] * scale
+            x2[i] = x2[i] + (w2[i] - new_w) / 2.0
+            y2[i] = y2[i] + (h2[i] - new_h) / 2.0
+            w2[i] = new_w
+            h2[i] = new_h
+
+    # ---- accept/reject 安全閘門 ----
+    if count_overlaps(x2, y2, w2, h2) > 0:
+        if verbose:
+            print("compact_joint_convex: 解出來仍有重疊，回傳輸入不變")
+        return x, y, w, h
+
+    free_mask = ~preplaced_mask
+    area_err = np.abs(w2 * h2 - areas) / np.maximum(areas, 1e-9)
+    if np.any(area_err[free_mask] > area_tol):
+        if verbose:
+            print("compact_joint_convex: 面積誤差超出容忍度，回傳輸入不變")
+        return x, y, w, h
+
+    if preplaced_mask.any():
+        pp_ok = (np.allclose(x2[preplaced_mask], x[preplaced_mask], atol=1e-6) and
+                 np.allclose(y2[preplaced_mask], y[preplaced_mask], atol=1e-6) and
+                 np.allclose(w2[preplaced_mask], w[preplaced_mask], atol=1e-6) and
+                 np.allclose(h2[preplaced_mask], h[preplaced_mask], atol=1e-6))
+        if not pp_ok:
+            if verbose:
+                print("compact_joint_convex: preplaced block 被動到，回傳輸入不變")
+            return x, y, w, h
+
+    if outline_bbox is not None:
+        oxmin, oymin, oxmax, oymax = outline_bbox
+        ob_tol = 1e-4
+        if (x2.min() < oxmin - ob_tol or (x2 + w2).max() > oxmax + ob_tol or
+                y2.min() < oymin - ob_tol or (y2 + h2).max() > oymax + ob_tol):
+            if verbose:
+                print("compact_joint_convex: 超出 outline_bbox，回傳輸入不變")
+            return x, y, w, h
+
+    soft_before = compute_soft_violations(x, y, w, h, mib_group, cluster_group, boundary_code)
+    soft_after = compute_soft_violations(x2, y2, w2, h2, mib_group, cluster_group, boundary_code)
+    if soft_after["V_relative"] > soft_before["V_relative"] + 1e-9:
+        if verbose:
+            print("compact_joint_convex: V_relative 變差（{:.4f}->{:.4f}），"
+                  "回傳輸入不變".format(soft_before["V_relative"], soft_after["V_relative"]))
+        return x, y, w, h
+
+    area_before = (float((x + w).max() - x.min())) * (float((y + h).max() - y.min()))
+    area_after = (float((x2 + w2).max() - x2.min())) * (float((y2 + h2).max() - y2.min()))
+    if area_after > area_before * (1.0 + 1e-6):
+        if verbose:
+            print("compact_joint_convex: bbox 面積沒有真的縮小（{:.1f}->{:.1f}），"
+                  "回傳輸入不變".format(area_before, area_after))
+        return x, y, w, h
+
+    if verbose:
+        print("compact_joint_convex: 接受，bbox 面積 {:.1f} -> {:.1f}（{:+.2%}）".format(
+            area_before, area_after, area_after / area_before - 1.0))
+
+    return x2, y2, w2, h2
+
+
 # ============================================================
 # Legalization v3: LFF 風格的自由矩形（MAXRECTS）決定性單趟排布
 # ============================================================
@@ -3983,6 +4379,14 @@ def legalize_lff(
     # v5.35（實驗用，預設關閉）：見下方 use_atomic_group_placement 的
     # docstring 說明（在 `_attempt()` 內的說明區塊）。
     use_atomic_group_placement=False,
+    # v5.39（實驗用，預設關閉）：見 compact_joint_convex docstring 與呼叫處
+    # 說明。post-legalize 聯合形狀+位置凸優化壓縮，參考隊友團隊
+    # （ICCAD2026-Problem-C/diffusion-floorplanner）AREA_UTIL_SCREEN.md
+    # 的 M9 做法。
+    use_joint_compaction=False,
+    joint_compaction_ar_bound=8.0,
+    joint_compaction_area_tol=0.009,
+    joint_compaction_solver="CLARABEL",
     verbose=False,
 ):
     """
@@ -4851,6 +5255,31 @@ def legalize_lff(
                                        boundary_code=boundary_code, cluster_group=cluster_group,
                                        iters=seqpair_grouped_iters, seed=seqpair_grouped_seed,
                                        relax_boundary=seqpair_grouped_relax_boundary)
+
+    # ---- 聯合形狀+位置凸優化壓縮（v5.39，實驗用）----
+    # 參考隊友團隊 diffusion-floorplanner 的 M9 做法：前面所有 compact_*
+    # pass 要嘛只動位置（compact_positions/compact_reinsert/...），要嘛
+    # 只在放置當下選長寬比、放完就凍結形狀——沒有任何 pass 會在合法佈局
+    # 已經固定之後，同時重新考慮所有 block 的形狀「和」位置。這裡從目前
+    # 佈局抽取一個固定的 precedence 圖（不搜尋拓樸），對 (x,y,w,h) 做一次
+    # 全域凸優化聯合求解，只有零重疊、面積誤差在容差內、preplaced 不變、
+    # outline 不越界、V_relative 不變差、bbox_area 沒有變大時才採用，否則
+    # 原封不動退回輸入（見 compact_joint_convex docstring 的 6 點安全閘門）。
+    # 刻意放在 pipeline 最尾端、防禦性 hard_zero_overlap 之前：跟
+    # v4.9/v5.1/v5.26 一貫學到的教訓一樣，這是這條 pipeline 裡對幾何改動
+    # 幅度最大的一個 pass，最需要避免影響後面貪婪 pass 的起點。
+    if use_joint_compaction:
+        x, y, w, h = compact_joint_convex(x, y, w, h, areas,
+                                          preplaced_mask=preplaced_mask_ds,
+                                          fixed_mask=fixed_mask,
+                                          mib_group=mib_group,
+                                          cluster_group=cluster_group,
+                                          boundary_code=boundary_code,
+                                          outline_bbox=(oxmin, oymin, oxmax, oymax),
+                                          ar_bound=joint_compaction_ar_bound,
+                                          area_tol=joint_compaction_area_tol,
+                                          solver=joint_compaction_solver,
+                                          verbose=verbose)
 
     # ---- 保底驗證：理論上此時已經零重疊，這裡只是零成本的防禦性再確認 ----
     preplaced_idx_list = [i for i in range(k) if preplaced_mask_ds[i]]

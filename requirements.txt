@@ -1,0 +1,14 @@
+# ICCAD 2026 FloorSet Challenge - Requirements
+# Install: pip install -r requirements.txt
+
+torch>=2.0.0
+numpy>=1.24.0
+shapely>=2.0.0
+matplotlib>=3.7.0
+tqdm>=4.60.0
+requests>=2.28.0
+
+# Optional: only required if use_joint_compaction=True (utils.py:
+# compact_joint_convex, v5.39). Not imported at module load time, so the
+# rest of the codebase runs fine without it.
+cvxpy>=1.4.0

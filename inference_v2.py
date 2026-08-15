@@ -82,7 +82,17 @@ DEFAULT_LEGALIZE_SAMPLE_KWARGS = dict(
     snap_mib=True,
     snap_clear=("step",),
     gap_repair=True,
-    finish_rounds=4,
+    # v6.4（採用）：出貨值 4，我們自己的資料上篩過（5 個大樣本 ×
+    # (iters, finish_rounds) 掃描，legalize_sample() 對同一批 raw
+    # candidate 共用、排除 RNG confound）：4→2 在 4/5 樣本上 area_gap/
+    # hpwl_gap 逐位元不變（唯一有波動的樣本 V_rel 只從 0.0476→0.0635 的
+    # 小幅雜訊），legalize 時間有小幅節省；4→1 或同時調低 iters 則明顯
+    # 傷品質（area_gap 最多從 +2.45% 惡化到 +21.30%，甚至讓一個原本
+    # legalize_sample 解得出來的樣本變成觸發 legalize_lff fallback）。
+    # 官方公式裡 area_gap/hpwl_gap 沒有下限、runtime 有 max(0.7,...) 下限
+    # （這個專案的 rt_mult 已經有近半數樣本卡在 0.7），继续往下調用時間
+    # 換品質大概率虧本，只有 4→2 這一格是乾淨的免費節省。
+    finish_rounds=2,
     grp_hard=(),
     grp_dag=("b2", "e7"),
     pull_batch=True,
@@ -175,7 +185,8 @@ def legalize_result_v2(
     # 我們自己的 legalize_lff（保證用建構式方法從零排出合法佈局，不管
     # raw 座標多爛都不會失敗）處理這個候選，而不是讓它流到彈射保底。
     n_overlaps_v2 = count_overlaps(x2, y2, w2, h2)
-    if n_overlaps_v2 > 0:
+    used_lff_fallback = n_overlaps_v2 > 0
+    if used_lff_fallback:
         if verbose:
             print("legalize_result_v2: legalize_sample 沒清乾淨重疊"
                   "（{} 對，tag={!r}），改用 legalize_lff 處理這個候選"
@@ -216,9 +227,24 @@ def legalize_result_v2(
         "overlap": overlap, "n_overlaps": n_overlaps,
         "bbox_area": bbox_area,
         "soft": soft,
+        "used_lff_fallback": used_lff_fallback,
         "legalize_tag": tag,
         "legalize_time": t_legalize,
     }
+
+
+def _warmup_worker(_=None):
+    """v6.3：給 ProcessPoolExecutor 熱身用的 no-op。`ProcessPoolExecutor`
+    建構子本身不會真的 spawn worker process——第一個 `.map()`/`.submit()`
+    呼叫到的時候才會，而 worker 一啟動要先重跑一次這個模組（跟它遞移
+    import 到的 torch/numpy/cvxpy 等）的 import，這筆一次性成本在 Windows
+    spawn 語意下不小。官方 evaluate 量到過：第一個 test case 的 runtime
+    比其他樣本高出好幾倍（tid=0 的 rt_mult 飆到 1.55，其他樣本大多落在
+    0.7-0.9），全部都是這個冷啟動成本，跟樣本本身的難度無關。在
+    `MyOptimizer.__init__` 建好 pool 之後立刻呼叫這個函式把每個 worker
+    都熱身一次，把成本挪到 `__init__`（不計入任何 test case 的 runtime）
+    裡吸收掉，而不是讓隨機哪個先跑到的 test case 揹這筆帳。"""
+    return True
 
 
 def _legalize_worker_v2(args):

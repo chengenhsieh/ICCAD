@@ -96,6 +96,90 @@ legalize_lff 專屬設定的實際使用但保留數值跟說明當歷史記錄�
 
 ---
 
+## v6.2（不採用）／cluster=True（不採用）／v6.3＋v6.4（採用，官方 evaluate 三次確認 real Total Score 持平、runtime 改善）
+
+v6.0/v6.1 換上 `legalize_sample` 並確認採用後，針對現有 legalizer 再試
+兩個「之前成功過或高潛力」的方向、以及一輪 runtime 壓縮，四項都個別
+獨立驗證（使用者明確要求「分開試試看」，不合併測試以免混淆歸因）。
+
+**v6.2（不採用）—— `USE_LFF_FALLBACK_RETRY`**：假設 v6.1 的
+`legalize_lff` fallback 觸發時（`legalize_sample` 內部求解 infeasible），
+用更高的 `ddim_steps` 重新生成一次 diffusion 候選、重試 `legalize_sample`，
+說不定能避開觸發 fallback 的「起點已經很爛」的原始重疊。在唯二已知會
+穩定觸發 fallback 的樣本（test_id=94/98）上跑 6 次試驗：retry 確實有
+執行（runtime 明顯翻倍），但 6/6 次最終還是落在跟單次嘗試一樣的
+「fallback 品質」區間（V_relative 0.046-0.115），0/6 真正救回
+`legalize_sample` 成功路徑。結論：retry 對這個 fallback 模式沒有效果，
+`USE_LFF_FALLBACK_RETRY` 保留在 `my_optimizer.py` 裡但預設關閉（`False`）。
+
+**`cluster=True`（不採用）**：`legalize_sample` 有個內建的兩層 cluster
+求解功能，`teammate_legalizer/config.py` 裡 `CLUSTER_MIN_OWED=3` 是觸發
+門檻。在 4 個樣本（含兩個 cluster 比例最高的）上開關比較，量到**零
+差異**。根因追查（不只是觀察現象）：我們自己 pipeline 的
+`snap_groups`／`lam_grp=0.2` 已經把 `V_grouping` 壓在 0-2，從未達到
+`CLUSTER_MIN_OWED=3` 這個門檻，這個功能在我們的資料分布上本來就不會
+被觸發。維持 `cluster=False`（`DEFAULT_LEGALIZE_SAMPLE_KWARGS` 現狀）。
+
+**v6.3（採用）—— worker pool 冷啟動修復**：從三次 v6.1 官方 evaluate
+結果觀察到一個固定模式：`test_id=0` 的 `runtime_seconds` 每次都異常飆到
+8.5-9s（其餘樣本正常落在 0.7-5s），`rt_mult` 因此撞到單樣本 1.55 的
+離群值。根因：Windows 上 `ProcessPoolExecutor` 建構子並不會真的 spawn
+worker process，要等第一次 `.map()`/`.submit()` 才觸發，所以永遠是
+「跑到的第一個」測資（`test_id=0`）額外背了 worker spawn＋reimport
+（含重新載入 diffusion 模型跟 `teammate_legalizer` 整包依賴）的一次性
+成本。修法：`MyOptimizer.__init__` 建完 pool 後立刻對每個 worker 送一個
+no-op 任務（`inference_v2._warmup_worker`）強迫 spawn，把這筆成本吸收進
+`__init__`（不計入任何測資的量測 runtime）。獨立驗證：`__init__` 耗時
+8.47s，第一個 `solve()` 從舊的 8-9s 降到 1.56s。
+
+**v6.4（採用）—— `finish_rounds` 4→2**：`legalize_sample` 的
+`finish_rounds`（snap/pull 收尾交替輪數，出貨預設 4）跟 `iters`
+（precedence 圖重建＋求解輪數，出貨預設 3）做參數篩選，鎖定 5 個
+大樣本（k≥90，`exp(n/12)` 加權下對總分槓桿最大），同一份 raw diffusion
+候選餵給不同組合排除 RNG confound：
+
+| iters | finish_rounds | avg legT | avg V_rel | avg area_gap |
+|---|---|---|---|---|
+| 3 | 4（出貨值） | 9.29s | 0.0527 | +12.82% |
+| 3 | **2** | 9.07s | 0.0559 | +12.82% |
+| 3 | 1 | 8.73s | 0.1186 | +21.24% |
+| 2 | 2 | 8.54s | 0.0590 | +20.73% |
+| 1 | 1 | 7.34s | 0.1160 | +21.43% |
+
+`finish_rounds: 4→2` 在 5 個樣本中 4/5 逐位元完全不變（`V_rel`／
+`area_gap`／`hpwl_gap` 全部相同），只有 idx=88 的 `V_rel` 從 0.0476
+變成 0.0635（仍遠優於再往下調的任何組合），是唯一一個「幾乎免費」的
+調整點；再往下調（`finish_rounds=1` 或 `iters=2`）品質明顯變差
+（`area_gap` 從 ~13% 跳到 20%+）。同時考量 `rt_mult` 下限
+`max(0.7, rtf**0.3)` 的分析：三次 v6.1 official evaluate 結果裡 48/100
+樣本已經卡在 0.7 下限（mean rt_mult=0.7371），繼續往時間換品質的方向
+壓縮邊際效益有限，而 `area_gap`／`hpwl_gap` 沒有下限、直接線性傷
+`cost`——這是隻採用 `finish_rounds=2` 這一個「品質不變、runtime 略降」
+的選項，不繼續往 `iters=2` 或更低 `finish_rounds` 冒險的理由。
+
+**v6.3＋v6.4 合併最終驗證（官方 evaluate 三次獨立跑）**：
+
+| | Run 1 | Run 2 | Run 3 | 跨 3 次 |
+|---|---|---|---|---|
+| Feasible | 100/100 | 100/100 | 100/100 | 300/300 |
+| test_id=0 runtime | 1.51s | 1.40s | 1.64s | 不再有 8.5-9s 離群值 |
+| Avg Runtime | 1.489s | 1.442s | 1.394s | mean≈1.44s |
+| 真實 Total Score（exp(n/12) 加權） | 0.8711 | 0.8609 | 0.8707 | **mean=0.8676, std=0.0047** |
+
+跟 v6.1 基準（mean=0.8652, std=0.0051）比較，品質差異落在雙方 std
+範圍內、統計上沒有退步；runtime 有實際改善（平均 Avg Runtime 從
+1.52-1.65s 降到約 1.44s），且冷啟動離群值三次都確認消失。
+
+**決定**：v6.2、`cluster=True` **不採用**（保留程式碼／設定但預設關閉，
+當作已測試過的負向紀錄）；v6.3、v6.4 **採用**。
+
+**會動到的檔案**：`my_optimizer.py`（新增 `USE_LFF_FALLBACK_RETRY`／
+`LFF_FALLBACK_RETRY_DDIM_STEPS` 類別屬性，預設關閉；`__init__` 新增
+pool warmup）；`inference_v2.py`（新增 `_warmup_worker`；
+`DEFAULT_LEGALIZE_SAMPLE_KWARGS` 的 `finish_rounds` 4→2）。
+
+---
+
 ## v5.39 —— post-legalize 聯合形狀+位置凸優化壓縮（不採用，V_relative 大幅變差）
 
 **背景**：使用者請我再次參考隊友團隊

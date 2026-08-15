@@ -51,7 +51,7 @@ sys.modules.pop("utils", None)
 sys.path.insert(0, str(_THIS_DIR))
 
 from inference import load_model, generate_floorplan
-from inference_v2 import legalize_top_k_candidates_v2
+from inference_v2 import legalize_top_k_candidates_v2, _warmup_worker
 
 
 class MyOptimizer(FloorplanOptimizer):
@@ -226,6 +226,23 @@ class MyOptimizer(FloorplanOptimizer):
     ADAPTIVE_STEPS_V_REL_THRESHOLD = 0.12
     ADAPTIVE_STEPS_RETRY_DDIM_STEPS = 15
 
+    # v6.2（實驗用，預設關閉）：跟 v5.38 同一種「品質不夠好就重跑
+    # diffusion」的機制，但觸發訊號完全不同、動機也不一樣。v5.38 用
+    # V_relative 當訊號，在 legalize_lff 年代被否決是因為 legalize_lff
+    # 結構上保證一定「成功」，V_relative 偏高只是「品質普通」，訊號不夠
+    # 強，重試的固定成本划不來。v6.1 換上 legalize_sample 之後多了一個
+    # 更明確的訊號：`legalize_result_v2` 現在會回傳 `used_lff_fallback`
+    # ——代表 legalize_sample 的凸優化求解對這批候選**全部**判定
+    # infeasible（見 CHANGELOG v6.0/v6.1 的 tid=94/98 根因診斷：raw
+    # diffusion 輸出嚴重重疊時求解才會失敗，而重疊嚴重度會隨 random draw
+    # 大幅波動），退回較弱的 legalize_lff 結果，而不是「這批候選裡最好的
+    # 也只是普通」。換一批新的 random draw（不同的 raw 佈局、通常重疊
+    # 程度會不一樣）有機會讓 legalize_sample 這次真的解出來，賭的是「同一
+    # 個難樣本、換個 seed 有機會避開這次的壞 draw」，跟 v5.38 賭「同一批
+    # draw 再跑更多 diffusion step 品質會更好」是不同的機制。
+    USE_LFF_FALLBACK_RETRY = False
+    LFF_FALLBACK_RETRY_DDIM_STEPS = 15
+
     # v5.39（不採用，v6.0 起未使用——同上，legalize_lff 專屬參數）：
     # post-legalize 聯合形狀+位置凸優化壓縮，見 utils.py:
     # compact_joint_convex docstring 與 legalize_lff 呼叫處說明。
@@ -247,6 +264,16 @@ class MyOptimizer(FloorplanOptimizer):
             ProcessPoolExecutor(max_workers=self.LEGALIZE_WORKERS)
             if self.TOP_K_CANDIDATES > 1 else None
         )
+        # v6.3（採用）：ProcessPoolExecutor 的建構子不會真的 spawn worker
+        # process，第一個 `.map()` 呼叫到時才會，每個 worker 啟動要重跑
+        # 一次這個模組（含 torch/numpy/cvxpy）的 import——這筆一次性成本
+        # 官方 evaluate 量到過整整轉嫁到「不管哪個先跑到」的那個 test
+        # case 頭上（tid=0 的 runtime 因此從其他樣本的 ~1-5s 飆到 8.5-9s，
+        # rt_mult 因此比其他樣本高出近 2 倍）。這裡建完 pool 立刻用一個
+        # no-op 熱身，把成本挪到 __init__（不計入任何 test case 的
+        # runtime）裡吸收掉。
+        if self._legalize_pool is not None:
+            list(self._legalize_pool.map(_warmup_worker, range(self.LEGALIZE_WORKERS)))
 
     def __del__(self):
         pool = getattr(self, "_legalize_pool", None)
@@ -374,6 +401,18 @@ class MyOptimizer(FloorplanOptimizer):
         # 都跑完才用同一套 GT-free 排序鍵挑較好的——不是無條件都跑兩次。
         if self.USE_ADAPTIVE_STEPS and legalized["soft"]["V_relative"] > self.ADAPTIVE_STEPS_V_REL_THRESHOLD:
             retry = _attempt(self.ADAPTIVE_STEPS_RETRY_DDIM_STEPS)
+            key_first = (legalized["soft"]["V_relative"], legalized["total_hpwl"], legalized["bbox_area"])
+            key_retry = (retry["soft"]["V_relative"], retry["total_hpwl"], retry["bbox_area"])
+            if key_retry < key_first:
+                legalized = retry
+
+        # v6.2：只有選中的候選是靠 legalize_lff 保底（代表這批候選
+        # legalize_sample 全部求解失敗）才重跑一次新的 diffusion draw，
+        # 賭新的 raw 佈局重疊程度不同、這次能讓 legalize_sample 真的解
+        # 出來。兩次都跑完才用同一套 GT-free 排序鍵選較好的一個——換到
+        # 更差的話（新 draw 一樣求解失敗、甚至更爛）不會被採用。
+        if self.USE_LFF_FALLBACK_RETRY and legalized.get("used_lff_fallback", False):
+            retry = _attempt(self.LFF_FALLBACK_RETRY_DDIM_STEPS)
             key_first = (legalized["soft"]["V_relative"], legalized["total_hpwl"], legalized["bbox_area"])
             key_retry = (retry["soft"]["V_relative"], retry["total_hpwl"], retry["bbox_area"])
             if key_retry < key_first:

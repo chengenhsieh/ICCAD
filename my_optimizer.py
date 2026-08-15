@@ -10,18 +10,17 @@ Stage 1 (diffusion, diffusion.py / inference.py:generate_floorplan):
   candidates cost almost nothing), applies pin/grouping/repulsion/boundary
   forces during sampling, then a short physics-only "post-repel" phase.
 
-Stage 2 (legalize, utils.py:legalize_lff via inference.py:legalize_result):
-  Deterministic, single-pass, Less-Flexibility-First-style placement using
-  MAXRECTS free-rectangle bin packing with weighted-median (L1-optimal)
-  positioning per block. Guarantees, by construction:
-    - zero overlap between blocks
-    - preplaced blocks keep their exact position and shape
-    - fixed-shape blocks keep their exact shape
-    - all blocks stay within 1% of their target area
-    - all blocks stay within the pin-derived bounding box
-  Followed by compaction passes (compact_merge_clusters, compact_reinsert,
-  compact_positions) that reduce wasted space without ever being able to
-  reintroduce a hard-constraint violation.
+Stage 2 (legalize, teammate_legalizer/compaction.py:legalize_sample via
+inference_v2.py:legalize_result_v2):
+  v6.0（採用，見下方 MyOptimizer 類別 docstring 的完整說明）：改用隊友團隊
+  （ICCAD2026-Problem-C/diffusion-floorplanner）的正式 legalizer，取代原本
+  的 utils.py:legalize_lff。precedence 圖重建+求解跑 3 輪、grouping/
+  boundary 懲罰項直接在凸優化目標裡、求解完接一整串逐步驟都有
+  feasibility gate 的收尾 pass（snap_groups/pull_boundary/
+  snap_mib_shapes/gap_repair）。保證零重疊、preplaced/fixed-shape
+  不可變、面積在 1% 容差內——跟舊版 legalize_lff 同一組 hard constraint
+  保證，只是換了一套演算法達成。舊版 legalize_lff 保留在 utils.py／
+  inference.py 內未刪除，只是不再是這裡的預設路徑。
 """
 
 import os
@@ -51,12 +50,35 @@ from iccad2026_evaluate import FloorplanOptimizer
 sys.modules.pop("utils", None)
 sys.path.insert(0, str(_THIS_DIR))
 
-from inference import load_model, generate_floorplan, legalize_top_k_candidates
+from inference import load_model, generate_floorplan
+from inference_v2 import legalize_top_k_candidates_v2
 
 
 class MyOptimizer(FloorplanOptimizer):
-    """Diffusion-generate + LFF-legalize floorplanning optimizer."""
+    """Diffusion-generate + legalize（隊友 legalize_sample）floorplanning optimizer."""
 
+    # v6.0（採用）：legalize 步驟從 utils.py 自己的 legalize_lff 改成隊友
+    # 團隊（ICCAD2026-Problem-C/diffusion-floorplanner）的正式 legalizer
+    # `teammate_legalizer/compaction.py:legalize_sample`（vendor 進來的
+    # 未修改原始碼，見 teammate_legalizer/README.md）。跟已經否決的 v5.39
+    # （compact_joint_convex，只 port 了單次凸優化核心、V_relative 反而
+    # 大幅變差）不是同一件事——這次用的是完整出貨版本：precedence 圖
+    # 重建+求解跑 3 輪、grouping/boundary 懲罰項直接寫進凸優化目標、求解
+    # 完接一整串逐步驟都有 feasibility gate 的收尾 pass（snap_groups/
+    # pull_boundary/snap_mib_shapes/gap_repair）。
+    #
+    # 驗證（inference_v2.py + 100 樣本配對比較，production 等價設定：
+    # DDIM_STEPS=10/N_SAMPLES=14，兩邊都套用 TOP_K_CANDIDATES=5 的
+    # legalize-then-select，不是只比較單一候選）：real_cost 1.3143→
+    # 1.0400（-20.87%），96/100 勝、4/100 負（負的樣本裡有 2 個是隊友
+    # 文件自己記載的「約 1/100 凸求解 infeasible、退回較弱結果」的已知
+    # 邊界案例），0/100 infeasible（兩邊都是）。平均 V_relative
+    # 0.0836→0.0238。詳見 CHANGELOG.md。
+    #
+    # 舊版 legalize_lff／legalize_top_k_candidates（utils.py／
+    # inference.py）保留未刪除，只是不再是這裡呼叫的路徑——如果之後想
+    # 切回來或做 A/B，程式碼還在。
+    #
     # Config validated on the 100-sample validation set -- see method.md
     # sections 2.2 (v4.7 legalize-side cluster merge) and 2.1 (v5.0
     # diffusion-side force-strength tuning). ~2.5s/sample avg, 0/100
@@ -88,14 +110,16 @@ class MyOptimizer(FloorplanOptimizer):
     # 1.1807 / 1.1577，平均 1.1692，比純 DDIM_STEPS=10 的 1.178 再進步
     # 約 -0.75%，0/100 infeasible。見 CHANGELOG.md v5.16。
     POST_REPEL_STEPS = 10
-    # v5.17（採用）：legalize 的 compact_reinsert 搜尋強度
-    # （reinsert_sweeps/reinsert_grid_density，原預設 3/12）。34 樣本
-    # 分層抽樣：真實資料上第一輪就幾乎收斂，area_gap/hpwl_gap 在所有測試
-    # 組合下完全不變，grid_density 降到 4 以下 real cost 打平（不再有額外
-    # 好處也沒有壞處）。選 sweeps=1/grid_density=4，完整 100 樣本官方
-    # evaluate 確認兩次（在 v5.15+v5.16 之上疊加）：real score 1.1381 /
-    # 1.1174，平均 1.128，比 v5.16 的 1.1692 再進步約 -3.5%，0/100
-    # infeasible。見 CHANGELOG.md v5.17。
+    # v5.17（採用，v6.0 起未使用——legalize_lff 專屬參數，legalize_sample
+    # 沒有對應概念。保留數值跟說明供之後若切回 legalize_lff 或做 A/B 用）：
+    # legalize 的 compact_reinsert 搜尋強度（reinsert_sweeps/
+    # reinsert_grid_density，原預設 3/12）。34 樣本分層抽樣：真實資料上
+    # 第一輪就幾乎收斂，area_gap/hpwl_gap 在所有測試組合下完全不變，
+    # grid_density 降到 4 以下 real cost 打平（不再有額外好處也沒有壞處）。
+    # 選 sweeps=1/grid_density=4，完整 100 樣本官方 evaluate 確認兩次
+    # （在 v5.15+v5.16 之上疊加）：real score 1.1381 / 1.1174，平均
+    # 1.128，比 v5.16 的 1.1692 再進步約 -3.5%，0/100 infeasible。見
+    # CHANGELOG.md v5.17。
     REINSERT_SWEEPS = 1
     REINSERT_GRID_DENSITY = 4
     # v5.0: 100-sample quasi-paired sweep found the hardcoded force-guidance
@@ -142,8 +166,9 @@ class MyOptimizer(FloorplanOptimizer):
     REPAINT_RESAMPLE_STEPS = 1
     # v5.31（不採用，見 CHANGELOG.md）：post-repel 階段加入 grouping force。
     POST_REPEL_GROUPING = False
-    # v5.34（不採用，見 CHANGELOG.md）：compact_merge_cluster_groups
-    # 擴大候選搬移搜尋範圍，疊加 v5.33 的 cost-aware 閘門。
+    # v5.34（不採用，v6.0 起未使用——同上，legalize_lff 專屬參數）：
+    # compact_merge_cluster_groups 擴大候選搬移搜尋範圍，疊加 v5.33 的
+    # cost-aware 閘門。
     USE_EXPANDED_SEARCH = False
     EXPANDED_SEARCH_MAX_PAIRS = 20
     USE_COST_AWARE_GATE = False
@@ -201,9 +226,9 @@ class MyOptimizer(FloorplanOptimizer):
     ADAPTIVE_STEPS_V_REL_THRESHOLD = 0.12
     ADAPTIVE_STEPS_RETRY_DDIM_STEPS = 15
 
-    # v5.39（實驗用，預設關閉）：post-legalize 聯合形狀+位置凸優化壓縮，
-    # 見 utils.py: compact_joint_convex docstring 與 legalize_lff 呼叫處
-    # 說明。
+    # v5.39（不採用，v6.0 起未使用——同上，legalize_lff 專屬參數）：
+    # post-legalize 聯合形狀+位置凸優化壓縮，見 utils.py:
+    # compact_joint_convex docstring 與 legalize_lff 呼叫處說明。
     USE_JOINT_COMPACTION = False
     JOINT_COMPACTION_AR_BOUND = 8.0
     JOINT_COMPACTION_AREA_TOL = 0.009
@@ -268,6 +293,18 @@ class MyOptimizer(FloorplanOptimizer):
             gt_x[preplaced_mask] = tp[preplaced_mask, 0]
             gt_y[preplaced_mask] = tp[preplaced_mask, 1]
 
+        # -- target_ll for legalize_sample()：跟上面 gt_x/gt_y/gt_w/gt_h
+        #    同一份 target_positions、同一組 mask，只是打包成隊友
+        #    legalize_sample() 要的 [N,4]=[x,y,w,h] 格式（-1=free；
+        #    preplaced 帶完整 (x,y,w,h)；fixed-shape 只帶 (_,_,w,h)）——
+        #    這正是 target_positions 本來的 schema，不需要另外重建。
+        target_ll = np.full((k, 4), -1.0, dtype=np.float64)
+        if target_positions is not None:
+            target_ll[fixed_mask, 2] = tp[fixed_mask, 2]
+            target_ll[fixed_mask, 3] = tp[fixed_mask, 3]
+            target_ll[preplaced_mask, 0] = tp[preplaced_mask, 0]
+            target_ll[preplaced_mask, 1] = tp[preplaced_mask, 1]
+
         # -- b2b connectivity -> dense weight matrix --
         W_int = np.zeros((k, k), dtype=np.float32)
         if b2b_connectivity is not None and len(b2b_connectivity) > 0:
@@ -299,33 +336,10 @@ class MyOptimizer(FloorplanOptimizer):
             canvas_h = float(np.sqrt(total_area / aspect) * slack)
             x_offset = (px_min + px_max) / 2.0 - canvas_w / 2.0
             y_offset = (py_min + py_max) / 2.0 - canvas_h / 2.0
-            outline_bbox = (px_min, py_min, px_max, py_max)
         else:
             canvas_w = canvas_h = float(np.sqrt(total_area))
             x_offset = y_offset = 0.0
-            outline_bbox = None
 
-        legalize_kwargs = dict(
-            preplaced_mask=preplaced_mask,
-            fixed_mask=fixed_mask,
-            mib_group=mib_group,
-            cluster_group=cluster_group,
-            boundary_code=boundary_code,
-            outline_bbox=outline_bbox,
-            use_second_merge_pass=True,
-            use_cluster_merge=True,
-            hpwl_slack_ratio=5.0,
-            use_expanded_search=self.USE_EXPANDED_SEARCH,
-            expanded_search_max_pairs=self.EXPANDED_SEARCH_MAX_PAIRS,
-            use_cost_aware_gate=self.USE_COST_AWARE_GATE,
-            reinsert_sweeps=self.REINSERT_SWEEPS,
-            reinsert_grid_density=self.REINSERT_GRID_DENSITY,
-            use_joint_compaction=self.USE_JOINT_COMPACTION,
-            joint_compaction_ar_bound=self.JOINT_COMPACTION_AR_BOUND,
-            joint_compaction_area_tol=self.JOINT_COMPACTION_AREA_TOL,
-            joint_compaction_solver=self.JOINT_COMPACTION_SOLVER,
-            verbose=self.verbose,
-        )
         n_cand = max(1, self.TOP_K_CANDIDATES)
 
         def _attempt(ddim_steps):
@@ -346,8 +360,10 @@ class MyOptimizer(FloorplanOptimizer):
                 use_self_cond=self.USE_SELF_COND,
                 post_repel_grouping=self.POST_REPEL_GROUPING,
             )
-            return legalize_top_k_candidates(
-                all_results[:n_cand], legalize_kwargs, areas, W_int, p2b_edges, pins_np,
+            return legalize_top_k_candidates_v2(
+                all_results[:n_cand], areas, W_int, p2b_edges, pins_np,
+                preplaced_mask, fixed_mask, mib_group, cluster_group, boundary_code,
+                target_ll,
                 n_workers=self.LEGALIZE_WORKERS, executor=self._legalize_pool,
             )
 

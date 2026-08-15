@@ -6,6 +6,96 @@
 
 ---
 
+## v6.0/v6.1 —— 正式改用隊友的 legalizer（`legalize_sample`）取代 `legalize_lff`（採用，官方 evaluate 三次確認 real Total Score -23%）
+
+**背景**：v5.39 只 port 了隊友團隊（ICCAD2026-Problem-C/diffusion-floorplanner）
+legalizer 裡「單次凸優化」這個最小核心，套用在我們自己已經跑完
+`legalize_lff` 全部壓縮 pass 之後的成品上，結果 `V_relative` 大幅變差、
+不採用。使用者接著請我看看能不能直接把隊友完整的 legalizer 拿來用
+（而不是只 port 核心演算法），先新增獨立的 `inference_v2.py`（不動
+`my_optimizer.py`）驗證可行性。
+
+**實作**：把隊友的 `diffusion_floorplanner/{compaction,config,scoring,
+energy,canvas}.py` 原封不動 vendor 進 `teammate_legalizer/`（`energy.py`／
+`canvas.py` 是後來才發現的隱性依賴——`compaction.py` 在函式內部才
+`from .energy import grouping_components`，靜態掃 import 掃不到，第一次
+真的跑 `legalize_sample()` 才炸出 `ModuleNotFoundError`）。`inference_v2.py`
+新增 `legalize_result_v2`（把我們的 schema 轉成 `legalize_sample()` 要的
+`[cx,cy,w,h]` 中心點座標＋`target_ll`，legalize 完轉回我們自己的
+result dict，重新用我們自己的 `compute_soft_violations` 等函式算所有
+指標，不信任對方回傳的 tag）跟 `legalize_top_k_candidates_v2`（跟
+`inference.py` 的 `legalize_top_k_candidates` 同一套 `ProcessPoolExecutor`
+平行化＋GT-free 選擇鍵，只是每個候選改用 `legalize_result_v2`）。
+
+**驗證第一階段（`inference_v2.py` 獨立跑，`compare_lff_vs_v2_100_production.py`
+腳本）**：一開始誤用非 production 設定（`ddim_steps=100/n_samples=6`、
+只 legalize 單一候選）比較，baseline 數字（1.4551）比記憶中的 production
+分數（~1.12-1.18）差一大截，發現後改用真正 production 等價設定
+（`DDIM_STEPS=10/N_SAMPLES=14`，兩邊都套用 `TOP_K_CANDIDATES=5` 的
+legalize-then-select）重跑：100 樣本 real_cost baseline=1.3143→
+v2=1.0400（**-20.87%**），96/100 樣本勝、0/100 infeasible——看起來是
+這個 session 目前最大的一次改善。
+
+**直接改 `my_optimizer.py`（使用者明確要求：不新建檔案）**：`solve()`
+的 legalize 步驟從 `legalize_top_k_candidates`（`legalize_lff`）換成
+`legalize_top_k_candidates_v2`；`target_ll` 直接沿用 `target_positions`
+參數（逐位元比對過，跟 GT 重建出來的版本完全一致，不是另外的資料
+來源）。第一次跑官方 `iccad2026_evaluate.py --evaluate` **馬上踩到嚴重
+問題**：100/100 technically feasible，但換算真實 median runtime 後的
+real Total Score 從本地驗證預期的 ~1.04 惡化成 **3.3738**——追查發現
+兩個大樣本（test_id=94 k=115、test_id=98 k=119）real_cost 飆到 18.4／
+22.9，座標裡有 60+ 個 block 被排成一直線疊在遠處。
+
+**根因**（`diagnose_verbose_tid94.py` 逐一序列、`verbose=True` 重現）：
+這兩個樣本無論換哪個 random seed，raw diffusion 輸出都嚴重重疊
+（~90 對），`legalize_sample()` 的凸優化求解**每次**都判定
+infeasible（precedence 圖矛盾——隊友自己文件描述的失敗模式：某個可動
+block 同時被要求在某個 preplaced 錨點左邊又要在右邊），退回「幾乎
+原封不動的輸入」（`tag='fallback (solve infeasible)'`），而這個輸入
+還有幾十對重疊，遠超我們自己 `_guarantee_zero_overlap` 正常迭代式修復
+能處理的量級，逼得它的最後一道絕對保底（強制彈射）把幾十個 block 硬
+搬到遠處清掉重疊，佈局整個報廢。這不是接線 bug（`target_ll` 逐位元比對
+確認一致），是 `legalize_sample()` 本身的已知限制，剛好在我們自己
+diffusion 模型（跟隊友自己模型的輸出特性不同）產生的「起點已經很爛」
+的樣本上被踩到——先前本地驗證每個樣本只試了一個 seed，剛好在這兩個
+樣本上運氣好抽到求解成功的那次，沒有踩到。
+
+**v6.1 修法**：`legalize_result_v2` 偵測到 `legalize_sample()` 沒能把
+重疊清乾淨（`count_overlaps > 0`）時，不讓它流到粗暴的彈射保底，直接
+改用我們自己的 `legalize_lff`（保證用建構式方法從零排出合法佈局，不管
+raw 座標多爛都不會失敗）處理那一個候選。修法後同一個 idx=94、同樣
+10/10 次重跑全部正確 fallback，`V_relative` 從 0.92-0.95 降到
+0.06-0.11，`bbox_area` 從 127K-151K 縮回正常的 44.7K-45.1K。
+
+**最終驗證（官方 evaluate 三次獨立跑）**：
+
+| | Run 1 | Run 2 | Run 3 | 跨 3 次 |
+|---|---|---|---|---|
+| Feasible | 100/100 | 100/100 | 100/100 | 300/300 |
+| 真實 real_cost 平均 | 0.8172 | 0.8122 | 0.8163 | mean=0.8152, std=0.0022 |
+| 真實 Total Score（exp(n/12) 加權） | 0.8713 | 0.8653 | 0.8589 | **mean=0.8652, std=0.0051** |
+
+三次都 100/100 feasible、零離群值，變異度（std=0.0051）比這個專案
+自己歷史上量到的 baseline 跑跑差異（~0.0104-0.0296）還小。
+
+**決定**：**採用**。real Total Score 平均 0.8652，比歷史 v4 baseline
+（~1.128）好約 **23%**，且三次跑高度穩定。`legalize_lff`／
+`legalize_top_k_candidates`（`utils.py`／`inference.py`）保留未刪除，
+只是不再是 `my_optimizer.py` 呼叫的路徑；`legalize_result_v2` 裡的
+`legalize_lff` fallback 分支正是靠它們兜底，兩者互補才是最終真正生效
+的架構，不是單純二選一。
+
+**會動到／新增的檔案**：`teammate_legalizer/`（新增，vendor
+`compaction.py`/`config.py`/`scoring.py`/`energy.py`/`canvas.py`，
+`README.md` 記錄來源 commit）；`inference_v2.py`（新增，
+`legalize_result_v2`／`legalize_top_k_candidates_v2`／
+`_legalize_worker_v2`／`run_one_sample_v2`）；`my_optimizer.py`
+（`solve()` 的 legalize 步驟改接 `legalize_top_k_candidates_v2`，
+`target_ll` 取代原本的 `legalize_kwargs`／`outline_bbox`，移除
+legalize_lff 專屬設定的實際使用但保留數值跟說明當歷史記錄）。
+
+---
+
 ## v5.39 —— post-legalize 聯合形狀+位置凸優化壓縮（不採用，V_relative 大幅變差）
 
 **背景**：使用者請我再次參考隊友團隊

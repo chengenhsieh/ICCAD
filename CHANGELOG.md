@@ -6,6 +6,60 @@
 
 ---
 
+## v6.5 —— `legalize_sample` 的 frozen-topology wirelength re-solve（不採用）
+
+v6.0/v6.1 換上 `legalize_sample` 之後，找還沒接上的功能裡有沒有能再壓
+real Total Score 的地方，查了 `teammate_legalizer/compaction.py` 跟
+`config.py` 的原始碼／inline 開發筆記，發現：
+
+- `legalize_sample` 的主凸優化目標只 minimize `W + H`（bounding box），
+  完全不管 wire。他們自己筆記記載過兩個更早的 wirelength 手段（H3
+  `sep_net`、J1 `priced_hpwl`）在他們自己資料上量到 hpwl_gap 移動
+  「~0」，結構性沒用。
+- 真正把 HPWL 放進目標函式的是 H5/H6「frozen-topology wirelength-only
+  re-solve」（`resolve=('hpwl@eps',)` 參數，`eps`=允許 outline 周長變大
+  的比例，`hpwl_nets=(b2b_conn, p2b_conn, pins_pos)` 提供官方口徑的
+  wirelength），而且是「有 priced acceptance test 把關的候選」，理論上
+  不會讓結果變差，只會「有時更好或持平」。我們的 production 設定原本
+  三個入口（`grp_hard`/`cluster`/`resolve`）都是關的，這個把關機制其實
+  從沒被觸發過。
+
+**實作**：`inference_v2.py` 的 `legalize_result_v2`／
+`legalize_top_k_candidates_v2`／`_legalize_worker_v2` 加一個 `hpwl_nets`
+參數（**必須是 contest 原始 edge-list 格式**，不是我們自己算
+`compute_hpwl_vectorized` 用的 `W_int` 矩陣——`scoring.py` 的
+`v10_total_hpwl` docstring 警告過用 `W_int`／model 的
+`edge_index_full` 重建會因為對稱化/去重複跟官方口徑對不上），預設
+`None`、不影響現有行為。
+
+**驗證（5 個大樣本，同一份 raw diffusion candidate 餵給三種設定排除
+RNG confound）**：
+
+| 設定 | avg hpwl_gap | avg area_gap | avg V_rel | avg legT |
+|---|---|---|---|---|
+| baseline（`resolve=()`） | +10.48% | +11.04% | 0.0509 | 8.06s |
+| `hpwl@0.0` | +10.48%（**逐位元不變**） | +11.04% | 0.0509 | 10.32s（+28%） |
+| `hpwl@0.02` | +10.94%（**變差**） | +16.85%（**明顯變差**） | 0.0541（變差） | 10.69s |
+
+`hpwl@0.0`（不准 outline 變大）5 個樣本中候選從未被接受測試選中，輸出
+跟不接完全一樣，只是白白多花約 28% legalize 時間。`hpwl@0.02`（准
+outline 周長多長 2%）在 2/5 樣本觸發並被接受，但都是用 area_gap 換
+hpwl_gap 換得不划算（idx=88 甚至兩者同時變差），平均下來連 hpwl_gap
+本身都沒有變好。這正好對應他們自己筆記警告過的陷阱（wirelength 目標在
+outline cap 下拿 area_gap 換 hpwl_gap，代價換算約 100 倍不划算），也
+符合這個專案的既有教訓（v5.39）——移植隊友程式碼裡的功能不保證在我們
+自己 diffusion 模型的輸出分布上一樣有效。
+
+**決定**：**不採用**。`hpwl_nets` 接線保留（預設 `None`，行為零改變），
+`DEFAULT_LEGALIZE_SAMPLE_KWARGS` 維持 `resolve=()` 不變。
+
+**會動到的檔案**：`inference_v2.py`（新增 `hpwl_nets` 參數，
+`legalize_result_v2`／`legalize_top_k_candidates_v2`／
+`_legalize_worker_v2` 三處），`my_optimizer.py` 未變動（沒有接上這個
+關閉中的功能）。
+
+---
+
 ## v6.0/v6.1 —— 正式改用隊友的 legalizer（`legalize_sample`）取代 `legalize_lff`（採用，官方 evaluate 三次確認 real Total Score -23%）
 
 **背景**：v5.39 只 port 了隊友團隊（ICCAD2026-Problem-C/diffusion-floorplanner）

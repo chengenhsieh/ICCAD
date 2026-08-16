@@ -117,6 +117,7 @@ def legalize_result_v2(
     mib_group, cluster_group, boundary_code,
     opt_target_pos,
     verbose=True,
+    hpwl_nets=None,
     **legalize_kwargs
 ):
     """
@@ -134,6 +135,19 @@ def legalize_result_v2(
     compute_soft_violations/total_overlap/count_overlaps 重新算所有指標
     ——不信任 legalize_sample 內部算好的東西或它回傳的 tag 字串，確保
     跟這個專案其他地方的報告/評分口徑一致。
+
+    hpwl_nets（v6.5 實驗用，預設 None=不啟用，行為與之前 bit-for-bit
+    相同）：`(b2b_conn_raw, p2b_conn_raw, pins_pos_raw)` 三元組，**必須是
+    contest 原始 edge-list 格式**（`[i, j, weight]`，-1 padding），不是我們
+    自己算 compute_hpwl_vectorized 用的 W_int 矩陣——teammate_legalizer
+    自己的文件警告過用 W_int 或 model 的 edge_index_full 重建會因為
+    對稱化/去重複導致權重跟官方 scorer 對不上（見 scoring.py
+    v10_total_hpwl 的 docstring）。傳了這個之後 legalize_sample 內部的
+    候選接受測試（B8）會把 HPWL 也一起定價（不只 area），並且如果
+    legalize_kwargs 裡的 `resolve` 包含 'hpwl'/'both'，會多做一次
+    frozen-topology 的 wirelength-only 凸求解（H5/H6，見
+    teammate_legalizer/config.py 裡的說明），這個候選跟其他候選一樣要
+    通過定價測試才會被採用，不會讓結果變差。
     """
     x, y, w, h = best["x"], best["y"], best["w"], best["h"]
     k = len(x)
@@ -155,6 +169,7 @@ def legalize_result_v2(
         pos_ll, tag = legalize_sample(
             coords, is_pp, is_fs, area_target, target_ll,
             mib=mib, grouping=grouping, boundary=boundary,
+            hpwl_nets=hpwl_nets,
             **kwargs
         )
     except Exception as e:
@@ -253,20 +268,21 @@ def _legalize_worker_v2(args):
     全部是純 Python/numpy/cvxpy，不碰 torch/CUDA，丟到獨立行程跑安全。"""
     cand, fixed_args, legalize_kwargs = args
     (areas, W_int, p2b_edges, pins_pos, preplaced_mask, fixed_mask,
-     mib_group, cluster_group, boundary_code, target_ll) = fixed_args
+     mib_group, cluster_group, boundary_code, target_ll, hpwl_nets) = fixed_args
     kw = dict(legalize_kwargs)
     kw["verbose"] = False
     return legalize_result_v2(
         cand, areas, W_int, p2b_edges, pins_pos,
         preplaced_mask, fixed_mask, mib_group, cluster_group, boundary_code,
-        target_ll, **kw
+        target_ll, hpwl_nets=hpwl_nets, **kw
     )
 
 
 def legalize_top_k_candidates_v2(candidates, areas, W_int, p2b_edges, pins_pos,
                                   preplaced_mask, fixed_mask, mib_group, cluster_group,
                                   boundary_code, target_ll,
-                                  legalize_kwargs=None, n_workers=1, executor=None):
+                                  legalize_kwargs=None, n_workers=1, executor=None,
+                                  hpwl_nets=None):
     """跟 inference.py 的 legalize_top_k_candidates 同一套原則跟同一套
     GT-free 選擇鍵（V_relative, total_hpwl, bbox_area）——只是每個候選
     改用 legalize_result_v2（隊友的 legalize_sample）legalize，不是
@@ -283,7 +299,7 @@ def legalize_top_k_candidates_v2(candidates, areas, W_int, p2b_edges, pins_pos,
     """
     legalize_kwargs = legalize_kwargs or {}
     fixed_args = (areas, W_int, p2b_edges, pins_pos, preplaced_mask, fixed_mask,
-                  mib_group, cluster_group, boundary_code, target_ll)
+                  mib_group, cluster_group, boundary_code, target_ll, hpwl_nets)
 
     if n_workers <= 1 or len(candidates) <= 1:
         best, best_key = None, None
@@ -291,7 +307,7 @@ def legalize_top_k_candidates_v2(candidates, areas, W_int, p2b_edges, pins_pos,
             leg = legalize_result_v2(
                 cand, areas, W_int, p2b_edges, pins_pos,
                 preplaced_mask, fixed_mask, mib_group, cluster_group, boundary_code,
-                target_ll, verbose=False, **legalize_kwargs)
+                target_ll, verbose=False, hpwl_nets=hpwl_nets, **legalize_kwargs)
             s = leg["soft"]
             key = (s["V_relative"], leg["total_hpwl"], leg["bbox_area"])
             if best_key is None or key < best_key:

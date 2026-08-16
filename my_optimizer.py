@@ -145,6 +145,20 @@ class MyOptimizer(FloorplanOptimizer):
     # 最佳（調高讓 V_relative 變差），無變動。
     BOUNDARY_NUDGE_STRENGTH = 0.025
     REPULSION_STRENGTH = 0.0375
+    # v6.6（實驗用，預設關閉，見 diffusion.py: _force_wirelength
+    # docstring／CHANGELOG.md）：現有四個力（pin/grouping/repulsion/
+    # boundary）都跟 b2b 連線權重無關，wirelength 完全交給模型自己學到
+    # 的訊號；`legalize_sample` 主目標只 minimize W+H，事後也補不回來
+    # （見 v6.5，wirelength-aware legalize 沒有效果）。新增一個依連線
+    # 權重把 block 拉向鄰居加權中心的力，inference-time guidance、不用
+    # 重新訓練模型（跟 "Chip Placement with Diffusion Models"，
+    # arXiv:2407.12282 的做法同一個精神）。**不採用**（見 CHANGELOG v6.6）：
+    # 6 樣本篩選看到 area/hpwl 隨強度改善但 V_relative 抵銷掉大半好處
+    # （淨效果 -0.9%~-1%），擴大到 20 樣本後訊號沒撐住（逐樣本勝敗接近
+    # 50/50），且 strength=0.08 在 20 樣本裡新增 2 個 legalize_sample
+    # fallback 觸發（idx=75 原本正常，加了這個力才觸發）、idx=90 出現
+    # 單樣本嚴重暴走。0.0 = 跟改動前完全等價，維持關閉。
+    WIRELENGTH_FORCE_STRENGTH = 0.0
     # v5.12（不採用，見 CHANGELOG.md）：純推論端，force 強度乘上
     # alpha_bar_t**power，讓每個力剛進窗口時弱、隨 x0_pred 信心平滑增強到滿
     # 強度。100 樣本 paired 測試 power=1.0 四項指標同向變好、但幅度小
@@ -382,6 +396,7 @@ class MyOptimizer(FloorplanOptimizer):
                 grouping_force_strength=self.GROUPING_FORCE_STRENGTH,
                 boundary_nudge_strength=self.BOUNDARY_NUDGE_STRENGTH,
                 repulsion_strength=self.REPULSION_STRENGTH,
+                wirelength_force_strength=self.WIRELENGTH_FORCE_STRENGTH,
                 force_confidence_power=self.FORCE_CONFIDENCE_POWER,
                 repaint_resample_steps=self.REPAINT_RESAMPLE_STEPS,
                 use_self_cond=self.USE_SELF_COND,

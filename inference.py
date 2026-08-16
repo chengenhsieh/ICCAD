@@ -108,6 +108,10 @@ def generate_floorplan(
     grouping_force_strength=0.030,
     boundary_nudge_strength=0.025,
     repulsion_strength=0.0375,
+    # v6.6: 純推論端實驗，只用於 ddim 分支——見 diffusion.py:
+    # ddim_sample_with_forces / _force_wirelength docstring。預設 0.0 =
+    # 關閉，跟改動前完全等價。
+    wirelength_force_strength=0.0,
     # v5.12: 純推論端實驗，只用於 ddim 分支——見 diffusion.py:
     # ddim_sample_with_forces 的 force_confidence_power docstring。
     # 預設 0.0 = 關閉，跟改動前完全等價。
@@ -389,6 +393,8 @@ def generate_floorplan(
             grouping_force_strength=grouping_force_strength,
             boundary_nudge_strength=boundary_nudge_strength,
             repulsion_strength=repulsion_strength,
+            wirelength_force_strength=wirelength_force_strength,
+            wirelength_until_t=int(30 * _t_scale),
             force_confidence_power=force_confidence_power,
             resample_temperature=resample_temperature,
             repaint_resample_steps=repaint_resample_steps,

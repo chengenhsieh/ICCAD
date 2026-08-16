@@ -670,6 +670,41 @@ class GaussianDiffusion:
         return torch.stack([dx, dy], dim=-1)               # (B, N, 2)
 
     @torch.no_grad()
+    def _force_wirelength(self, x, conn_weights, mask, strength=0.0):
+        """
+        Wirelength Force（v6.6，實驗用，strength=0.0 時完全不啟用）：跟
+        `_force_grouping` 同一個「拉向鄰居加權中心」設計，只是鄰居集合
+        從離散的 group membership 換成連續的 b2b 連線權重
+        （`conn_weights`，model 本來就用來 condition 的同一份 (B,N,N)
+        矩陣，不需要另外傳資料）——概念對應 "Chip Placement with Diffusion
+        Models"（arXiv:2407.12282）的 inference-time guidance：不重新
+        訓練模型，只在 sampling 過程中依連線關係直接引導佈局往低 HPWL
+        方向走，動機是現有四個力（pin/grouping/repulsion/boundary）裡
+        沒有一個對 b2b 連線權重敏感，wirelength 完全交給模型自己學到的
+        訊號，legalize 階段（`legalize_sample` 主目標只 minimize W+H，
+        見 v6.5 CHANGELOG）也證實不會事後補救。
+
+        target_x[i] = sum_j(w_ij * cx_j) / sum_j(w_ij)（等同以連線權重
+        為權重的鄰居中心），沒有任何連線的 block（sum_j w_ij == 0）不
+        受力。
+        """
+        if conn_weights is None or strength == 0.0:
+            return None
+        m = mask
+        w = conn_weights * (m.unsqueeze(1) * m.unsqueeze(2))     # (B, N, N)，非法 pair 歸零
+        wsum = w.sum(dim=2)                                      # (B, N)
+        if float(wsum.sum()) <= 0.0:
+            return None
+        cx = x[:, :, 0]
+        cy = x[:, :, 1]
+        target_x = (w * cx.unsqueeze(1)).sum(dim=2) / wsum.clamp(min=1e-8)
+        target_y = (w * cy.unsqueeze(1)).sum(dim=2) / wsum.clamp(min=1e-8)
+        has_edge = (wsum > 0).float() * m
+        dx = (target_x - cx) * strength * has_edge
+        dy = (target_y - cy) * strength * has_edge
+        return torch.stack([dx, dy], dim=-1)                      # (B, N, 2)
+
+    @torch.no_grad()
     def _force_boundary_nudge(self, x, boundary_code, mask, areas, strength=0.05):
         """
         Boundary Nudge：對有 boundary 約束的 block，往「當前 layout bbox 邊」推。
@@ -884,11 +919,17 @@ class GaussianDiffusion:
         grouping_force_strength=0.015,
         boundary_nudge_strength=0.05,
         repulsion_strength=0.05,
+        # v6.6: 純推論端實驗，預設 0.0 = 關閉，跟改動前完全等價。見
+        # _force_wirelength docstring。
+        wirelength_force_strength=0.0,
         max_step_per_iter=0.05,
         # 各機制窗口
         mib_clamp_until_t=20,
         pin_force_until_t=20,
         grouping_until_t=30,
+        # v6.6: 跟 grouping_until_t 同一個窗口預設（同屬「拉向關聯 block」
+        # 類型的力），strength=0.0 時窗口值不影響任何行為。
+        wirelength_until_t=30,
         repulsion_from_t=50,               # v3.9: 30→50，repulsion 提早啟動（讓 overlap 改善）
         boundary_from_t=20,
         # v3.9: pin bbox clamp 上下限，套力後把 block 中心拉回 bbox 內
@@ -1135,6 +1176,10 @@ class GaussianDiffusion:
             if t_cur >= grouping_until_t:
                 d = self._force_grouping(x, grouping_group, mask_f,
                                          grouping_force_strength * conf_w)
+                if d is not None: deltas.append(d)
+            if t_cur >= wirelength_until_t and wirelength_force_strength != 0.0:
+                d = self._force_wirelength(x, conn_weights, mask_f,
+                                           wirelength_force_strength * conf_w)
                 if d is not None: deltas.append(d)
             if t_cur <= repulsion_from_t and areas_norm is not None:
                 d = self._force_repulsion(x, areas_norm, mask_f,

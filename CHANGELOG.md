@@ -6,6 +6,65 @@
 
 ---
 
+## v6.7 —— force strength 重篩（不採用）／v6.6 —— diffusion 端新增 wirelength force（不採用）
+
+v6.0/v6.1 換上 `legalize_sample` 之後，`grouping_force_strength`/
+`boundary_nudge_strength`/`repulsion_strength`（v5.0/v5.21 在
+`legalize_lff` 年代調的）從沒因為換了 legalizer 重新篩過；另外查證
+`legalize_sample` 的凸優化目標只 minimize `W+H`（bounding box，見 v6.5）
+之後，發現整條 pipeline 沒有任何機制直接以 wirelength 為目標——現有四個
+diffusion 端力（pin/grouping/repulsion/boundary）都跟 b2b 連線權重無關。
+兩個方向都值得一試，各自獨立驗證。
+
+**v6.7 force strength 重篩**：6 個樣本（idx=30/50/70/88/94/98，quasi-paired
+——同一個 idx 固定 `torch.manual_seed`，只變力道，逼近 paired 設計）分別
+對 `grouping_force_strength`（0.0/0.015/0.045）、`boundary_nudge_strength`
+（0.0/0.0125/0.0375）、`repulsion_strength`（0.025/0.05）掃描，跟現行
+production 值（0.030/0.025/0.0375）比較。每個設定都是「一好兩壞」或
+「一壞兩好」的權衡，沒有一個設定三個指標（V_relative/area_gap/
+hpwl_gap）同時變好；`lff_fallback` 觸發率在所有設定下都固定 2/6，代表
+「調高 repulsion 能降低 raw overlap 嚴重度、避免觸發 legalize_sample
+infeasible」這個假設沒有得到支持。**不採用**，三個參數維持原值。
+
+**v6.6 wirelength force（`diffusion.py: _force_wirelength`）**：仿照
+`_force_grouping` 的「拉向鄰居加權中心」設計，鄰居集合從離散 group
+membership 換成連續的 b2b 連線權重（複用 model 本來就在用的
+`conn_weights`，`ddim_sample_with_forces` 主迴圈裡新增
+`wirelength_force_strength` 參數，預設 `0.0`）——概念對應
+"Chip Placement with Diffusion Models"（arXiv:2407.12282）的
+inference-time guidance，不用重新訓練模型。
+
+驗證分兩輪：
+1. 6 樣本（同上）掃 strength=0.01/0.02/0.04/0.08：area_gap/hpwl_gap
+   隨強度持續改善（13.55%→8.99%／10.86%→9.33%），但 V_relative 一開力
+   就跳高（0.0539→0.06~0.067）且不隨強度線性變化，換算 real_cost 淨
+   效果只有 -0.9%~-1%，落在雜訊範圍內。
+2. 擴大到 20 樣本（沿整個 test_id 範圍每 5 個取一個，不只挑大樣本）
+   重篩 strength=0.02/0.04/0.08：**訊號沒有撐住**——三個強度的逐樣本
+   勝/敗都接近 50/50（9 勝 11 敗、10 勝 10 敗、11 勝 9 敗），avg
+   real_cost 在 ±1.3% 內來回，不是真實效果。而且 **strength=0.08
+   在 20 樣本裡新增了 2 個 `lff_fallback` 觸發**（其中 idx=75 在
+   baseline 是正常的，加了這個力才觸發 legalize_sample 求解
+   infeasible）——代表這個力有實際機率把某些樣本的 raw overlap 推得
+   更嚴重，正是 v6.1 費工夫要防的失敗模式。另外 idx=90 在
+   strength=0.04/0.08 出現單樣本嚴重暴走（real_cost 1.08→1.59/1.61，
+   area_gap 4.99%→36-40%）。
+
+**決定**：兩者皆**不採用**。`WIRELENGTH_FORCE_STRENGTH` 維持預設 `0.0`
+（`my_optimizer.py`），`GROUPING_FORCE_STRENGTH`/`BOUNDARY_NUDGE_STRENGTH`/
+`REPULSION_STRENGTH` 維持原值。`_force_wirelength` 程式碼保留（inert，
+strength=0.0 時完全不影響任何行為）當作已測試過的負向紀錄，跟
+v6.2/`cluster=True`/v6.5 同一套處理方式。
+
+**會動到的檔案**：`diffusion.py`（新增 `_force_wirelength`、
+`wirelength_force_strength`/`wirelength_until_t` 參數，接進
+`ddim_sample_with_forces` 主迴圈），`inference.py`（`generate_floorplan`
+新增同名參數並轉發），`my_optimizer.py`（新增
+`WIRELENGTH_FORCE_STRENGTH = 0.0` 類別屬性並轉發，`GROUPING_FORCE_STRENGTH`/
+`BOUNDARY_NUDGE_STRENGTH`/`REPULSION_STRENGTH` 數值未變動）。
+
+---
+
 ## v6.5 —— `legalize_sample` 的 frozen-topology wirelength re-solve（不採用）
 
 v6.0/v6.1 換上 `legalize_sample` 之後，找還沒接上的功能裡有沒有能再壓

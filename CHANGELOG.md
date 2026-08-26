@@ -6,6 +6,56 @@
 
 ---
 
+## Beta median runtime 更新後的重新校準（DDIM_STEPS 重篩，不採用）
+
+主辦方釋出 `C_median_runtimes_beta_hidden_update.csv`（取代
+`C_Median Runtime per Testcase(Alpha).csv`），中位數 runtime 全面快
+很多（例如 test_id=0：2.005s→1.103s；test_id=1：1.629s→0.661s）。用
+這份新基準重算目前 production（v6.3/v6.4 沒有變動）的三次官方 evaluate
+結果：real Total Score 從 alpha 版的 mean=0.8676/std=0.0047 變成
+**beta 版的 mean=1.0360/std=0.0051**——分數變差不是佈局品質退步（100/100
+feasible、area_gap/hpwl_gap/V_relative 都沒變），是相對排名問題：其他
+隊伍在 beta 測試裡的 runtime 普遍比 alpha 快，同樣的 runtime 換算出來
+的 `rt_mult=(runtime/median)^0.3` 就變重。
+
+**重新分析 rt_mult 下限分布**：v6.4 當時用 alpha median 算出「48/100
+樣本已經卡在 0.7 下限，繼續壓縮 runtime 邊際效益低」，用 beta median
+重算同一批結果變成 **0/100 卡在下限**（avg rt_mult 從 alpha 的 ~0.74
+變成 beta 的 0.906），若所有樣本都能壓到下限、理論上限是 -21.72%——
+runtime 對分數的槓桿明顯比之前以為的大很多，值得重新檢視。
+
+**DDIM_STEPS 重篩（不採用）**：`DDIM_STEPS=10` 是 v5.15 在 alpha 經濟學
+下選的保守值（篩選本身就發現 steps 從 30 降到 4 品質幾乎不變、只有 2
+才崩潰，10 留了 2 倍安全邊際，純粹因為當時省下的 runtime 不夠值錢）。
+用完整 production pipeline（真的跑 `MyOptimizer.solve()`，含平行
+legalize，runtime 量測方式跟官方 evaluate 一致）在 20 個樣本（沿整個
+test_id 範圍每 5 個取一個）上重篩 steps=10/8/6/5：
+
+| steps | avg runtime | avg V_rel | avg area_gap | avg hpwl_gap | avg real_cost（beta） |
+|---|---|---|---|---|---|
+| 10（現行） | 1.726s | 0.0296 | +4.84% | +9.89% | 1.0794 |
+| 8 | 1.583s | 0.0260 | +8.94% | +13.81% | 1.0850（+0.5%，變差） |
+| 6 | 1.517s | 0.0316 | +10.35% | +14.63% | 1.0892（+0.9%，變差） |
+| 5 | 1.384s | 0.0284 | +10.40% | +16.42% | 1.0645（-1.4%，勉強好一點） |
+
+逐樣本勝率看起來不差（12-14 勝 6-8 敗），但平均分數幾乎沒進步甚至變差
+——少數樣本的劇烈暴走把平均拉垮了（例如 idx=90 在 steps=5 時 real_cost
+1.17→1.64，area_gap 7.64%→44.78%；idx=95 在 steps=6 時 0.78→1.11，
+area_gap -0.10%→+24.27%），而且暴走的樣本每次不固定。推測原因：v5.15
+的原始篩選是在 `legalize_lff`（結構上保證一定成功）年代做的，換成
+`legalize_sample`（v6.0 起）之後，它自己的凸優化求解對「起點多亂」比較
+敏感，DDIM_STEPS 降低讓 raw layout 更粗糙時，會在某些樣本上把
+`legalize_sample` 推向明顯更差的 hybrid/plain 分支，不像以前一樣穩定。
+
+**決定**：**不採用**。「beta 經濟學下 runtime 槓桿變大」這個發現本身
+是真的、也重要，但 `DDIM_STEPS` 這個特定槓桿撞上了 `legalize_sample`
+的穩定性問題，淨效果不划算。`DDIM_STEPS` 維持 10 不變，沒有動到任何
+程式碼——純粹是用新的 median runtime 基準重新驗證一次既有選擇還站得
+住腳。若之後想繼續挖這個方向，`TOP_K_CANDIDATES`／`POST_REPEL_STEPS`
+（跟 `legalize_sample` 本身穩定性關係較小）是還沒試過的候選。
+
+---
+
 ## v6.7 —— force strength 重篩（不採用）／v6.6 —— diffusion 端新增 wirelength force（不採用）
 
 v6.0/v6.1 換上 `legalize_sample` 之後，`grouping_force_strength`/

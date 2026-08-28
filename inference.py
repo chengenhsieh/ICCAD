@@ -55,7 +55,13 @@ from utils import (
 
 
 def load_model(checkpoint_path, device="cpu"):
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # weights_only=False（明確指定，不依賴 torch 版本的預設值）：checkpoint
+    # 裡的 "config" 是我們自己的 config.Config 物件（不是純 tensor），PyTorch
+    # 2.6 起 torch.load 預設 weights_only=True，遇到這種自訂 class 會直接
+    # UnpicklingError（"Unsupported global: GLOBAL config.Config"）。這是我們
+    # 自己訓練產出的可信 checkpoint，明確設 False 沿用原本行為，不受呼叫方
+    # 裝的 torch 版本影響。
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint["config"]
     model = FloorplanDiffusionModel(config).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])

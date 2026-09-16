@@ -278,6 +278,16 @@ v5.15）產生高品質樣本。
 
 ### 2.2 Stage B — Legalize（`utils.py:legalize_lff`）
 
+> **更新（v6.0 起，見 CHANGELOG.md）**：`legalize_lff`（本節描述的演算法）
+> 從 v6.0 起**不再是 production 預設路徑**——`my_optimizer.py` 現在優先呼叫
+> 隊友團隊（ICCAD2026-Problem-C/diffusion-floorplanner）的正式 legalizer
+> `teammate_legalizer/compaction.py:legalize_sample`（透過 `inference_v2.py`
+> 接線），100 樣本配對驗證 real_cost 改善約 -21%。本節描述的演算法完全沒有
+> 被刪除，而是變成 `legalize_sample` 求解 infeasible 時的**保底 fallback**
+> （v6.1，見 §「最終結果」跟 CHANGELOG.md v6.0/v6.1）——正是靠這個機制才能
+> 保證「不管 legalize_sample 內部發生什麼，最終輸出結構上一定零重疊」。本節
+> 仍完整保留，因為它準確描述這個 fallback 實際在跑的演算法。
+
 Diffusion 輸出仍可能有重疊、面積誤差、blockshape 偏移。Legalize 階段用
 **決定性、單趟**的演算法把它轉成保證合法的最終解——「決定性」是刻意的設計
 選擇：我們最初評估過用 B*-tree + Simulated Annealing（Chang, Chang, Wu, Wu,
@@ -512,33 +522,60 @@ v5.11。
 
 ---
 
-## 最終結果（100 樣本官方 validation set）
+## 最終結果
 
-以下數字取自 `my_optimizer.py`（v4 checkpoint `model_epoch300_overlap_v4.pt`
-+ `DDIM_STEPS=10` + `POST_REPEL_STEPS=10` + `REINSERT_SWEEPS=1` +
-`REINSERT_GRID_DENSITY=4`，v5.15／v5.16／v5.17 採用後的目前 production
-設定）跑官方 `iccad2026_evaluate.py --evaluate` 的實測結果（兩次獨立評估
-平均），是目前已知最準確、最新的版本（`violations_relative` 跟官方
-100/100 精確吻合，見 §2.4／CHANGELOG.md v5.11；runtime 相關調整見
-CHANGELOG.md v5.15／v5.16／v5.17）：
+（以下取代原本 v5.17-era 的舊數字——那組結果是 `legalize_lff` 還是 production
+預設路徑時測的，跟現在的架構〔v6.0 起預設 `legalize_sample`，見 §2.2 更新
+說明／CHANGELOG.md v6.0/v6.1〕不是同一套 pipeline，數字不能直接比較。）
+
+### 本地 validation set（100 樣本，跟正式比賽同格式、不同資料）
+
+`my_optimizer.py` 目前 production 設定（v4 checkpoint
+`model_epoch300_overlap_v4.pt` + `DDIM_STEPS=10` + `legalize_sample`
+`finish_rounds=2` 等，見 CHANGELOG.md v6.0-v6.7 完整版本歷程）跑官方
+`iccad2026_evaluate.py --evaluate` 的單次實測結果：
 
 | 指標 | 數值 |
 |---|---|
-| Hard constraint 違規 | 0 / 100（zero overlap, exact preplaced/fixed shape, area ≤1% error, 皆保證滿足） |
-| Area gap（vs. optimal） | 23.16% |
-| HPWL gap（vs. optimal） | 28.52% |
-| Soft constraint 違規率（V_relative，官方精確定義） | 0.1095 |
-| 平均單樣本總時間 | 1.46s（v5.15 之前為 2.485s，-41%） |
-| Total Score（`RuntimeFactor=1.0` 中性，官方 evaluate 直接輸出） | 1.5266 |
-| Total Score（換算 alpha-test 實際 median runtime） | **1.128**（原始 v4 為 1.2322，累計 -8.5%） |
+| Hard constraint 違規 | 0 / 100 |
+| Area gap（vs. optimal） | +4.85% |
+| HPWL gap（vs. optimal） | +8.60% |
+| Soft constraint 違規率（V_relative） | 0.0253 |
+| 平均單樣本總時間 | 1.669s |
+| Total Score（`RuntimeFactor=1.0` 中性，官方 evaluate 直接輸出） | 1.1739 |
 
-（diffusion sampling 未固定 random seed，同一組參數重跑 100 樣本時上述數字
-本身會有若干自然波動，屬於量測雜訊而非參數變化造成——這也是為何 v4.7 之後
-的驗證過程多半改用 paired 設計，見上一節。中性 runtime 版本的 Total Score
-沒有反映真實比賽的 RuntimeFactor 加成，換算 alpha-test 真實 median runtime
-的版本更接近實際競賽會拿到的分數；v5.15-v5.17 這一系列改動正是靠重新檢視這個
-換算方式才發現的改善空間，品質幾乎不受影響，純粹是 runtime 下降帶來的
-真實分數提升。）
+（diffusion sampling 未固定 random seed，重跑會有自然波動；CHANGELOG.md
+v6.1/v6.4 記錄的三次獨立官方 evaluate 換算真實 median runtime 後，real
+Total Score 落在 mean≈0.87〔alpha 版 median runtime 基準〕/ mean≈1.04
+〔beta 版基準，主辦方後來更新〕，std 都在 0.005 上下，屬於穩定結果。）
+
+### 官方最終測試結果（Hidden Test Set，100 樣本，2026-09-02）
+
+主辦方在隱藏測試集上實際跑出的最終結果（`final_evaluation_results.json`，
+含真實 RuntimeFactor）：
+
+| 指標 | 數值 |
+|---|---|
+| Hard constraint 違規 | 0 / 100（100% feasible） |
+| Area gap（vs. optimal） | +24.48% |
+| HPWL gap（vs. optimal） | +46.20% |
+| Soft constraint 違規率（V_relative） | 0.1877 |
+| 平均單樣本總時間 | 1.319s |
+| **Total Score（官方最終，含真實 RuntimeFactor）** | **2.0186** |
+
+**誠實記錄一個落差**：隱藏測試集的 area_gap／hpwl_gap／V_relative 都明顯比
+本地 validation set 差（約 3-5 倍）。逐樣本檢查發現 **14/100** 個樣本出現
+跟 CHANGELOG.md v6.0/v6.1 診斷過的同一種失敗模式——`legalize_sample` 的
+凸優化求解在 raw diffusion 輸出重疊特別嚴重的樣本上判定 infeasible，退回
+`legalize_lff` 保底（見上方 §2.2 更新說明）。這個保底機制的設計目標只有
+「結構上保證零重疊」，沒有能力保證跟 `legalize_sample` 一樣好的 area/HPWL
+品質，一旦觸發，這幾個指標就會明顯變差（但不會 infeasible，這也是為什麼
+100/100 hard constraint 仍然全部滿足）。本地 100 樣本 validation set 只有
+2/100 踩到這個模式（tid=94/98），隱藏測試集的比例高出 7 倍，代表隱藏測試集
+裡「raw diffusion 輸出嚴重重疊」的樣本分布比例比 validation set 高不少——
+這是 diffusion 模型本身在某一類輸入上的弱點，透過現有的驗證流程只用 100
+個 validation 樣本沒能完整量到，是這個專案目前已知、但賽後才確認規模的
+限制。
 
 ---
 
